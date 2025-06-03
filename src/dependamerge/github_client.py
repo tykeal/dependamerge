@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2024 The Linux Foundation
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 import os
 from typing import List, Optional
@@ -25,16 +25,24 @@ class GitHubClient:
 
     def parse_pr_url(self, url: str) -> tuple[str, str, int]:
         """Parse GitHub PR URL to extract owner, repo, and PR number."""
-        # Expected format: https://github.com/owner/repo/pull/123
+        # Expected format: https://github.com/owner/repo/pull/123[/files|/commits|etc]
         parts = url.rstrip("/").split("/")
         if len(parts) < 7 or "github.com" not in url or "pull" not in parts:
             raise ValueError(f"Invalid GitHub PR URL: {url}")
 
-        owner = parts[-4]
-        repo = parts[-3]
-        pr_number = int(parts[-1])
+        # Find the 'pull' segment and get the PR number from the next segment
+        try:
+            pull_index = parts.index("pull")
+            if pull_index + 1 >= len(parts):
+                raise ValueError("PR number not found after 'pull'")
 
-        return owner, repo, pr_number
+            owner = parts[pull_index - 2]
+            repo = parts[pull_index - 1]
+            pr_number = int(parts[pull_index + 1])
+
+            return owner, repo, pr_number
+        except (ValueError, IndexError) as e:
+            raise ValueError(f"Invalid GitHub PR URL: {url}") from e
 
     def get_pull_request_info(
         self, owner: str, repo: str, pr_number: int
@@ -67,6 +75,8 @@ class GitHubClient:
                 head_branch=pr.head.ref,
                 state=pr.state,
                 mergeable=pr.mergeable,
+                mergeable_state=pr.mergeable_state,
+                behind_by=getattr(pr, "behind_by", None),
                 files_changed=files_changed,
                 repository_full_name=repository.full_name,
                 html_url=pr.html_url,
@@ -135,3 +145,45 @@ class GitHubClient:
             "allcontributors[bot]",
         }
         return author in automation_authors
+
+    def get_pr_status_details(self, pr_info: PullRequestInfo) -> str:
+        """Get detailed status information for a PR."""
+        if pr_info.state != "open":
+            return f"Closed ({pr_info.state})"
+
+        # Check for draft status first
+        if pr_info.mergeable_state == "draft":
+            return "Draft PR"
+
+        if pr_info.mergeable is False:
+            # Check for specific reasons why it's not mergeable
+            if pr_info.mergeable_state == "dirty":
+                return "Merge conflicts"
+            elif pr_info.mergeable_state == "behind":
+                return "Rebase required"
+            elif pr_info.mergeable_state == "blocked":
+                return "Blocked by checks"
+            else:
+                return f"Not mergeable ({pr_info.mergeable_state or 'unknown'})"
+
+        if pr_info.mergeable_state == "behind":
+            return "Rebase required"
+
+        return "Ready to merge"
+
+    def fix_out_of_date_pr(self, owner: str, repo: str, pr_number: int) -> bool:
+        """Fix an out-of-date PR by updating the branch."""
+        try:
+            repository = self.github.get_repo(f"{owner}/{repo}")
+            pr = repository.get_pull(pr_number)
+
+            if pr.mergeable_state != "behind":
+                print(f"PR {pr_number} is not behind the base branch")
+                return False
+
+            # Update the branch using GitHub's update branch API
+            pr.update_branch()
+            return True
+        except GithubException as e:
+            print(f"Failed to update PR {pr_number}: {e}")
+            return False

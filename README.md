@@ -1,6 +1,6 @@
 <!--
 SPDX-License-Identifier: Apache-2.0
-SPDX-FileCopyrightText: 2024 The Linux Foundation
+SPDX-FileCopyrightText: 2025 The Linux Foundation
 -->
 
 # Dependamerge
@@ -83,6 +83,7 @@ dependamerge https://github.com/owner/repo/pull/123 --dry-run
 dependamerge https://github.com/owner/repo/pull/123 \
   --threshold 0.9 \
   --merge-method squash \
+  --fix \
   --token your_github_token
 ```
 
@@ -91,6 +92,7 @@ dependamerge https://github.com/owner/repo/pull/123 \
 - `--dry-run`: Show what changes will apply without making them
 - `--threshold FLOAT`: Similarity threshold for matching PRs (0.0-1.0, default: 0.8)
 - `--merge-method TEXT`: Merge method - merge, squash, or rebase (default: merge)
+- `--fix`: Automatically fix out-of-date branches before merging
 - `--token TEXT`: GitHub token (alternative to GITHUB_TOKEN env var)
 
 ## How It Works
@@ -106,6 +108,8 @@ dependamerge https://github.com/owner/repo/pull/123 \
 6. **Approval & Merge**: For matching PRs above the threshold:
    - Adds an approval review
    - Merges the pull request
+7. **Source PR Merge**: Merges the original source PR that served as the
+   baseline
 
 ## Similarity Matching
 
@@ -148,11 +152,11 @@ dependamerge https://github.com/myorg/repo1/pull/45
 dependamerge https://github.com/myorg/repo1/pull/12 --threshold 0.85
 ```
 
-### Dry Run with Custom Threshold
+### Dry Run with Fix Option
 
 ```bash
-# See what changes will apply with 90% similarity threshold
-dependamerge https://github.com/myorg/repo1/pull/78 --dry-run --threshold 0.9
+# See what changes will apply and automatically fix out-of-date branches
+dependamerge https://github.com/myorg/repo1/pull/78 --dry-run --fix --threshold 0.9
 ```
 
 ## Safety Features
@@ -160,10 +164,29 @@ dependamerge https://github.com/myorg/repo1/pull/78 --dry-run --threshold 0.9
 - **Automation-Focused**: Processes PRs from recognized automation tools
 - **Mergeable Check**: Verifies PRs are in a mergeable state before attempting
   merge
+- **Auto-Fix**: Automatically update out-of-date branches when using `--fix` option
+- **Detailed Status**: Shows specific reasons why PRs cannot merge
+  (conflicts, blocked by checks, etc.)
 - **Similarity Threshold**: Configurable confidence threshold prevents
   incorrect matches
 - **Dry Run Mode**: Always test with `--dry-run` first
 - **Detailed Logging**: Shows which PRs match and why they match
+
+## Enhanced URL Support
+
+The tool now supports GitHub PR URLs with path segments:
+
+```bash
+# These URL formats now work:
+dependamerge https://github.com/owner/repo/pull/123
+dependamerge https://github.com/owner/repo/pull/123/
+dependamerge https://github.com/owner/repo/pull/123/files
+dependamerge https://github.com/owner/repo/pull/123/commits
+dependamerge https://github.com/owner/repo/pull/123/files/diff
+```
+
+This enhancement allows you to copy URLs directly from GitHub's PR pages
+without worrying about the specific tab you're viewing.
 
 ## Development
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2024 The Linux Foundation
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
@@ -9,7 +9,9 @@ build-backend = "setuptools.build_meta"
 name = "dependamerge"
 version = "0.1.0"
 description = "Automatically merge pull requests created by automation tools across GitHub organizations"
-authors = [{name = "Linux Foundation", email = "example@linuxfoundation.org"}]
+authors = [
+    {name = "Matthew Watkins", email = "93649628+ModeSevenIndustrialSolutions@users.noreply.github.com" }
+]
 license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.8"
