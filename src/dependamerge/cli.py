@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2024 The Linux Foundation
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 from typing import List, Optional, Tuple
 
@@ -33,6 +33,9 @@ def merge(
     ),
     token: Optional[str] = typer.Option(
         None, "--token", help="GitHub token (or set GITHUB_TOKEN env var)"
+    ),
+    fix: bool = typer.Option(
+        False, "--fix", help="Automatically fix out-of-date branches before merging"
     ),
 ):
     """
@@ -138,8 +141,12 @@ def merge(
         table.add_column("Status", style="blue")
 
         for pr_info, comparison in similar_prs:
-            repo_name = pr_info.repository_full_name
-            status = "Ready to merge" if pr_info.mergeable else "Not mergeable"
+            # Strip organization name from repository full name
+            repo_name = pr_info.repository_full_name.split("/")[-1]
+
+            # Get detailed status information
+            status = github_client.get_pr_status_details(pr_info)
+
             table.add_row(
                 repo_name,
                 str(pr_info.number),
@@ -159,39 +166,20 @@ def merge(
 
         success_count = 0
         for pr_info, _comparison in similar_prs:
-            if not pr_info.mergeable:
-                console.print(
-                    f"[yellow]Skipping unmergeable PR {pr_info.number} in {pr_info.repository_full_name}[/yellow]"
-                )
-                continue
+            if _merge_single_pr(pr_info, github_client, merge_method, fix, console):
+                success_count += 1
 
-            repo_owner, repo_name = pr_info.repository_full_name.split("/")
+        # Merge source PR
+        console.print(f"\n[bold blue]Merging source PR {source_pr.number}[/bold blue]")
+        source_pr_merged = _merge_single_pr(
+            source_pr, github_client, merge_method, fix, console
+        )
+        if source_pr_merged:
+            success_count += 1
 
-            # Approve PR
-            console.print(
-                f"[blue]Approving PR {pr_info.number} in {pr_info.repository_full_name}[/blue]"
-            )
-            if github_client.approve_pull_request(
-                repo_owner, repo_name, pr_info.number
-            ):
-                # Merge PR
-                console.print(
-                    f"[blue]Merging PR {pr_info.number} in {pr_info.repository_full_name}[/blue]"
-                )
-                if github_client.merge_pull_request(
-                    repo_owner, repo_name, pr_info.number, merge_method
-                ):
-                    console.print(
-                        f"[green]✓ Successfully merged PR {pr_info.number}[/green]"
-                    )
-                    success_count += 1
-                else:
-                    console.print(f"[red]✗ Failed to merge PR {pr_info.number}[/red]")
-            else:
-                console.print(f"[red]✗ Failed to approve PR {pr_info.number}[/red]")
-
+        total_prs = len(similar_prs) + 1  # similar PRs + source PR
         console.print(
-            f"\n[bold green]Successfully merged {success_count}/{len(similar_prs)} PRs[/bold green]"
+            f"\n[bold green]Successfully merged {success_count}/{total_prs} PRs (including source PR)[/bold green]"
         )
 
     except Exception as e:
@@ -215,6 +203,73 @@ def _display_pr_info(pr: PullRequestInfo, title: str):
     table.add_row("URL", pr.html_url)
 
     console.print(table)
+
+
+def _merge_single_pr(
+    pr_info: PullRequestInfo,
+    github_client: GitHubClient,
+    merge_method: str,
+    fix: bool,
+    console: Console,
+) -> bool:
+    """
+    Merge a single pull request.
+
+    Returns True if successfully merged, False otherwise.
+    """
+    repo_owner, repo_name = pr_info.repository_full_name.split("/")
+
+    # Check if PR needs fixing
+    if not pr_info.mergeable and fix:
+        status = github_client.get_pr_status_details(pr_info)
+        if "Rebase required" in status:
+            console.print(
+                f"[blue]Fixing out-of-date PR {pr_info.number} in {pr_info.repository_full_name}[/blue]"
+            )
+            if github_client.fix_out_of_date_pr(repo_owner, repo_name, pr_info.number):
+                console.print(
+                    f"[green]✓ Successfully updated PR {pr_info.number}[/green]"
+                )
+                # Refresh PR info after fix
+                try:
+                    pr_info = github_client.get_pull_request_info(
+                        repo_owner, repo_name, pr_info.number
+                    )
+                except Exception as e:
+                    console.print(
+                        f"[yellow]Warning: Failed to refresh PR info: {e}[/yellow]"
+                    )
+            else:
+                console.print(f"[red]✗ Failed to update PR {pr_info.number}[/red]")
+                return False
+
+    if not pr_info.mergeable:
+        status = github_client.get_pr_status_details(pr_info)
+        console.print(
+            f"[yellow]Skipping unmergeable PR {pr_info.number} in {pr_info.repository_full_name} ({status})[/yellow]"
+        )
+        return False
+
+    # Approve PR
+    console.print(
+        f"[blue]Approving PR {pr_info.number} in {pr_info.repository_full_name}[/blue]"
+    )
+    if github_client.approve_pull_request(repo_owner, repo_name, pr_info.number):
+        # Merge PR
+        console.print(
+            f"[blue]Merging PR {pr_info.number} in {pr_info.repository_full_name}[/blue]"
+        )
+        if github_client.merge_pull_request(
+            repo_owner, repo_name, pr_info.number, merge_method
+        ):
+            console.print(f"[green]✓ Successfully merged PR {pr_info.number}[/green]")
+            return True
+        else:
+            console.print(f"[red]✗ Failed to merge PR {pr_info.number}[/red]")
+    else:
+        console.print(f"[red]✗ Failed to approve PR {pr_info.number}[/red]")
+
+    return False
 
 
 if __name__ == "__main__":

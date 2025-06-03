@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2024 The Linux Foundation
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 from dependamerge.models import FileChange, PullRequestInfo
 from dependamerge.pr_comparator import PRComparator
@@ -21,7 +21,7 @@ class TestPRComparator:
         normalized = comparator._normalize_title(original)
         assert "1.2.3" not in normalized
         assert "1.2.4" not in normalized
-        assert "bump dependency from  to" in normalized
+        assert "bump dependency from to" in normalized
 
     def test_normalize_title_removes_commit_hashes(self):
         comparator = PRComparator()
@@ -131,6 +131,8 @@ class TestPRComparator:
             head_branch="dependabot/pip/requests-2.28.1",
             state="open",
             mergeable=True,
+            mergeable_state="clean",
+            behind_by=0,
             files_changed=[],
             repository_full_name="owner/repo",
             html_url="https://github.com/owner/repo/pull/1",
@@ -151,6 +153,8 @@ class TestPRComparator:
             head_branch="fix-auth-bug",
             state="open",
             mergeable=True,
+            mergeable_state="clean",
+            behind_by=0,
             files_changed=[],
             repository_full_name="owner/repo",
             html_url="https://github.com/owner/repo/pull/1",
@@ -171,6 +175,8 @@ class TestPRComparator:
             head_branch="dependabot/pip/requests-2.28.1",
             state="open",
             mergeable=True,
+            mergeable_state="clean",
+            behind_by=0,
             files_changed=[
                 FileChange(
                     filename="requirements.txt",
@@ -194,6 +200,8 @@ class TestPRComparator:
             head_branch="dependabot/pip/requests-2.28.1",
             state="open",
             mergeable=True,
+            mergeable_state="clean",
+            behind_by=0,
             files_changed=[
                 FileChange(
                     filename="requirements.txt",

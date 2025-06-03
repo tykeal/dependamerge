@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2024 The Linux Foundation
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 from unittest.mock import Mock, patch
 
@@ -47,6 +47,33 @@ class TestGitHubClient:
         with pytest.raises(ValueError, match="Invalid GitHub PR URL"):
             client.parse_pr_url("https://invalid-url.com")
 
+    def test_parse_pr_url_with_files_path(self):
+        client = GitHubClient(token="test_token")
+        owner, repo, pr_number = client.parse_pr_url(
+            "https://github.com/lfreleng-actions/python-project-name-action/pull/23/files"
+        )
+        assert owner == "lfreleng-actions"
+        assert repo == "python-project-name-action"
+        assert pr_number == 23
+
+    def test_parse_pr_url_with_commits_path(self):
+        client = GitHubClient(token="test_token")
+        owner, repo, pr_number = client.parse_pr_url(
+            "https://github.com/owner/repo/pull/456/commits"
+        )
+        assert owner == "owner"
+        assert repo == "repo"
+        assert pr_number == 456
+
+    def test_parse_pr_url_with_multiple_path_segments(self):
+        client = GitHubClient(token="test_token")
+        owner, repo, pr_number = client.parse_pr_url(
+            "https://github.com/org/repository/pull/789/files/diff"
+        )
+        assert owner == "org"
+        assert repo == "repository"
+        assert pr_number == 789
+
     @patch("dependamerge.github_client.Github")
     def test_get_pull_request_info(self, mock_github_class):
         # Setup mocks
@@ -68,6 +95,8 @@ class TestGitHubClient:
         mock_pr.head.ref = "update-deps"
         mock_pr.state = "open"
         mock_pr.mergeable = True
+        mock_pr.mergeable_state = "clean"
+        mock_pr.behind_by = 0
         mock_pr.html_url = "https://github.com/owner/repo/pull/22"
 
         mock_file = Mock()

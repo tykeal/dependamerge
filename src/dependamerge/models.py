@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2024 The Linux Foundation
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 from typing import List, Optional
 
@@ -28,6 +28,8 @@ class PullRequestInfo(BaseModel):
     head_branch: str
     state: str
     mergeable: Optional[bool]
+    mergeable_state: Optional[str]  # Additional state information from GitHub
+    behind_by: Optional[int]  # Number of commits behind the base branch
     files_changed: List[FileChange]
     repository_full_name: str
     html_url: str
