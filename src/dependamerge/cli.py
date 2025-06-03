@@ -1,28 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2024 The Linux Foundation
+
+from typing import List, Optional, Tuple
+
 import typer
-from typing import Optional
+from github.Repository import Repository
 from rich.console import Console
-from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.table import Table
 
 from .github_client import GitHubClient
+from .models import ComparisonResult, PullRequestInfo
 from .pr_comparator import PRComparator
-from .models import PullRequestInfo
 
-app = typer.Typer(help="Automatically merge pull requests created by automation tools across GitHub organizations")
+app = typer.Typer(
+    help="Automatically merge pull requests created by automation tools across GitHub organizations"
+)
 console = Console()
 
 
 @app.command()
 def merge(
     pr_url: str = typer.Argument(..., help="GitHub pull request URL"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be done without making changes"),
-    similarity_threshold: float = typer.Option(0.8, "--threshold", help="Similarity threshold for matching PRs (0.0-1.0)"),
-    merge_method: str = typer.Option("merge", "--merge-method", help="Merge method: merge, squash, or rebase"),
-    token: Optional[str] = typer.Option(None, "--token", help="GitHub token (or set GITHUB_TOKEN env var)"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what changes will apply without making them"
+    ),
+    similarity_threshold: float = typer.Option(
+        0.8, "--threshold", help="Similarity threshold for matching PRs (0.0-1.0)"
+    ),
+    merge_method: str = typer.Option(
+        "merge", "--merge-method", help="Merge method: merge, squash, or rebase"
+    ),
+    token: Optional[str] = typer.Option(
+        None, "--token", help="GitHub token (or set GITHUB_TOKEN env var)"
+    ),
 ):
     """
     Merge automation pull requests across an organization.
-    
+
     This command will:
     1. Analyze the provided PR
     2. Find similar PRs in the organization
@@ -32,76 +47,88 @@ def merge(
         # Initialize clients
         github_client = GitHubClient(token)
         comparator = PRComparator(similarity_threshold)
-        
+
         console.print(f"[bold blue]Analyzing PR: {pr_url}[/bold blue]")
-        
+
         # Parse PR URL and get info
-        owner, repo, pr_number = github_client.parse_pr_url(pr_url)
-        source_pr = github_client.get_pull_request_info(owner, repo, pr_number)
-        
+        owner, repo_name, pr_number = github_client.parse_pr_url(pr_url)
+        source_pr: PullRequestInfo = github_client.get_pull_request_info(
+            owner, repo_name, pr_number
+        )
+
         # Display source PR info
         _display_pr_info(source_pr, "Source PR")
-        
+
         # Check if source PR is from automation
         if not github_client.is_automation_author(source_pr.author):
-            console.print("[red]Error: Source PR is not from a recognized automation tool[/red]")
+            console.print(
+                "[red]Error: Source PR is not from a recognized automation tool[/red]"
+            )
             raise typer.Exit(1)
-        
+
         # Get organization repositories
         console.print(f"\n[bold blue]Scanning organization: {owner}[/bold blue]")
-        
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as progress:
             task = progress.add_task("Fetching repositories...", total=None)
-            repositories = github_client.get_organization_repositories(owner)
+            repositories: List[Repository] = (
+                github_client.get_organization_repositories(owner)
+            )
             progress.update(task, description=f"Found {len(repositories)} repositories")
-        
+
         # Find similar PRs
-        similar_prs = []
-        
+        similar_prs: List[Tuple[PullRequestInfo, ComparisonResult]] = []
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as progress:
             task = progress.add_task("Analyzing PRs...", total=len(repositories))
-            
+
             for repo in repositories:
                 if repo.full_name == source_pr.repository_full_name:
                     progress.advance(task)
                     continue
-                
+
                 open_prs = github_client.get_open_pull_requests(repo)
-                
+
                 for pr in open_prs:
                     if not github_client.is_automation_author(pr.user.login):
                         continue
-                    
+
                     try:
                         target_pr = github_client.get_pull_request_info(
                             repo.owner.login, repo.name, pr.number
                         )
-                        
-                        comparison = comparator.compare_pull_requests(source_pr, target_pr)
-                        
+
+                        comparison = comparator.compare_pull_requests(
+                            source_pr, target_pr
+                        )
+
                         if comparison.is_similar:
                             similar_prs.append((target_pr, comparison))
-                    
+
                     except Exception as e:
-                        console.print(f"[yellow]Warning: Failed to analyze PR {pr.number} in {repo.full_name}: {e}[/yellow]")
-                
+                        console.print(
+                            f"[yellow]Warning: Failed to analyze PR {pr.number} in {repo.full_name}: {e}[/yellow]"
+                        )
+
                 progress.advance(task)
-        
+
         # Display results
         if not similar_prs:
             console.print("\n[yellow]No similar PRs found in the organization[/yellow]")
             return
-        
-        console.print(f"\n[bold green]Found {len(similar_prs)} similar PR(s)[/bold green]")
-        
+
+        console.print(
+            f"\n[bold green]Found {len(similar_prs)} similar PR(s)[/bold green]"
+        )
+
         # Display similar PRs table
         table = Table(title="Similar Pull Requests")
         table.add_column("Repository", style="cyan")
@@ -109,51 +136,67 @@ def merge(
         table.add_column("Title", style="green")
         table.add_column("Confidence", style="yellow")
         table.add_column("Status", style="blue")
-        
-        for pr, comparison in similar_prs:
-            repo_name = pr.repository_full_name
-            status = "Ready to merge" if pr.mergeable else "Not mergeable"
+
+        for pr_info, comparison in similar_prs:
+            repo_name = pr_info.repository_full_name
+            status = "Ready to merge" if pr_info.mergeable else "Not mergeable"
             table.add_row(
                 repo_name,
-                str(pr.number),
-                pr.title[:50] + "..." if len(pr.title) > 50 else pr.title,
+                str(pr_info.number),
+                pr_info.title[:50] + "..."
+                if len(pr_info.title) > 50
+                else pr_info.title,
                 f"{comparison.confidence_score:.2f}",
-                status
+                status,
             )
-        
+
         console.print(table)
-        
+
         # Merge PRs
         if dry_run:
             console.print("\n[yellow]Dry run mode - no changes will be made[/yellow]")
             return
-        
+
         success_count = 0
-        for pr, comparison in similar_prs:
-            if not pr.mergeable:
-                console.print(f"[yellow]Skipping unmergeable PR {pr.number} in {pr.repository_full_name}[/yellow]")
+        for pr_info, _comparison in similar_prs:
+            if not pr_info.mergeable:
+                console.print(
+                    f"[yellow]Skipping unmergeable PR {pr_info.number} in {pr_info.repository_full_name}[/yellow]"
+                )
                 continue
-            
-            repo_owner, repo_name = pr.repository_full_name.split('/')
-            
+
+            repo_owner, repo_name = pr_info.repository_full_name.split("/")
+
             # Approve PR
-            console.print(f"[blue]Approving PR {pr.number} in {pr.repository_full_name}[/blue]")
-            if github_client.approve_pull_request(repo_owner, repo_name, pr.number):
+            console.print(
+                f"[blue]Approving PR {pr_info.number} in {pr_info.repository_full_name}[/blue]"
+            )
+            if github_client.approve_pull_request(
+                repo_owner, repo_name, pr_info.number
+            ):
                 # Merge PR
-                console.print(f"[blue]Merging PR {pr.number} in {pr.repository_full_name}[/blue]")
-                if github_client.merge_pull_request(repo_owner, repo_name, pr.number, merge_method):
-                    console.print(f"[green]✓ Successfully merged PR {pr.number}[/green]")
+                console.print(
+                    f"[blue]Merging PR {pr_info.number} in {pr_info.repository_full_name}[/blue]"
+                )
+                if github_client.merge_pull_request(
+                    repo_owner, repo_name, pr_info.number, merge_method
+                ):
+                    console.print(
+                        f"[green]✓ Successfully merged PR {pr_info.number}[/green]"
+                    )
                     success_count += 1
                 else:
-                    console.print(f"[red]✗ Failed to merge PR {pr.number}[/red]")
+                    console.print(f"[red]✗ Failed to merge PR {pr_info.number}[/red]")
             else:
-                console.print(f"[red]✗ Failed to approve PR {pr.number}[/red]")
-        
-        console.print(f"\n[bold green]Successfully merged {success_count}/{len(similar_prs)} PRs[/bold green]")
-    
+                console.print(f"[red]✗ Failed to approve PR {pr_info.number}[/red]")
+
+        console.print(
+            f"\n[bold green]Successfully merged {success_count}/{len(similar_prs)} PRs[/bold green]"
+        )
+
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from e
 
 
 def _display_pr_info(pr: PullRequestInfo, title: str):
@@ -161,7 +204,7 @@ def _display_pr_info(pr: PullRequestInfo, title: str):
     table = Table(title=title)
     table.add_column("Property", style="cyan")
     table.add_column("Value", style="green")
-    
+
     table.add_row("Repository", pr.repository_full_name)
     table.add_row("PR Number", str(pr.number))
     table.add_row("Title", pr.title)
@@ -170,7 +213,7 @@ def _display_pr_info(pr: PullRequestInfo, title: str):
     table.add_row("Mergeable", str(pr.mergeable))
     table.add_row("Files Changed", str(len(pr.files_changed)))
     table.add_row("URL", pr.html_url)
-    
+
     console.print(table)
 
 
