@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 import typer
 from github.Repository import Repository
 from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
 from .github_client import GitHubClient
@@ -71,57 +72,56 @@ def merge(
         # Get organization repositories
         console.print(f"\n[bold blue]Scanning organization: {owner}[/bold blue]")
 
-        # TEMP: Remove progress for debugging
-        # with Progress(
-        #     SpinnerColumn(),
-        #     TextColumn("[progress.description]{task.description}"),
-        #     console=console,
-        # ) as progress:
-        #     task = progress.add_task("Fetching repositories...", total=None)
-        repositories: List[Repository] = github_client.get_organization_repositories(
-            owner
-        )
-        console.print(f"Found {len(repositories)} repositories")
-        #     progress.update(task, description=f"Found {len(repositories)} repositories")
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Fetching repositories...", total=None)
+            repositories: List[Repository] = (
+                github_client.get_organization_repositories(owner)
+            )
+            progress.update(task, description=f"Found {len(repositories)} repositories")
 
         # Find similar PRs
         similar_prs: List[Tuple[PullRequestInfo, ComparisonResult]] = []
 
-        # TEMP: Remove progress for debugging
-        # with Progress(
-        #     SpinnerColumn(),
-        #     TextColumn("[progress.description]{task.description}"),
-        #     console=console,
-        # ) as progress:
-        #     task = progress.add_task("Analyzing PRs...", total=len(repositories))
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Analyzing PRs...", total=len(repositories))
 
-        for repo in repositories:
-            if repo.full_name == source_pr.repository_full_name:
-                # progress.advance(task)
-                continue
-
-            open_prs = github_client.get_open_pull_requests(repo)
-
-            for pr in open_prs:
-                if not github_client.is_automation_author(pr.user.login):
+            for repo in repositories:
+                if repo.full_name == source_pr.repository_full_name:
+                    progress.advance(task)
                     continue
 
-                try:
-                    target_pr = github_client.get_pull_request_info(
-                        repo.owner.login, repo.name, pr.number
-                    )
+                open_prs = github_client.get_open_pull_requests(repo)
 
-                    comparison = comparator.compare_pull_requests(source_pr, target_pr)
+                for pr in open_prs:
+                    if not github_client.is_automation_author(pr.user.login):
+                        continue
 
-                    if comparison.is_similar:
-                        similar_prs.append((target_pr, comparison))
+                    try:
+                        target_pr = github_client.get_pull_request_info(
+                            repo.owner.login, repo.name, pr.number
+                        )
 
-                except Exception as e:
-                    console.print(
-                        f"[yellow]Warning: Failed to analyze PR {pr.number} in {repo.full_name}: {e}[/yellow]"
-                    )
+                        comparison = comparator.compare_pull_requests(
+                            source_pr, target_pr
+                        )
 
-            # progress.advance(task)
+                        if comparison.is_similar:
+                            similar_prs.append((target_pr, comparison))
+
+                    except Exception as e:
+                        console.print(
+                            f"[yellow]Warning: Failed to analyze PR {pr.number} in {repo.full_name}: {e}[/yellow]"
+                        )
+
+                progress.advance(task)
 
         # Display results
         if not similar_prs:
