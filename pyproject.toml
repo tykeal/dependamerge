@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dependamerge"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Automatically merge pull requests created by automation tools across GitHub organizations"
 authors = [
     {name = "Matthew Watkins", email = "93649628+ModeSevenIndustrialSolutions@users.noreply.github.com" }
