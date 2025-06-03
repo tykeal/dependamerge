@@ -1,17 +1,28 @@
+<!--
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2024 The Linux Foundation
+-->
+
 # Dependamerge
 
-Automatically merge pull requests created by automation tools (like Dependabot, pre-commit.ci, Renovate) across GitHub organizations.
+Automatically merge pull requests created by automation tools (like Dependabot,
+pre-commit.ci, Renovate) across GitHub organizations.
 
 ## Overview
 
-Dependamerge analyzes a source pull request from an automation tool and finds similar pull requests across all repositories in the same GitHub organization. It then automatically approves and merges the matching PRs, saving time on routine dependency updates and automated maintenance tasks.
+Dependamerge analyzes a source pull request from an automation tool and finds
+similar pull requests across all repositories in the same GitHub organization.
+It then automatically approves and merges the matching PRs, saving time on
+routine dependency updates and automated maintenance tasks.
 
 ## Features
 
-- **Automated PR Detection**: Identifies pull requests created by popular automation tools
-- **Smart Matching**: Uses content similarity algorithms to match related PRs across repositories
-- **Bulk Operations**: Approve and merge multiple similar PRs with a single command
-- **Dry Run Mode**: Preview what would be changed without making any modifications
+- **Automated PR Detection**: Identifies pull requests created by popular
+  automation tools
+- **Smart Matching**: Uses content similarity algorithms to match related PRs
+  across repositories
+- **Bulk Operations**: Approve and merge related similar PRs with a single command
+- **Dry Run Mode**: Preview what changes will apply without modifications
 - **Rich CLI Output**: Beautiful terminal output with progress indicators and tables
 
 ## Supported Automation Tools
@@ -77,7 +88,7 @@ dependamerge https://github.com/owner/repo/pull/123 \
 
 ### Command Options
 
-- `--dry-run`: Show what would be done without making changes
+- `--dry-run`: Show what changes will apply without making them
 - `--threshold FLOAT`: Similarity threshold for matching PRs (0.0-1.0, default: 0.8)
 - `--merge-method TEXT`: Merge method - merge, squash, or rebase (default: merge)
 - `--token TEXT`: GitHub token (alternative to GITHUB_TOKEN env var)
@@ -88,7 +99,7 @@ dependamerge https://github.com/owner/repo/pull/123 \
 2. **Validation**: Ensures the PR is from a recognized automation tool
 3. **Organization Scan**: Lists all repositories in the same GitHub organization
 4. **PR Discovery**: Finds all open pull requests in each repository
-5. **Content Matching**: Compares PRs using multiple similarity metrics:
+5. **Content Matching**: Compares PRs using different similarity metrics:
    - Title similarity (normalized to remove version numbers)
    - File change patterns
    - Author matching
@@ -98,21 +109,25 @@ dependamerge https://github.com/owner/repo/pull/123 \
 
 ## Similarity Matching
 
-The tool uses several algorithms to determine if PRs are similar:
+The tool uses different algorithms to determine if PRs are similar:
 
 ### Title Normalization
+
 - Removes version numbers (e.g., "1.2.3", "v2.0.0")
 - Removes commit hashes
 - Removes dates
 - Normalizes whitespace
 
 ### File Change Analysis
+
 - Compares changed filenames using Jaccard similarity
 - Accounts for path normalization
 - Ignores version-specific filename differences
 
 ### Confidence Scoring
-Combines multiple factors:
+
+Combines different factors:
+
 - Title similarity score
 - File change similarity score
 - Author matching (same automation tool)
@@ -120,30 +135,35 @@ Combines multiple factors:
 ## Examples
 
 ### Dependabot PR
+
 ```bash
 # Merge a Dependabot dependency update across all repos
 dependamerge https://github.com/myorg/repo1/pull/45
 ```
 
 ### pre-commit.ci PR
+
 ```bash
 # Merge pre-commit hook updates
 dependamerge https://github.com/myorg/repo1/pull/12 --threshold 0.85
 ```
 
 ### Dry Run with Custom Threshold
+
 ```bash
-# See what would be merged with 90% similarity requirement
+# See what changes will apply with 90% similarity threshold
 dependamerge https://github.com/myorg/repo1/pull/78 --dry-run --threshold 0.9
 ```
 
 ## Safety Features
 
-- **Automation-Only**: Only processes PRs from recognized automation tools
-- **Mergeable Check**: Verifies PRs are in a mergeable state before attempting merge
-- **Similarity Threshold**: Configurable confidence threshold prevents incorrect matches
+- **Automation-Focused**: Processes PRs from recognized automation tools
+- **Mergeable Check**: Verifies PRs are in a mergeable state before attempting
+  merge
+- **Similarity Threshold**: Configurable confidence threshold prevents
+  incorrect matches
 - **Dry Run Mode**: Always test with `--dry-run` first
-- **Detailed Logging**: Shows exactly what PRs were found and why they matched
+- **Detailed Logging**: Shows which PRs match and why they match
 
 ## Development
 
@@ -190,27 +210,33 @@ MIT License - see LICENSE file for details.
 
 ### Common Issues
 
-**Authentication Error**
+#### Authentication Error
+
+```text
+Error: GitHub token needed
 ```
-Error: GitHub token is required
-```
+
 Solution: Set `GITHUB_TOKEN` environment variable or use `--token` flag.
 
-**Permission Error**
-```
+#### Permission Error
+
+```text
 Failed to fetch organization repositories
 ```
+
 Solution: Ensure your token has `read:org` scope.
 
-**No Similar PRs Found**
+#### No Similar PRs Found
+
 - Check that other repositories have open automation PRs
 - Try lowering the similarity threshold with `--threshold 0.7`
 - Use `--dry-run` to see detailed matching information
 
-**Merge Failures**
+#### Merge Failures
+
 - Ensure PRs are in mergeable state (no conflicts)
 - Check that you have write permissions to the target repositories
-- Verify the merge method is allowed in the repository settings
+- Verify the repository settings permit the merge method
 
 ### Getting Help
 
@@ -222,6 +248,6 @@ Solution: Ensure your token has `read:org` scope.
 
 - Store GitHub tokens securely (environment variables, not in code)
 - Use tokens with minimal required permissions
-- Regularly rotate access tokens
-- Review what PRs will be merged in dry-run mode first
+- Rotate access tokens periodically
+- Review PR changes in dry-run mode first
 - Be cautious with low similarity thresholds
