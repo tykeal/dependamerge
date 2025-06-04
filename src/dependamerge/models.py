@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
+
 from typing import List, Optional
 from pydantic import BaseModel
 
 
 class FileChange(BaseModel):
     """Represents a file change in a pull request."""
+
     filename: str
     additions: int
     deletions: int
@@ -13,6 +17,7 @@ class FileChange(BaseModel):
 
 class PullRequestInfo(BaseModel):
     """Represents pull request information."""
+
     number: int
     title: str
     body: Optional[str]
@@ -29,6 +34,7 @@ class PullRequestInfo(BaseModel):
 
 class ComparisonResult(BaseModel):
     """Result of comparing two pull requests."""
+
     is_similar: bool
     confidence_score: float
     reasons: List[str]
