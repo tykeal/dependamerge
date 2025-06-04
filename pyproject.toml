@@ -15,6 +15,21 @@ authors = [
 license = {text = "Apache-2.0"}
 readme = "README.md"
 requires-python = ">=3.10"
+classifiers = [
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: Unix",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.10",
+  "Topic :: Software Development",
+]
 dependencies = [
     "typer>=0.9.0",
     "requests>=2.31.0",
@@ -22,6 +37,15 @@ dependencies = [
     "rich>=13.0.0",
     "pydantic>=2.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/lfit/dependamerge"
+Repository = "https://github.com/lfit/dependamerge"
+Downloads = "https://github.com/lfit/dependamerge/releases"
+"Bug Tracker" = "https://github.com/lfit/dependamerge/issues"
+Documentation = "https://github.com/lfit/dependamerge/tree/main/docs"
+"Source Code" = "https://github.com/lfit/dependamerge"
+
 
 [project.optional-dependencies]
 dev = [
