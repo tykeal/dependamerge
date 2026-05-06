@@ -148,19 +148,28 @@ class TestCheckPrCommitSignatures:
         assert len(unverified) == 1
 
     @pytest.mark.asyncio
-    async def test_api_error_returns_verified(self):
-        """On API errors, assume verified to avoid false positives."""
+    async def test_api_error_propagates(self):
+        """On API errors, the exception now propagates to callers.
+
+        The previous fail-open default (returning ``(True, [])`` on
+        error) collided with the signature-preservation gate in
+        ``rebase.py``, which interprets ``all_verified=True`` as a
+        positive confirmation. Surfacing the error lets each caller
+        choose its own fail-open / fail-closed semantics.
+        """
         api = AsyncMock(spec=GitHubAsync)
 
         async def _raise_gen(*a, **kw):
-            raise Exception("API error")
+            raise RuntimeError("API error")
             yield  # pragma: no cover – makes this an async generator
 
         api.get_paginated = _raise_gen
         api.log = AsyncMock()
         api.log.debug = lambda *a, **kw: None
-        result = await GitHubAsync.check_pr_commit_signatures(api, "owner", "repo", 42)
-        assert result == (True, [])
+        with pytest.raises(RuntimeError, match="API error"):
+            await GitHubAsync.check_pr_commit_signatures(
+                api, "owner", "repo", 42
+            )
 
     @pytest.mark.asyncio
     async def test_unexpected_response_shape(self):

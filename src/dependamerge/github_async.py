@@ -930,57 +930,60 @@ class GitHubAsync:
     async def check_pr_commit_signatures(
         self, owner: str, repo: str, number: int
     ) -> tuple[bool, list[str]]:
-        """
-        Check whether all commits on a pull request have verified signatures.
+        """Check whether all commits on a pull request have verified signatures.
 
         REST: GET /repos/{owner}/{repo}/pulls/{pull_number}/commits
 
         Returns:
-            Tuple of (all_verified: bool, unverified_shas: list[str]).
-            ``all_verified`` is True when every commit carries a valid
-            signature according to GitHub.  ``unverified_shas`` contains
-            the abbreviated SHAs of any commits whose verification failed.
+            Tuple of ``(all_verified, unverified_shas)``.
+            ``all_verified`` is True when every commit carries a
+            valid signature according to GitHub.
+            ``unverified_shas`` contains the abbreviated SHAs of
+            any commits whose verification failed.
+
+        Raises:
+            Exception: surfaces the underlying API/network error
+            on failure rather than silently returning a default.
+            Callers that want fail-open or fail-closed semantics
+            should wrap the call in ``try``/``except`` and decide
+            for themselves — the previous fail-open default
+            (returning ``(True, [])``) collided with the
+            signature-preservation gate in ``rebase.py``, which
+            documents "verified" as a positive confirmation.
         """
         unverified: list[str] = []
-        try:
-            # Iterate over all pages of commits to ensure we don't miss
-            # unverified commits on pull requests with >100 commits.
-            async for commits in self.get_paginated(
-                f"/repos/{owner}/{repo}/pulls/{number}/commits",
-                per_page=100,
-            ):
-                if not isinstance(commits, list):
-                    # Unexpected response shape – assume OK to avoid false positives
-                    return True, []
+        # Iterate over all pages of commits to ensure we don't miss
+        # unverified commits on pull requests with >100 commits.
+        async for commits in self.get_paginated(
+            f"/repos/{owner}/{repo}/pulls/{number}/commits",
+            per_page=100,
+        ):
+            if not isinstance(commits, list):
+                # Unexpected response shape — assume OK to avoid
+                # false positives. The API returned 200 OK but in
+                # an unexpected shape, which is distinct from a
+                # network/HTTP error and arguably means the page
+                # is empty.
+                return True, []
 
-                for commit_data in commits:
-                    if not isinstance(commit_data, dict):
-                        continue
-                    raw_sha = commit_data.get("sha")
-                    sha = str(raw_sha)[:8] if isinstance(raw_sha, str) else "unknown"
-                    commit_obj = commit_data.get("commit")
-                    if not isinstance(commit_obj, dict):
-                        unverified.append(sha)
-                        continue
-                    verification = commit_obj.get("verification")
-                    if not isinstance(verification, dict):
-                        unverified.append(sha)
-                        continue
-                    if not verification.get("verified", False):
-                        unverified.append(sha)
+            for commit_data in commits:
+                if not isinstance(commit_data, dict):
+                    continue
+                raw_sha = commit_data.get("sha")
+                sha = str(raw_sha)[:8] if isinstance(raw_sha, str) else "unknown"
+                commit_obj = commit_data.get("commit")
+                if not isinstance(commit_obj, dict):
+                    unverified.append(sha)
+                    continue
+                verification = commit_obj.get("verification")
+                if not isinstance(verification, dict):
+                    unverified.append(sha)
+                    continue
+                if not verification.get("verified", False):
+                    unverified.append(sha)
 
-            all_verified = len(unverified) == 0
-            return all_verified, unverified
-        except Exception as e:
-            self.log.debug(
-                "Failed to check commit signatures for PR %s/%s#%s: %s",
-                owner,
-                repo,
-                number,
-                e,
-            )
-            # On error, assume verified to avoid blocking merges unnecessarily
-            return True, []
+        all_verified = len(unverified) == 0
+        return all_verified, unverified
 
     async def requires_commit_signatures(
         self, owner: str, repo: str, branch: str = "main"
