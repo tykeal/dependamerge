@@ -733,3 +733,71 @@ class TestLocalRebaseAutoMergeUnavailable:
         # recompute mergeability after the force-push before any
         # manual merge attempt in Step 6.
         assert "owner/repo#42" not in mgr._rebased_prs
+
+
+# ---------------------------------------------------------------------------
+# 5. local_rebase_pr fails closed when head repo identity is unknown
+# ---------------------------------------------------------------------------
+
+
+class TestLocalRebaseFailClosed:
+    """Verify local_rebase_pr() refuses to push when head repo is unknown.
+
+    For fork PRs, synthesising a clone URL from the base repo name
+    would push to the upstream repo instead of the fork (creating
+    or overwriting a branch on someone else's repository). When
+    ``head_repo_full_name`` and ``head_repo_clone_url`` are both
+    unset we cannot tell whether the PR is from a fork, so we
+    fail closed to avoid the dangerous mis-target.
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_head_repo_identity_returns_false(
+        self,
+    ) -> None:
+        """head_repo_full_name + head_repo_clone_url both None → False."""
+        import logging
+
+        from dependamerge.models import PullRequestInfo
+
+        # Construct a PR with NEITHER head_repo identifier set.
+        # This mimics the production state where ``PullRequestInfo``
+        # objects from the merge workflow don't populate the
+        # optional head/base repo fields (they're only set in the
+        # interactive fix flow).
+        pr = PullRequestInfo(
+            number=42,
+            node_id="PR_node42",
+            title="Test PR",
+            body="",
+            author="dependabot[bot]",
+            head_sha="abc123",
+            base_branch="main",
+            head_branch="feature",
+            state="open",
+            mergeable=True,
+            mergeable_state="behind",
+            behind_by=2,
+            files_changed=[],
+            repository_full_name="owner/repo",
+            html_url="https://github.com/owner/repo/pull/42",
+            reviews=[],
+            review_comments=[],
+            head_repo_full_name=None,
+            head_repo_clone_url=None,
+            base_repo_full_name=None,
+            base_repo_clone_url=None,
+            is_fork=None,
+        )
+
+        result = await rebase_module.local_rebase_pr(
+            pr_info=pr,
+            owner="owner",
+            repo="repo",
+            token="fake-token",
+            log=logging.getLogger("test"),
+        )
+        # Must NOT attempt the rebase — we'd risk pushing to the
+        # base repo for a fork PR. The caller falls through to
+        # auto-merge, which is always safe.
+        assert result is False

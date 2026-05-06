@@ -273,8 +273,31 @@ async def local_rebase_pr(
     base_clone_url = pr_info.base_repo_clone_url
     head_full = pr_info.head_repo_full_name
     base_full = pr_info.base_repo_full_name or f"{owner}/{repo}"
+
+    # Fail closed when head repo identity is ambiguous. Without a
+    # confirmed ``head_repo_full_name`` or ``head_repo_clone_url``
+    # we cannot tell whether the PR is from a fork. Synthesising a
+    # clone URL from the base repo would push to the wrong remote
+    # for fork PRs (creating or overwriting a branch on the base
+    # repo). The caller falls through to the auto-merge path on
+    # False, which is always safe.
+    if not head_full and not head_clone_url:
+        log.debug(
+            "Local rebase: PR %s/%s#%s missing head_repo identity "
+            "(head_repo_full_name and head_repo_clone_url are both unset); "
+            "failing closed to avoid pushing to the wrong remote.",
+            owner,
+            repo,
+            pr_info.number,
+        )
+        return False
+
+    # Both fields populated, or one of them — synthesise the
+    # missing URL from the known full_name. Safe because
+    # ``head_full`` is now confirmed to refer to the head repo,
+    # not the base.
     if not head_clone_url:
-        head_clone_url = f"https://github.com/{head_full or base_full}.git"
+        head_clone_url = f"https://github.com/{head_full}.git"
     if not base_clone_url:
         base_clone_url = f"https://github.com/{base_full}.git"
     head_full = head_full or base_full

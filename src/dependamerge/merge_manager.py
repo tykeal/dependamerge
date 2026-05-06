@@ -1258,7 +1258,16 @@ class AsyncMergeManager:
                             break
                         # Sleep no longer than the time remaining
                         # so we don't overshoot ``wait_deadline``.
-                        remaining = wait_deadline - asyncio.get_running_loop().time()
+                        # Clamp to a non-negative value: the loop's
+                        # ``while ... < wait_deadline`` check and the
+                        # ``time()`` call here are not atomic, so a
+                        # near-deadline crossing can produce a tiny
+                        # negative ``remaining`` which would raise
+                        # ``ValueError`` from ``asyncio.sleep``.
+                        remaining = max(
+                            0.0,
+                            wait_deadline - asyncio.get_running_loop().time(),
+                        )
                         await asyncio.sleep(
                             min(self._merge_recheck_interval, remaining)
                         )
