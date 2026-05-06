@@ -81,6 +81,8 @@ query($org: String!, $reposCursor: String) {
             baseRefName
             headRefName
             headRefOid
+            headRepository { nameWithOwner url isFork }
+            baseRepository { nameWithOwner url }
             createdAt
             updatedAt
             files(first: 50) {
@@ -169,6 +171,8 @@ query($owner: String!, $name: String!, $prsCursor: String, $prsPageSize: Int!, $
         baseRefName
         headRefName
         headRefOid
+        headRepository { nameWithOwner url isFork }
+        baseRepository { nameWithOwner url }
         createdAt
         updatedAt
         files(first: $filesPageSize) {

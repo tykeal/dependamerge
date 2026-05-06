@@ -17,6 +17,7 @@ Covers:
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -65,13 +66,18 @@ def _make_pr(
 
 
 def _make_mgr(**overrides) -> tuple[AsyncMergeManager, AsyncMock]:
-    """Build a manager with an AsyncMock GitHub client."""
-    defaults = {"token": "fake-token", "rebase_local": True}
+    """Build a manager with an AsyncMock GitHub client.
+
+    Thin wrapper around the shared ``tests.conftest.make_merge_manager``
+    so typing/lint fixes and defaults stay centralised. Local
+    additions: defaults ``rebase_local=True`` (the production
+    default — this module's tests focus on the rebase path).
+    """
+    from tests.conftest import make_merge_manager
+
+    defaults: dict[str, Any] = {"rebase_local": True}
     defaults.update(overrides)
-    mgr = AsyncMergeManager(**defaults)
-    client = AsyncMock()
-    mgr._github_client = client
-    return mgr, client
+    return make_merge_manager(**defaults)
 
 
 # ---------------------------------------------------------------------------

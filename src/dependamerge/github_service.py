@@ -515,6 +515,38 @@ class GitHubService:
             repository_full_name=repo_full_name,
             html_url=pr.get("url") or "",
             reviews=reviews,
+            # Populate head/base repo identity from the GraphQL
+            # ``headRepository`` / ``baseRepository`` fields so the
+            # signature-preserving local-rebase path can tell
+            # whether the PR is from a fork (and which remote to
+            # push to).  Without these, ``rebase.local_rebase_pr()``
+            # fails closed to avoid pushing to the wrong repository.
+            # GraphQL returns the HTTPS URL via ``url`` (without the
+            # ``.git`` suffix), so we synthesise the canonical
+            # ``clone_url`` form for parity with REST.
+            head_repo_full_name=(
+                (pr.get("headRepository") or {}).get("nameWithOwner")
+            ),
+            head_repo_clone_url=(
+                (
+                    (pr.get("headRepository") or {}).get("url")
+                    + ".git"
+                )
+                if (pr.get("headRepository") or {}).get("url")
+                else None
+            ),
+            base_repo_full_name=(
+                (pr.get("baseRepository") or {}).get("nameWithOwner")
+            ),
+            base_repo_clone_url=(
+                (
+                    (pr.get("baseRepository") or {}).get("url")
+                    + ".git"
+                )
+                if (pr.get("baseRepository") or {}).get("url")
+                else None
+            ),
+            is_fork=(pr.get("headRepository") or {}).get("isFork"),
         )
 
     async def find_similar_prs(
