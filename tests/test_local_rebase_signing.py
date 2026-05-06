@@ -635,3 +635,101 @@ class TestAuthedCloneUrl:
     def test_git_protocol_url_unchanged(self) -> None:
         url = "git://github.com/owner/repo.git"
         assert rebase_module.authed_clone_url(url, "abc123") == url
+
+
+# ---------------------------------------------------------------------------
+# 4. Local-rebase path conditionally skips _rebased_prs marking
+# ---------------------------------------------------------------------------
+
+
+class TestLocalRebaseAutoMergeUnavailable:
+    """Verify the conditional ``_rebased_prs`` invariant.
+
+    When local rebase succeeds but auto-merge cannot be enabled
+    (repo doesn't allow it, branch protection blocks it, etc.),
+    we must **not** mark ``_rebased_prs`` — doing so would skip
+    Step 5.5 and let Step 6 attempt a manual merge while GitHub
+    is still recomputing mergeability after the force-push,
+    which would 405 transiently.
+
+    When auto-merge *is* enabled, marking ``_rebased_prs`` is
+    correct: Step 5.5's wait would be redundant since auto-merge
+    handles the wait server-side, and the marker keeps Step 6's
+    skip gate firing for ``AUTO_MERGE_PENDING``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_auto_merge_unavailable_leaves_pr_unmarked(self) -> None:
+        """enable_auto_merge False → PR not in ``_rebased_prs``."""
+        mgr, client = _make_mgr(merge_timeout=0.1, fix_out_of_date=True)
+        pr = _make_pr(author="pre-commit-ci[bot]", mergeable_state="behind")
+
+        client.update_branch = AsyncMock()
+        # Repo doesn't allow auto-merge — enable_auto_merge returns False.
+        client.enable_auto_merge = AsyncMock(return_value=False)
+        # Refresh keeps the PR ``behind`` (transient post-push state).
+        client.get = AsyncMock(
+            return_value={
+                "mergeable": True,
+                "mergeable_state": "behind",
+                "state": "open",
+            }
+        )
+        client.analyze_block_reason = AsyncMock(return_value=None)
+        client.get_required_status_checks = AsyncMock(return_value=[])
+        client.requires_commit_signatures = AsyncMock(return_value=True)
+        client.post_issue_comment = AsyncMock()
+
+        with (
+            patch(
+                "dependamerge.rebase.local_rebase_pr",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                mgr,
+                "_detect_github2gerrit",
+                new_callable=AsyncMock,
+                return_value=GitHub2GerritDetectionResult(),
+            ),
+            patch.object(
+                mgr,
+                "_get_merge_method_for_repo",
+                new_callable=AsyncMock,
+                return_value="merge",
+            ),
+            patch.object(
+                mgr,
+                "_trigger_stale_precommit_ci",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                mgr,
+                "_check_merge_requirements",
+                new_callable=AsyncMock,
+                return_value=(True, ""),
+            ),
+            patch.object(
+                mgr,
+                "_approve_pr",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                mgr,
+                "_merge_pr_with_retry",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            await mgr._merge_single_pr(pr)
+
+        # REST update-branch must still NOT fire (signature
+        # preservation invariant).
+        client.update_branch.assert_not_awaited()
+        # _rebased_prs must NOT be populated, so Step 5.5 still
+        # runs its bounded wait. This gives GitHub time to
+        # recompute mergeability after the force-push before any
+        # manual merge attempt in Step 6.
+        assert "owner/repo#42" not in mgr._rebased_prs

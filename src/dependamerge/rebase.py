@@ -507,19 +507,22 @@ async def _run_local_path(
     """Local-rebase path.  Always succeeds from the caller's POV.
 
     Whether the underlying ``git`` workflow succeeds or fails, we
-    record the PR in ``_rebased_prs`` so Step 5.5 doesn't double
-    the merge_timeout, and we never fall back to REST
-    ``update-branch`` (doing so would defeat the whole point of
-    the local path).
+    never fall back to REST ``update-branch`` (doing so would
+    defeat the whole point of the local path).
 
-    We also enable auto-merge here — not in Step 5.5 — because
-    marking ``_rebased_prs`` makes Step 5.5 skip this PR, and
-    without auto-merge enablement Step 6's skip gate wouldn't
-    fire either (it only routes to ``AUTO_MERGE_PENDING`` when
-    the PR is in ``_auto_merge_enabled``).  Without that, a still-
-    pending PR would fall through to a manual merge attempt and
-    405 against unfinished checks — the failure mode this whole
-    feature exists to prevent.
+    Auto-merge enablement and ``_rebased_prs`` marking are linked:
+
+    - If auto-merge gets enabled, mark ``_rebased_prs`` so Step
+      5.5 skips this PR; auto-merge will handle the bounded wait
+      server-side and Step 6's skip gate routes to
+      ``AUTO_MERGE_PENDING``.
+    - If auto-merge cannot be enabled (repo doesn't allow it,
+      branch protection blocks it, etc.), do **not** mark
+      ``_rebased_prs`` so Step 5.5 still runs its bounded poll
+      loop. Without this, GitHub may still be recomputing
+      mergeability after the force-push when Step 6 fires and a
+      manual merge attempt would 405 transiently. Letting Step
+      5.5 wait gives GitHub time to settle before Step 6 acts.
     """
     log_and_print(
         ctx.log,
@@ -543,26 +546,29 @@ async def _run_local_path(
         )
         local_rebase_ok = False
 
-    ctx.rebased_prs.add(f"{owner}/{repo}#{pr_info.number}")
-
-    # Enable auto-merge regardless of local-rebase outcome.
-    # On success: GitHub may need a few seconds to recompute
-    # mergeability and start checks against the new head;
-    # auto-merge will fire when checks pass.
-    # On failure: the PR is unchanged on the GitHub side; auto-
-    # merge will fire when the PR is brought up to date through
-    # some other channel (a third-party rebase, a human update).
-    # In both cases, having auto-merge enabled means Step 6's
-    # skip gate routes the PR to ``AUTO_MERGE_PENDING`` rather
-    # than attempting a 405-prone manual merge.
+    # Try to enable auto-merge. We capture the return value so we
+    # can decide whether Step 5.5 should also run (see comment
+    # below).
     try:
-        await ctx.enable_auto_merge(pr_info, owner, repo)
+        auto_merge_ok = await ctx.enable_auto_merge(pr_info, owner, repo)
     except Exception as exc:
         ctx.log.debug(
             "Could not enable auto-merge after local rebase for %s: %s",
             pr_info.html_url,
             exc,
         )
+        auto_merge_ok = False
+
+    # Only mark ``_rebased_prs`` when auto-merge is active.
+    # Otherwise leave it unset so Step 5.5 still runs its bounded
+    # poll loop — GitHub may still be recomputing mergeability
+    # after the force-push, and a manual merge attempt in Step 6
+    # without that wait would 405 transiently.  When auto-merge
+    # *is* active, Step 6's skip gate routes the PR to
+    # ``AUTO_MERGE_PENDING`` directly, so the Step 5.5 wait would
+    # only double the merge_timeout.
+    if auto_merge_ok:
+        ctx.rebased_prs.add(f"{owner}/{repo}#{pr_info.number}")
 
     if local_rebase_ok:
         log_and_print(
@@ -578,6 +584,7 @@ async def _run_local_path(
             f"🛡️  Local rebase failed; deferring to auto-merge: {pr_info.html_url}",
             level="debug",
         )
+
 
 
 async def _run_rest_path(
