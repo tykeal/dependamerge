@@ -2353,7 +2353,6 @@ class AsyncMergeManager:
             add_remote,
             checkout,
             clone,
-            create_secure_tempdir,
             ensure_git_available,
             fetch,
             push_force_with_lease,
