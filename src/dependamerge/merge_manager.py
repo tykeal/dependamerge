@@ -1108,7 +1108,6 @@ class AsyncMergeManager:
                     github_client=self._github_client,
                     token=self.token,
                     rebase_local=self.rebase_local,
-                    fix_out_of_date=self.fix_out_of_date,
                     preview_mode=self.preview_mode,
                     merge_recheck_interval=self._merge_recheck_interval,
                     merge_poll_max_attempts=self._merge_poll_max_attempts,

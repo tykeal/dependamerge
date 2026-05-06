@@ -85,7 +85,6 @@ class RebaseContext:
     github_client: GitHubAsync | None
     token: str
     rebase_local: bool
-    fix_out_of_date: bool
     preview_mode: bool
     merge_recheck_interval: float
     merge_poll_max_attempts: int
@@ -357,26 +356,31 @@ async def local_rebase_pr(
             # rebase will surface the real problem if any.
             pass
 
-        # Rebase. ``git rebase`` here is non-interactive; if there
-        # are conflicts the command exits non-zero and leaves the
-        # working tree in conflict state, which we explicitly abort
-        # and treat as failure.
-        try:
-            rebase_result = rebase(
-                rebase_onto,
-                cwd=workspace,
-                autostash=False,
-                interactive=False,
-                logger=log.debug,
-            )
-        except GitError as exc:
-            log.debug("Local rebase: rebase failed for %s: %s", pr_info.html_url, exc)
-            return False
+        # Rebase. ``git rebase`` runs with ``check=False`` (see
+        # ``git_ops.rebase``), so a non-zero exit does *not* raise
+        # ``GitError``; we have to inspect ``returncode``
+        # ourselves. Conflicts are the most common cause of a
+        # non-zero exit here, but other failures (corrupt index,
+        # invalid base ref, etc.) hit the same path — surface
+        # stderr/stdout in debug output so the cause is visible
+        # to anyone investigating, then abort the rebase to leave
+        # the workspace in a clean state before cleanup.
+        rebase_result = rebase(
+            rebase_onto,
+            cwd=workspace,
+            autostash=False,
+            interactive=False,
+            logger=log.debug,
+        )
 
         if rebase_result.returncode != 0:
             log.debug(
-                "Local rebase: conflicts during rebase of %s; aborting.",
+                "Local rebase: rebase exited non-zero for %s "
+                "(rc=%d, stderr=%r, stdout=%r); aborting.",
                 pr_info.html_url,
+                rebase_result.returncode,
+                rebase_result.stderr,
+                rebase_result.stdout,
             )
             try:
                 rebase_abort(cwd=workspace, logger=log.debug)

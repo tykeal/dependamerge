@@ -85,10 +85,10 @@ class TestShouldUseLocalRebaseGate:
     @pytest.mark.asyncio
     async def test_disabled_by_no_rebase_local_flag(self) -> None:
         """``--no-rebase-local`` short-circuits the gate to False."""
-        mgr, _client = _make_mgr(rebase_local=False)
+        mgr, client = _make_mgr(rebase_local=False)
         pr = _make_pr(author="pre-commit-ci[bot]")  # would otherwise match
         use_local, reason = await rebase_module.should_use_local_rebase(
-            github_client=mgr._github_client,
+            github_client=client,
             pr_info=pr,
             owner="owner",
             repo="repo",
@@ -112,7 +112,7 @@ class TestShouldUseLocalRebaseGate:
         # No signature mocks needed: pre-commit-ci shortcut fires
         # before requires_commit_signatures is consulted.
         use_local, reason = await rebase_module.should_use_local_rebase(
-            github_client=mgr._github_client,
+            github_client=client,
             pr_info=pr,
             owner="owner",
             repo="repo",
@@ -132,7 +132,7 @@ class TestShouldUseLocalRebaseGate:
         client.requires_commit_signatures = AsyncMock(return_value=True)
         client.check_pr_commit_signatures = AsyncMock(return_value=(True, []))
         use_local, reason = await rebase_module.should_use_local_rebase(
-            github_client=mgr._github_client,
+            github_client=client,
             pr_info=pr,
             owner="owner",
             repo="repo",
@@ -156,7 +156,7 @@ class TestShouldUseLocalRebaseGate:
         client.requires_commit_signatures = AsyncMock(return_value=True)
         client.check_pr_commit_signatures = AsyncMock(return_value=(False, ["abc123"]))
         use_local, reason = await rebase_module.should_use_local_rebase(
-            github_client=mgr._github_client,
+            github_client=client,
             pr_info=pr,
             owner="owner",
             repo="repo",
@@ -174,7 +174,7 @@ class TestShouldUseLocalRebaseGate:
         pr = _make_pr(author="dependabot[bot]")
         client.requires_commit_signatures = AsyncMock(return_value=False)
         use_local, reason = await rebase_module.should_use_local_rebase(
-            github_client=mgr._github_client,
+            github_client=client,
             pr_info=pr,
             owner="owner",
             repo="repo",
@@ -196,7 +196,7 @@ class TestShouldUseLocalRebaseGate:
         pr = _make_pr(author="dependabot[bot]")
         client.requires_commit_signatures = AsyncMock(side_effect=RuntimeError("boom"))
         use_local, reason = await rebase_module.should_use_local_rebase(
-            github_client=mgr._github_client,
+            github_client=client,
             pr_info=pr,
             owner="owner",
             repo="repo",
@@ -211,10 +211,9 @@ class TestShouldUseLocalRebaseGate:
     async def test_no_github_client_returns_false(self) -> None:
         """Without a client we cannot consult branch protection."""
         mgr, _client = _make_mgr()
-        mgr._github_client = None
         pr = _make_pr(author="dependabot[bot]")
         use_local, reason = await rebase_module.should_use_local_rebase(
-            github_client=mgr._github_client,
+            github_client=None,
             pr_info=pr,
             owner="owner",
             repo="repo",
@@ -240,7 +239,7 @@ class TestShouldUseLocalRebaseGate:
         pr = _make_pr(author="dependabot[bot]")
         client.requires_commit_signatures = AsyncMock(return_value=MagicMock())
         use_local, _reason = await rebase_module.should_use_local_rebase(
-            github_client=mgr._github_client,
+            github_client=client,
             pr_info=pr,
             owner="owner",
             repo="repo",
@@ -270,7 +269,7 @@ class TestShouldUseLocalRebaseGate:
             side_effect=RuntimeError("transient API error")
         )
         use_local, reason = await rebase_module.should_use_local_rebase(
-            github_client=mgr._github_client,
+            github_client=client,
             pr_info=pr,
             owner="owner",
             repo="repo",
