@@ -4,7 +4,7 @@
 
 Covers:
 
-- ``_should_use_local_rebase`` decision tree (pre-commit-ci, signed
+- ``should_use_local_rebase`` decision tree (pre-commit-ci, signed
   base + signed head, signed base + unsigned head, unsigned base,
   ``--no-rebase-local`` opt-out).
 - End-to-end Step 5 dispatch: when the gate says ``use_local``, we
@@ -75,7 +75,7 @@ def _make_mgr(**overrides) -> tuple[AsyncMergeManager, AsyncMock]:
 
 
 # ---------------------------------------------------------------------------
-# 1. _should_use_local_rebase decision tree
+# 1. should_use_local_rebase decision tree
 # ---------------------------------------------------------------------------
 
 

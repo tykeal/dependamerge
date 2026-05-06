@@ -11,11 +11,14 @@ a PR up to date with its base branch before merging:
   endpoint (fast but produces unsigned commits).
 - :func:`local_rebase_pr` runs the local clone + rebase +
   force-push-with-lease against a secure temp workspace.
-- :func:`rest_rebase_and_poll` runs the REST ``update-branch``
-  call followed by the post-rebase polling loop that waits for
-  GitHub to recompute mergeability.
 - :func:`perform_step5_rebase` is the top-level dispatcher used by
-  :class:`AsyncMergeManager._merge_single_pr` Step 5.
+  :class:`AsyncMergeManager._merge_single_pr` Step 5.  It calls
+  :func:`should_use_local_rebase` to decide between paths, then
+  delegates to either ``_run_local_path`` or ``_run_rest_path``
+  (private helpers).  ``_run_rest_path`` runs the REST
+  ``update-branch`` call and the post-rebase polling loop
+  (``_poll_post_rebase``) that waits for GitHub to recompute
+  mergeability.
 - :func:`authed_clone_url` injects a token into an HTTPS clone URL
   for non-interactive ``git clone`` auth.
 
