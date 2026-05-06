@@ -300,6 +300,36 @@ async def local_rebase_pr(
         head_clone_url = f"https://github.com/{head_full}.git"
     if not base_clone_url:
         base_clone_url = f"https://github.com/{base_full}.git"
+
+    # Decide whether the PR is from a fork *before* we collapse
+    # ``head_full`` to ``base_full`` for clone-URL fallback.
+    # Treating fork PRs as non-fork would cause us to fetch the
+    # base branch from ``origin`` (the fork) instead of
+    # ``upstream`` (the canonical base repo) — either failing
+    # to fetch (the fork doesn't have the latest base commits)
+    # or, worse, fetching stale state and pushing back to the
+    # wrong remote.
+    #
+    # Preference order, all defensive:
+    #   1. The explicit ``pr_info.is_fork`` flag from the API.
+    #   2. Direct comparison of head/base full_names.
+    #   3. Direct comparison of head/base clone URLs.
+    if pr_info.is_fork is not None:
+        is_fork = bool(pr_info.is_fork)
+    elif head_full and base_full and head_full != base_full:
+        is_fork = True
+    elif (
+        head_clone_url
+        and base_clone_url
+        and head_clone_url != base_clone_url
+    ):
+        is_fork = True
+    else:
+        is_fork = False
+
+    # Now safe to collapse ``head_full`` for the clone-URL
+    # synthesis fallback. ``is_fork`` has already been computed
+    # above and won't be misled by this assignment.
     head_full = head_full or base_full
 
     head_branch = pr_info.head_branch
@@ -350,7 +380,7 @@ async def local_rebase_pr(
         # from a fork, from origin otherwise. We need it
         # available locally before we can rebase onto it.
         try:
-            if (head_full or base_full) != base_full:
+            if is_fork:
                 add_remote("upstream", upstream_url, cwd=workspace, logger=log.debug)
                 fetch(
                     "upstream",
@@ -400,9 +430,22 @@ async def local_rebase_pr(
         )
 
         if rebase_result.returncode != 0:
+            # Shallow clones (depth=50) can miss the merge base
+            # for PRs whose branch point is older than 50 commits.
+            # ``git rebase`` reports this as a generic non-zero
+            # exit; the diagnostic is visible in stderr but we
+            # can't reliably distinguish it without parsing
+            # locale-dependent text.
+            #
+            # Recovery: abort the failed rebase, unshallow both
+            # remotes, and retry the rebase. If that also fails,
+            # the cause is genuine (conflicts, corrupt index,
+            # etc.) and we return False as before so the caller
+            # falls through to the auto-merge path.
             log.debug(
                 "Local rebase: rebase exited non-zero for %s "
-                "(rc=%d, stderr=%r, stdout=%r); aborting.",
+                "(rc=%d, stderr=%r, stdout=%r); attempting "
+                "unshallow + retry.",
                 pr_info.html_url,
                 rebase_result.returncode,
                 rebase_result.stderr,
@@ -412,7 +455,53 @@ async def local_rebase_pr(
                 rebase_abort(cwd=workspace, logger=log.debug)
             except Exception:
                 pass
-            return False
+
+            try:
+                fetch(
+                    "origin",
+                    cwd=workspace,
+                    unshallow=True,
+                    logger=log.debug,
+                )
+                if is_fork:
+                    fetch(
+                        "upstream",
+                        cwd=workspace,
+                        unshallow=True,
+                        logger=log.debug,
+                    )
+            except GitError as exc:
+                log.debug(
+                    "Local rebase: unshallow failed for %s: %s",
+                    pr_info.html_url,
+                    exc,
+                )
+                return False
+
+            rebase_result = rebase(
+                rebase_onto,
+                cwd=workspace,
+                autostash=False,
+                interactive=False,
+                logger=log.debug,
+            )
+            if rebase_result.returncode != 0:
+                log.debug(
+                    "Local rebase: rebase still failing after unshallow "
+                    "for %s (rc=%d, stderr=%r); aborting.",
+                    pr_info.html_url,
+                    rebase_result.returncode,
+                    rebase_result.stderr,
+                )
+                try:
+                    rebase_abort(cwd=workspace, logger=log.debug)
+                except Exception:
+                    pass
+                return False
+            log.debug(
+                "Local rebase: succeeded after unshallow for %s",
+                pr_info.html_url,
+            )
 
         # Force-push with lease to the head repo. We push back to
         # ``origin`` because the head ref always lives there (even

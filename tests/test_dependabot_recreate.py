@@ -167,9 +167,7 @@ class TestCheckPrCommitSignatures:
         api.log = AsyncMock()
         api.log.debug = lambda *a, **kw: None
         with pytest.raises(RuntimeError, match="API error"):
-            await GitHubAsync.check_pr_commit_signatures(
-                api, "owner", "repo", 42
-            )
+            await GitHubAsync.check_pr_commit_signatures(api, "owner", "repo", 42)
 
     @pytest.mark.asyncio
     async def test_unexpected_response_shape(self):

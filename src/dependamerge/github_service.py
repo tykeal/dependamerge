@@ -40,6 +40,47 @@ AUTOMATION_TOOLS = [
 ]
 
 
+def _str_or_none(value: Any) -> str | None:
+    """Return ``value`` as a string when truthy, else None.
+
+    Used when populating optional ``PullRequestInfo`` fields from
+    GraphQL responses where the field may be missing entirely or
+    explicitly null.
+    """
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _bool_or_none(value: Any) -> bool | None:
+    """Coerce ``value`` to bool when present, else None.
+
+    Mirrors :func:`_str_or_none` for boolean GraphQL fields
+    (``isFork``).
+    """
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _clone_url_with_git_suffix(url: Any) -> str | None:
+    """Synthesise a canonical ``.git`` clone URL from a GraphQL ``url``.
+
+    GraphQL's ``Repository.url`` returns the HTTPS URL without the
+    ``.git`` suffix that REST's ``clone_url`` includes.  This
+    helper appends ``.git`` so both code paths produce the same
+    string and downstream consumers (notably
+    :func:`rebase.local_rebase_pr`) can treat them uniformly.
+
+    Returns None when the input is missing or empty so the
+    PullRequestInfo field stays unset rather than holding a
+    bogus ``".git"`` string.
+    """
+    if isinstance(url, str) and url:
+        return f"{url}.git"
+    return None
+
+
 class GitHubService:
     """
     Asynchronous service orchestrating GraphQL paging and mapping results
@@ -524,29 +565,21 @@ class GitHubService:
             # GraphQL returns the HTTPS URL via ``url`` (without the
             # ``.git`` suffix), so we synthesise the canonical
             # ``clone_url`` form for parity with REST.
-            head_repo_full_name=(
+            head_repo_full_name=_str_or_none(
                 (pr.get("headRepository") or {}).get("nameWithOwner")
             ),
-            head_repo_clone_url=(
-                (
-                    (pr.get("headRepository") or {}).get("url")
-                    + ".git"
-                )
-                if (pr.get("headRepository") or {}).get("url")
-                else None
+            head_repo_clone_url=_clone_url_with_git_suffix(
+                (pr.get("headRepository") or {}).get("url")
             ),
-            base_repo_full_name=(
+            base_repo_full_name=_str_or_none(
                 (pr.get("baseRepository") or {}).get("nameWithOwner")
             ),
-            base_repo_clone_url=(
-                (
-                    (pr.get("baseRepository") or {}).get("url")
-                    + ".git"
-                )
-                if (pr.get("baseRepository") or {}).get("url")
-                else None
+            base_repo_clone_url=_clone_url_with_git_suffix(
+                (pr.get("baseRepository") or {}).get("url")
             ),
-            is_fork=(pr.get("headRepository") or {}).get("isFork"),
+            is_fork=_bool_or_none(
+                (pr.get("headRepository") or {}).get("isFork")
+            ),
         )
 
     async def find_similar_prs(
