@@ -119,10 +119,18 @@ class Step5Outcome:
 def authed_clone_url(clone_url: str, token: str) -> str:
     """Return an HTTPS clone URL with the token injected for auth.
 
-    The token never appears in command-line arguments — it goes
-    through the standard ``git clone`` machinery, which redacts it
-    from log output via :func:`git_ops._redact`.  Non-HTTPS URLs
-    (SSH, ``git://``) are returned unchanged.
+    The token *is* passed to ``git`` as part of the URL command-
+    line argument, which means it can be visible to process-
+    listing tools (``ps``, ``/proc/<pid>/cmdline``) on the local
+    machine for the duration of the git invocation. Log output is
+    separately redacted by :func:`git_ops._redact`, but no
+    equivalent protection exists for ``ps``-style introspection.
+    Callers needing stronger guarantees should use a different
+    auth mechanism (e.g. SSH keys or a credential helper) and
+    pass an unmodified ``ssh://`` / ``git@`` URL through
+    unchanged.
+
+    Non-HTTPS URLs (SSH, ``git://``) are returned unchanged.
     """
     if clone_url.startswith("https://"):
         return clone_url.replace("https://", f"https://x-access-token:{token}@")
@@ -210,10 +218,16 @@ async def should_use_local_rebase(
             pr_info.number,
             exc,
         )
-        # Conservative: if we can't tell, prefer the local path
-        # (worst case: minor extra work; best case: preserve a
-        # signature we couldn't see).
-        return True, "signature check failed; preferring local path"
+        # Fail closed: if we can't confirm the PR head is
+        # verified, route to the REST path. The opposite
+        # (assuming verification and using the local path)
+        # would mean transient API failures could trigger
+        # network-touching local clones, and would conflict
+        # with the documented gate ("base requires signatures
+        # AND PR head is verified"). When verification isn't
+        # established, REST update-branch can't make things
+        # any worse than they already are.
+        return False, "signature check failed"
 
     if all_verified:
         return True, "base requires signatures and PR head is verified"
@@ -490,6 +504,15 @@ async def _run_local_path(
     the merge_timeout, and we never fall back to REST
     ``update-branch`` (doing so would defeat the whole point of
     the local path).
+
+    We also enable auto-merge here — not in Step 5.5 — because
+    marking ``_rebased_prs`` makes Step 5.5 skip this PR, and
+    without auto-merge enablement Step 6's skip gate wouldn't
+    fire either (it only routes to ``AUTO_MERGE_PENDING`` when
+    the PR is in ``_auto_merge_enabled``).  Without that, a still-
+    pending PR would fall through to a manual merge attempt and
+    405 against unfinished checks — the failure mode this whole
+    feature exists to prevent.
     """
     log_and_print(
         ctx.log,
@@ -514,6 +537,26 @@ async def _run_local_path(
         local_rebase_ok = False
 
     ctx.rebased_prs.add(f"{owner}/{repo}#{pr_info.number}")
+
+    # Enable auto-merge regardless of local-rebase outcome.
+    # On success: GitHub may need a few seconds to recompute
+    # mergeability and start checks against the new head;
+    # auto-merge will fire when checks pass.
+    # On failure: the PR is unchanged on the GitHub side; auto-
+    # merge will fire when the PR is brought up to date through
+    # some other channel (a third-party rebase, a human update).
+    # In both cases, having auto-merge enabled means Step 6's
+    # skip gate routes the PR to ``AUTO_MERGE_PENDING`` rather
+    # than attempting a 405-prone manual merge.
+    try:
+        await ctx.enable_auto_merge(pr_info, owner, repo)
+    except Exception as exc:
+        ctx.log.debug(
+            "Could not enable auto-merge after local rebase for %s: %s",
+            pr_info.html_url,
+            exc,
+        )
+
     if local_rebase_ok:
         log_and_print(
             ctx.log,

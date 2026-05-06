@@ -250,6 +250,37 @@ class TestShouldUseLocalRebaseGate:
         )
         assert use_local is False
 
+    @pytest.mark.asyncio
+    async def test_pr_signature_check_failure_uses_rest(self) -> None:
+        """If ``check_pr_commit_signatures()`` raises, fail safely to REST.
+
+        Distinct from ``test_signature_check_failure_uses_rest``
+        which covers ``requires_commit_signatures()`` raising.
+        Here the base requirement check succeeds (signatures are
+        required) but the PR-head verification check raises.
+        Failing closed avoids triggering network-touching local
+        clones on transient API failures, and keeps the gate
+        consistent with its documented invariant ("base requires
+        signatures AND PR head is verified").
+        """
+        mgr, client = _make_mgr()
+        pr = _make_pr(author="dependabot[bot]")
+        client.requires_commit_signatures = AsyncMock(return_value=True)
+        client.check_pr_commit_signatures = AsyncMock(
+            side_effect=RuntimeError("transient API error")
+        )
+        use_local, reason = await rebase_module.should_use_local_rebase(
+            github_client=mgr._github_client,
+            pr_info=pr,
+            owner="owner",
+            repo="repo",
+            base_branch="main",
+            rebase_local=mgr.rebase_local,
+            log=mgr.log,
+        )
+        assert use_local is False
+        assert "signature check failed" in reason
+
 
 # ---------------------------------------------------------------------------
 # 2. Step 5 dispatch: local-rebase path skips REST update-branch
@@ -422,13 +453,15 @@ class TestStep5DispatchLocalRebase:
         client.update_branch.assert_not_awaited()
         # PR is marked rebased so Step 5.5 doesn't double-wait.
         assert "owner/repo#42" in mgr._rebased_prs
-        # The flow continues to Step 6 (manual merge attempt). In
-        # this test the mock returns True so we end up MERGED; in
-        # production a signature-protected branch would 405 here
-        # and surface the failure to the user. Either outcome is
-        # better than the previous behaviour of *silently breaking*
-        # the verification by calling REST update-branch.
-        assert result.status == MergeStatus.MERGED
+        # Auto-merge gets enabled by the local-rebase orchestrator
+        # (regardless of whether the local rebase itself succeeded
+        # or failed) so Step 6's skip gate routes the PR to
+        # AUTO_MERGE_PENDING. Without this, marking ``_rebased_prs``
+        # would skip Step 5.5 too, and Step 6 would attempt a
+        # manual merge that 405s against pending checks — exactly
+        # the failure mode this feature exists to prevent.
+        assert "owner/repo#42" in mgr._auto_merge_enabled
+        assert result.status == MergeStatus.AUTO_MERGE_PENDING
 
     @pytest.mark.asyncio
     async def test_unsigned_base_uses_rest_update_branch(self) -> None:
