@@ -334,6 +334,7 @@ class _MergeContext:
     netrc_optional: bool
     github2gerrit_mode: str
     include_human_prs: bool = False
+    rebase_local: bool = True
 
     # Derived / mutable state
     github_client: GitHubClient | None = None
@@ -747,6 +748,7 @@ def _run_parallel_merge(
             github2gerrit_mode=ctx.github2gerrit_mode,
             no_netrc=ctx.no_netrc,
             netrc_file=ctx.netrc_file,
+            rebase_local=ctx.rebase_local,
         ) as merge_manager:
             if not preview:
                 console.print(
@@ -1482,6 +1484,19 @@ def merge(
         "--no-fix",
         help="Do not attempt to automatically fix out-of-date branches",
     ),
+    rebase_local: bool = typer.Option(
+        True,
+        "--rebase-local/--no-rebase-local",
+        help=(
+            "When rebasing a behind PR, prefer a local ``git`` clone + "
+            "rebase + force-push-with-lease over the GitHub REST "
+            "``update-branch`` endpoint when the base branch requires "
+            "verified signatures or the PR is from pre-commit-ci[bot]. "
+            "The local path inherits ``~/.gitconfig`` so commits stay "
+            "signed; the REST path is faster but produces unsigned "
+            "commits that break verification. Default: enabled."
+        ),
+    ),
     merge_timeout: float = typer.Option(
         DEFAULT_MERGE_TIMEOUT,
         "--merge-timeout",
@@ -1699,6 +1714,7 @@ def merge(
             netrc_optional=netrc_optional,
             github2gerrit_mode=github2gerrit_mode,
             include_human_prs=include_human_prs,
+            rebase_local=rebase_local,
         )
         try:
             _handle_repo_merge(parsed_repo, repo_ctx)
@@ -1765,6 +1781,7 @@ def merge(
         netrc_optional=netrc_optional,
         github2gerrit_mode=github2gerrit_mode,
         include_human_prs=include_human_prs,
+        rebase_local=rebase_local,
     )
 
     try:
