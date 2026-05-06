@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from dependamerge import rebase as rebase_module
 from dependamerge.github2gerrit_detector import GitHub2GerritDetectionResult
 from dependamerge.merge_manager import AsyncMergeManager, MergeStatus
 from dependamerge.models import PullRequestInfo
@@ -86,8 +87,14 @@ class TestShouldUseLocalRebaseGate:
         """``--no-rebase-local`` short-circuits the gate to False."""
         mgr, _client = _make_mgr(rebase_local=False)
         pr = _make_pr(author="pre-commit-ci[bot]")  # would otherwise match
-        use_local, reason = await mgr._should_use_local_rebase(
-            pr, "owner", "repo", "main"
+        use_local, reason = await rebase_module.should_use_local_rebase(
+            github_client=mgr._github_client,
+            pr_info=pr,
+            owner="owner",
+            repo="repo",
+            base_branch="main",
+            rebase_local=mgr.rebase_local,
+            log=mgr.log,
         )
         assert use_local is False
         assert "--no-rebase-local" in reason
@@ -104,8 +111,14 @@ class TestShouldUseLocalRebaseGate:
         pr = _make_pr(author="pre-commit-ci[bot]")
         # No signature mocks needed: pre-commit-ci shortcut fires
         # before requires_commit_signatures is consulted.
-        use_local, reason = await mgr._should_use_local_rebase(
-            pr, "owner", "repo", "main"
+        use_local, reason = await rebase_module.should_use_local_rebase(
+            github_client=mgr._github_client,
+            pr_info=pr,
+            owner="owner",
+            repo="repo",
+            base_branch="main",
+            rebase_local=mgr.rebase_local,
+            log=mgr.log,
         )
         assert use_local is True
         assert "pre-commit-ci" in reason
@@ -118,8 +131,14 @@ class TestShouldUseLocalRebaseGate:
         pr = _make_pr(author="dependabot[bot]")
         client.requires_commit_signatures = AsyncMock(return_value=True)
         client.check_pr_commit_signatures = AsyncMock(return_value=(True, []))
-        use_local, reason = await mgr._should_use_local_rebase(
-            pr, "owner", "repo", "main"
+        use_local, reason = await rebase_module.should_use_local_rebase(
+            github_client=mgr._github_client,
+            pr_info=pr,
+            owner="owner",
+            repo="repo",
+            base_branch="main",
+            rebase_local=mgr.rebase_local,
+            log=mgr.log,
         )
         assert use_local is True
         assert "PR head is verified" in reason
@@ -136,8 +155,14 @@ class TestShouldUseLocalRebaseGate:
         pr = _make_pr(author="dependabot[bot]")
         client.requires_commit_signatures = AsyncMock(return_value=True)
         client.check_pr_commit_signatures = AsyncMock(return_value=(False, ["abc123"]))
-        use_local, reason = await mgr._should_use_local_rebase(
-            pr, "owner", "repo", "main"
+        use_local, reason = await rebase_module.should_use_local_rebase(
+            github_client=mgr._github_client,
+            pr_info=pr,
+            owner="owner",
+            repo="repo",
+            base_branch="main",
+            rebase_local=mgr.rebase_local,
+            log=mgr.log,
         )
         assert use_local is False
         assert "not currently verified" in reason
@@ -148,8 +173,14 @@ class TestShouldUseLocalRebaseGate:
         mgr, client = _make_mgr()
         pr = _make_pr(author="dependabot[bot]")
         client.requires_commit_signatures = AsyncMock(return_value=False)
-        use_local, reason = await mgr._should_use_local_rebase(
-            pr, "owner", "repo", "main"
+        use_local, reason = await rebase_module.should_use_local_rebase(
+            github_client=mgr._github_client,
+            pr_info=pr,
+            owner="owner",
+            repo="repo",
+            base_branch="main",
+            rebase_local=mgr.rebase_local,
+            log=mgr.log,
         )
         assert use_local is False
         assert "does not require signatures" in reason
@@ -164,8 +195,14 @@ class TestShouldUseLocalRebaseGate:
         mgr, client = _make_mgr()
         pr = _make_pr(author="dependabot[bot]")
         client.requires_commit_signatures = AsyncMock(side_effect=RuntimeError("boom"))
-        use_local, reason = await mgr._should_use_local_rebase(
-            pr, "owner", "repo", "main"
+        use_local, reason = await rebase_module.should_use_local_rebase(
+            github_client=mgr._github_client,
+            pr_info=pr,
+            owner="owner",
+            repo="repo",
+            base_branch="main",
+            rebase_local=mgr.rebase_local,
+            log=mgr.log,
         )
         assert use_local is False
         assert "signature requirement check failed" in reason
@@ -176,8 +213,14 @@ class TestShouldUseLocalRebaseGate:
         mgr, _client = _make_mgr()
         mgr._github_client = None
         pr = _make_pr(author="dependabot[bot]")
-        use_local, reason = await mgr._should_use_local_rebase(
-            pr, "owner", "repo", "main"
+        use_local, reason = await rebase_module.should_use_local_rebase(
+            github_client=mgr._github_client,
+            pr_info=pr,
+            owner="owner",
+            repo="repo",
+            base_branch="main",
+            rebase_local=mgr.rebase_local,
+            log=mgr.log,
         )
         assert use_local is False
         assert "no GitHub client" in reason
@@ -196,8 +239,14 @@ class TestShouldUseLocalRebaseGate:
         mgr, client = _make_mgr()
         pr = _make_pr(author="dependabot[bot]")
         client.requires_commit_signatures = AsyncMock(return_value=MagicMock())
-        use_local, _reason = await mgr._should_use_local_rebase(
-            pr, "owner", "repo", "main"
+        use_local, _reason = await rebase_module.should_use_local_rebase(
+            github_client=mgr._github_client,
+            pr_info=pr,
+            owner="owner",
+            repo="repo",
+            base_branch="main",
+            rebase_local=mgr.rebase_local,
+            log=mgr.log,
         )
         assert use_local is False
 
@@ -240,9 +289,8 @@ class TestStep5DispatchLocalRebase:
         client.requires_commit_signatures = AsyncMock(return_value=True)
 
         with (
-            patch.object(
-                mgr,
-                "_local_git_rebase_pr",
+            patch(
+                "dependamerge.rebase.local_rebase_pr",
                 new_callable=AsyncMock,
                 return_value=True,
             ) as mock_local_rebase,
@@ -325,9 +373,8 @@ class TestStep5DispatchLocalRebase:
         client.requires_commit_signatures = AsyncMock(return_value=True)
 
         with (
-            patch.object(
-                mgr,
-                "_local_git_rebase_pr",
+            patch(
+                "dependamerge.rebase.local_rebase_pr",
                 new_callable=AsyncMock,
                 return_value=False,
             ) as mock_local_rebase,
@@ -410,9 +457,8 @@ class TestStep5DispatchLocalRebase:
         client.requires_commit_signatures = AsyncMock(return_value=False)
 
         with (
-            patch.object(
-                mgr,
-                "_local_git_rebase_pr",
+            patch(
+                "dependamerge.rebase.local_rebase_pr",
                 new_callable=AsyncMock,
                 return_value=True,
             ) as mock_local_rebase,
@@ -488,9 +534,8 @@ class TestStep5DispatchLocalRebase:
         client.requires_commit_signatures = AsyncMock(return_value=True)
 
         with (
-            patch.object(
-                mgr,
-                "_local_git_rebase_pr",
+            patch(
+                "dependamerge.rebase.local_rebase_pr",
                 new_callable=AsyncMock,
                 return_value=True,
             ) as mock_local_rebase,
@@ -546,15 +591,15 @@ class TestAuthedCloneUrl:
     """Token injection mirrors ``FixOrchestrator._authed_url``."""
 
     def test_https_url_gets_token(self) -> None:
-        url = AsyncMergeManager._authed_clone_url(
+        url = rebase_module.authed_clone_url(
             "https://github.com/owner/repo.git", "abc123"
         )
         assert url == "https://x-access-token:abc123@github.com/owner/repo.git"
 
     def test_ssh_url_unchanged(self) -> None:
         ssh = "git@github.com:owner/repo.git"
-        assert AsyncMergeManager._authed_clone_url(ssh, "abc123") == ssh
+        assert rebase_module.authed_clone_url(ssh, "abc123") == ssh
 
     def test_git_protocol_url_unchanged(self) -> None:
         url = "git://github.com/owner/repo.git"
-        assert AsyncMergeManager._authed_clone_url(url, "abc123") == url
+        assert rebase_module.authed_clone_url(url, "abc123") == url
