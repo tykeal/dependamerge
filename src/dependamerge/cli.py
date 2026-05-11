@@ -804,6 +804,28 @@ def _execute_confirmed_merge(
     if final_auto_merge > 0:
         console.print(f"⏳ Auto-merge pending for {final_auto_merge} PRs")
 
+    _print_failed_pr_details(real_results)
+
+
+def _print_failed_pr_details(
+    merge_results: list[MergeResult],
+) -> None:
+    """Print URL and reason for each failed PR in the result list.
+
+    A bare ``Failed: 1`` line in the summary forces the user to
+    scroll back through the merge output to find which PR failed
+    and why.  Surface that information directly so the failure is
+    actionable from the final summary alone.
+    """
+    failed = [r for r in merge_results if r.status.value == "failed"]
+    if not failed:
+        return
+    console.print("\n❌ Failed PRs:")
+    for r in failed:
+        url = getattr(r.pr_info, "html_url", "<unknown>")
+        reason = r.error or "no reason reported"
+        console.print(f"   • {url}\n     {reason}")
+
 
 def _display_merge_results(
     merge_results: list[MergeResult],
@@ -838,6 +860,8 @@ def _display_merge_results(
         if skipped_count > 0:
             parts.append(f"{skipped_count} skipped")
         console.print(f"📈 Final Results: {', '.join(parts)}")
+
+    _print_failed_pr_details(merge_results)
 
 
 def _handle_repo_merge(
@@ -882,11 +906,15 @@ def _handle_repo_merge(
     # --- Progress tracker ---
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
-            ctx.owner,
+            f"{ctx.owner}/{ctx.repo_name}",
             operation_label="Fetching open PRs",
             operation_icon="🔍",
         )
-        ctx.progress_tracker.update_total_repositories(1)
+        # Repo-scoped runs operate on a single repository, so the
+        # ``X/Y repos`` progress fraction is meaningless.  Skip
+        # ``update_total_repositories`` so the tracker falls through
+        # to the no-progress display branch and renders cleanly as
+        # ``🔍 Fetching open PRs in <owner>/<repo>``.
         ctx.progress_tracker.start()
 
     # --- Fetch open PRs for the repository ---
@@ -987,7 +1015,7 @@ def _handle_repo_merge(
     # --- Preview / merge using existing infrastructure ---
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
-            ctx.owner,
+            f"{ctx.owner}/{ctx.repo_name}",
             operation_label="Merging PRs",
             operation_icon="🔀",
         )
@@ -1096,7 +1124,7 @@ def _execute_repo_confirmed_merge(
 
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
-            ctx.owner,
+            f"{ctx.owner}/{ctx.repo_name}",
             operation_label="Merging PRs",
             operation_icon="🔀",
         )
@@ -1136,6 +1164,8 @@ def _execute_repo_confirmed_merge(
         console.print(f"🛑 Blocked {final_blocked} PRs")
     if final_auto_merge > 0:
         console.print(f"⏳ Auto-merge pending for {final_auto_merge} PRs")
+
+    _print_failed_pr_details(real_results)
 
 
 def _handle_gerrit_merge(

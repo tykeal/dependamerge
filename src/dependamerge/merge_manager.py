@@ -175,7 +175,14 @@ class AsyncMergeManager:
         self._github_client: GitHubAsync | None = None
         self._github_service: GitHubService | None = None
         self._copilot_handler: CopilotCommentHandler | None = None
-        self._console = Console()
+        # Reuse the progress tracker's Rich Console (when one is
+        # provided) so per-PR ✅/❌ lines emitted during a merge run
+        # interleave cleanly with the Live progress display.  Using a
+        # separate Console() instance causes Rich's Live re-draw to
+        # garble or eat those messages because the two consoles share
+        # the terminal but coordinate independently.
+        tracker_console = getattr(progress_tracker, "console", None)
+        self._console = tracker_console if tracker_console is not None else Console()
 
         # Track merge methods per repository
         self._pr_merge_methods: dict[str, str] = {}

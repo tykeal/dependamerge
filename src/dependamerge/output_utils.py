@@ -47,4 +47,10 @@ def log_and_print(
     if style:
         console.print(message, style=style)
     else:
-        print(message)
+        # Route through the Rich console rather than the builtin
+        # ``print`` so output coordinates correctly with any active
+        # Rich ``Live`` display in the same console.  Using
+        # ``print`` here causes the Live re-draw to garble or eat
+        # interleaved messages (e.g. per-PR ✅/❌ lines emitted
+        # while a progress tracker is running).
+        console.print(message)
