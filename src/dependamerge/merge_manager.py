@@ -53,6 +53,13 @@ from .progress_tracker import MergeProgressTracker
 DEFAULT_MERGE_TIMEOUT: float = 300.0  # seconds (5 minutes)
 DEFAULT_MERGE_RECHECK_INTERVAL: float = 10.0  # seconds between polls
 
+# A DCO check normally completes within a few seconds.  When it has
+# been pending for longer than this on a PR that itself was created
+# / last updated more than this many seconds ago, the check is
+# treated as stuck.  Used by ``_detect_stuck_dco`` to decide whether
+# to ask dependabot to recreate the PR.
+STUCK_DCO_THRESHOLD_SECONDS: float = 60.0
+
 
 class MergeStatus(Enum):
     """Status of a PR merge operation."""
@@ -1569,9 +1576,55 @@ class AsyncMergeManager:
                     # Before giving up, check if this is a dependabot PR
                     # that failed due to unsigned commits.  If so, ask
                     # dependabot to recreate the PR and merge the new one.
+                    #
+                    # Two recreate triggers are considered:
+                    #   1. Branch-protection failures (the original
+                    #      unsigned-commit case).
+                    #   2. A DCO check that has been stuck (queued /
+                    #      in_progress / pending) for longer than
+                    #      ``STUCK_DCO_THRESHOLD_SECONDS`` on a PR
+                    #      that itself was created and last updated
+                    #      that long ago. DCO normally completes in
+                    #      seconds; when it does not, the only
+                    #      reliable recovery for dependabot PRs is
+                    #      to recreate the PR so the check fires
+                    #      again on a fresh head SHA.
                     recreated_pr = None
                     if pr_info.author == "dependabot[bot]" and not self.preview_mode:
-                        if "branch protection" in failure_reason.lower():
+                        should_recreate = (
+                            "branch protection" in failure_reason.lower()
+                        )
+                        if not should_recreate:
+                            try:
+                                (
+                                    is_stuck,
+                                    stuck_check,
+                                    stuck_age,
+                                ) = await self._detect_stuck_dco(pr_info)
+                            except Exception as exc:
+                                self.log.debug(
+                                    "_detect_stuck_dco failed for %s#%s: %s",
+                                    pr_info.repository_full_name,
+                                    pr_info.number,
+                                    exc,
+                                )
+                                is_stuck = False
+                                stuck_check = None
+                                stuck_age = 0.0
+                            if is_stuck:
+                                # Use markup=False so a check name
+                                # containing characters that look like
+                                # Rich markup (e.g. ``[required]``) does
+                                # not get silently swallowed by the
+                                # console parser.
+                                self._console.print(
+                                    f"⏳ Stuck DCO detected: {pr_info.html_url} "
+                                    f"[{stuck_check} pending for "
+                                    f"{stuck_age:.0f}s, requesting recreate]",
+                                    markup=False,
+                                )
+                                should_recreate = True
+                        if should_recreate:
                             recreated_pr = await self._trigger_dependabot_recreate(
                                 pr_info
                             )
@@ -2412,6 +2465,174 @@ class AsyncMergeManager:
             f"{pr_info.repository_full_name}#{pr_info.number}"
         )
         return False
+
+    async def _detect_stuck_dco(
+        self,
+        pr_info: PullRequestInfo,
+    ) -> tuple[bool, str | None, float]:
+        """Detect whether a DCO check on ``pr_info`` is stuck.
+
+        The DCO check normally finishes within a handful of seconds.
+        When it has been queued / in-progress for longer than
+        :data:`STUCK_DCO_THRESHOLD_SECONDS` on a PR that itself was
+        created and last updated more than that long ago, treat it
+        as stuck so the caller can decide whether to ask dependabot
+        to recreate the PR.
+
+        The age floor on PR ``created_at`` / ``updated_at`` avoids
+        false positives on PRs that were touched seconds before we
+        observed them — in those cases the DCO check is simply
+        running normally and should be allowed to finish.
+
+        Args:
+            pr_info: The pull request being evaluated.
+
+        Returns:
+            A 3-tuple ``(is_stuck, check_name, age_seconds)``.
+            ``check_name`` is the GitHub check / status name of the
+            stuck check (or ``None`` when no stuck check was found).
+            ``age_seconds`` is the time the check has been pending
+            (or ``0.0`` when no candidate check was found).
+        """
+        if not self._github_client:
+            return False, None, 0.0
+
+        repo_owner, repo_name = pr_info.repository_full_name.split("/", 1)
+        threshold = STUCK_DCO_THRESHOLD_SECONDS
+
+        from datetime import datetime, timezone
+
+        def _parse_ts(value: Any) -> datetime | None:
+            if not isinstance(value, str) or not value:
+                return None
+            try:
+                # GitHub returns RFC 3339 with a trailing ``Z``.
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+
+        def _is_dco_name(name: str) -> bool:
+            """Return True when ``name`` looks like a DCO check.
+
+            Matches the common variants emitted by the GitHub DCO
+            App and similar bots: ``DCO``, ``dco/dco``, ``dcobot``,
+            and any name containing ``signoff`` / ``sign-off`` /
+            ``signed-off`` (case-insensitive).
+            """
+            n = (name or "").strip().lower()
+            if not n:
+                return False
+            if n in {"dco", "dco/dco", "dcobot"} or n.startswith("dco/"):
+                return True
+            return (
+                "signoff" in n
+                or "sign-off" in n
+                or "signed-off" in n
+            )
+
+        # 1. PR-level age floor — don't fire on PRs we caught right
+        #    after they were opened or force-pushed; the DCO check
+        #    on those is simply running normally.
+        now = datetime.now(timezone.utc)
+        try:
+            pr_data = await self._github_client.get(
+                f"/repos/{repo_owner}/{repo_name}/pulls/{pr_info.number}"
+            )
+        except Exception as exc:
+            self.log.debug(
+                "_detect_stuck_dco: pr fetch failed for %s#%s: %s",
+                pr_info.repository_full_name,
+                pr_info.number,
+                exc,
+            )
+            return False, None, 0.0
+
+        if not isinstance(pr_data, dict):
+            return False, None, 0.0
+
+        pr_created = _parse_ts(pr_data.get("created_at"))
+        pr_updated = _parse_ts(pr_data.get("updated_at"))
+        if pr_created is None or pr_updated is None:
+            # Without timing data we cannot safely judge stuckness;
+            # fail closed.
+            return False, None, 0.0
+
+        pr_age = (now - pr_created).total_seconds()
+        pr_idle = (now - pr_updated).total_seconds()
+        if pr_age < threshold or pr_idle < threshold:
+            return False, None, 0.0
+
+        # 2. Examine check-runs and status contexts on the head SHA.
+        candidate_name: str | None = None
+        candidate_age: float = 0.0
+
+        try:
+            runs = await self._github_client.get(
+                f"/repos/{repo_owner}/{repo_name}/commits/"
+                f"{pr_info.head_sha}/check-runs"
+            )
+        except Exception as exc:
+            self.log.debug(
+                "_detect_stuck_dco: check-runs fetch failed for %s#%s: %s",
+                pr_info.repository_full_name,
+                pr_info.number,
+                exc,
+            )
+            runs = None
+
+        if isinstance(runs, dict):
+            for run in runs.get("check_runs") or []:
+                if not isinstance(run, dict):
+                    continue
+                name = run.get("name", "")
+                if not _is_dco_name(name):
+                    continue
+                status = run.get("status")
+                if status not in ("queued", "in_progress"):
+                    continue
+                started = _parse_ts(run.get("started_at"))
+                # Use the *latest* of started_at and PR updated_at
+                # as the reference so a stale started_at left over
+                # from a prior head SHA does not inflate the age.
+                ref = max(started, pr_updated) if started else pr_updated
+                age = (now - ref).total_seconds()
+                if age >= threshold and age > candidate_age:
+                    candidate_name = name
+                    candidate_age = age
+
+        try:
+            statuses = await self._github_client.get(
+                f"/repos/{repo_owner}/{repo_name}/commits/"
+                f"{pr_info.head_sha}/status"
+            )
+        except Exception as exc:
+            self.log.debug(
+                "_detect_stuck_dco: status fetch failed for %s#%s: %s",
+                pr_info.repository_full_name,
+                pr_info.number,
+                exc,
+            )
+            statuses = None
+
+        if isinstance(statuses, dict):
+            for s in statuses.get("statuses") or []:
+                if not isinstance(s, dict):
+                    continue
+                ctx = s.get("context", "")
+                if not _is_dco_name(ctx):
+                    continue
+                if s.get("state") != "pending":
+                    continue
+                updated = _parse_ts(s.get("updated_at")) or pr_updated
+                ref = max(updated, pr_updated)
+                age = (now - ref).total_seconds()
+                if age >= threshold and age > candidate_age:
+                    candidate_name = ctx
+                    candidate_age = age
+
+        if candidate_name is None:
+            return False, None, 0.0
+        return True, candidate_name, candidate_age
 
     async def _trigger_dependabot_recreate(
         self, pr_info: PullRequestInfo
