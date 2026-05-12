@@ -20,3 +20,14 @@ updates:
     open-pull-requests-limit: 15
     exclude-paths:
       - "LICENSES/**"
+  # Pip entry exists solely to keep the zizmor pin in
+  # .github/dependabot/zizmor-requirements.txt up to date; that
+  # file is consumed at run-time by .github/workflows/zizmor.yaml
+  # via grep, never installed via pip.
+  - package-ecosystem: "pip"
+    directory: "/.github/dependabot"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "Chore"
+    open-pull-requests-limit: 5
