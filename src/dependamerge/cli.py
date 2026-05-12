@@ -729,8 +729,11 @@ def _run_parallel_merge(
         concurrency: Maximum number of concurrent merge workers.
             For org-wide merges (PRs spread across repos) the default
             of 10 is fine.  For repo-scoped merges (all PRs in the
-            same repo) use 1 to serialise operations and give GitHub
-            time to propagate approvals between merges.
+            same repo) ``AsyncMergeManager`` serialises the actual
+            ``merge_pull_request`` API call via a per-repo dispatch
+            lock, so a value > 1 is safe and lets the worker pool
+            keep processing other PRs while one PR sits in Step 5.5's
+            auto-merge wait loop — see ``_get_merge_dispatch_lock``.
     """
 
     async def _do_merge():
@@ -1097,12 +1100,23 @@ def _handle_repo_merge(
         ctx.progress_tracker.start()
 
     try:
-        # Serialise merges for repo-scoped operations: all PRs target
-        # the same repository, so parallel approve+merge would race
-        # against GitHub's branch-protection propagation and cause
-        # spurious "branch protection" failures.
+        # Per-repo merge dispatch is serialised inside
+        # ``AsyncMergeManager`` (see ``_get_merge_dispatch_lock``),
+        # so it is now safe to run multiple workers against PRs
+        # that target the same repository — only the actual
+        # ``merge_pull_request`` call queues, while approve,
+        # rebase, and the Step 5.5 auto-merge wait run in
+        # parallel.
         merge_results = _run_parallel_merge(
-            ctx, all_prs_to_merge, preview=not ctx.no_confirm, concurrency=1
+            ctx,
+            all_prs_to_merge,
+            preview=not ctx.no_confirm,
+            # Allow parallel workers; the merge dispatch itself is
+            # serialised per repo by ``AsyncMergeManager`` so PRs
+            # parked in Step 5.5's wait loop no longer block other
+            # PRs in the batch.  Cap by PR count so we don't spawn
+            # more workers than there is work.
+            concurrency=min(5, len(all_prs_to_merge)) or 1,
         )
     finally:
         if ctx.show_progress and ctx.progress_tracker:
@@ -1215,7 +1229,12 @@ def _execute_repo_confirmed_merge(
 
     try:
         real_results = _run_parallel_merge(
-            ctx, mergeable_prs, preview=False, concurrency=1
+            ctx,
+            mergeable_prs,
+            preview=False,
+            # Per-repo merge dispatch lock makes parallel workers
+            # safe; cap by PR count.
+            concurrency=min(5, len(mergeable_prs)) or 1,
         )
     finally:
         if ctx.show_progress and ctx.progress_tracker:

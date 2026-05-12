@@ -210,6 +210,19 @@ class AsyncMergeManager:
         self._waiting_prs: dict[str, float] = {}
         self._waiting_lock = asyncio.Lock()
 
+        # Per-repo locks that serialise the actual ``merge_pull_request``
+        # API call.  Multiple workers can run in parallel through approve,
+        # rebase polling, and Step 5.5's auto-merge wait loop — only the
+        # final dispatch is serialised, and only between PRs that target
+        # the same repository.  This avoids the head-of-line blocking we
+        # used to get from forcing ``concurrency=1`` for repo-scoped
+        # runs (where a single PR parked in the wait loop could block
+        # every other PR in the batch for the full ``merge_timeout``)
+        # while still preventing back-to-back merges on the same repo
+        # from racing GitHub's branch-protection propagation.
+        self._merge_dispatch_locks: dict[str, asyncio.Lock] = {}
+        self._merge_dispatch_locks_lock = asyncio.Lock()
+
         # Delay (seconds) after submitting a new approval before attempting merge.
         # GitHub needs time to propagate the approval to branch-protection evaluation.
         default_post_approval_delay = 3.0
@@ -1527,9 +1540,18 @@ class AsyncMergeManager:
                 if auto_merge_pending_checks:
                     merged = None  # Sentinel: auto-merge pending
                 else:
-                    merged = await self._merge_pr_with_retry(
-                        pr_info, repo_owner, repo_name
+                    # Serialise the actual merge dispatch per repo so
+                    # back-to-back merges don't race GitHub's branch
+                    # protection propagation.  Workers on the same
+                    # repo queue here; workers on different repos run
+                    # in parallel.  See ``_get_merge_dispatch_lock``.
+                    dispatch_lock = await self._get_merge_dispatch_lock(
+                        repo_owner, repo_name
                     )
+                    async with dispatch_lock:
+                        merged = await self._merge_pr_with_retry(
+                            pr_info, repo_owner, repo_name
+                        )
 
                 if merged is None:
                     # Auto-merge is active — PR will merge asynchronously.
@@ -1642,12 +1664,23 @@ class AsyncMergeManager:
                         try:
                             if self._github_client is None:
                                 raise RuntimeError("GitHub client not initialized")
-                            new_merged = await self._github_client.merge_pull_request(
-                                new_owner,
-                                new_repo,
-                                recreated_pr.number,
-                                new_merge_method,
+                            # Same per-repo dispatch serialisation as
+                            # the main merge path — see
+                            # ``_get_merge_dispatch_lock``.
+                            new_dispatch_lock = (
+                                await self._get_merge_dispatch_lock(
+                                    new_owner, new_repo
+                                )
                             )
+                            async with new_dispatch_lock:
+                                new_merged = (
+                                    await self._github_client.merge_pull_request(
+                                        new_owner,
+                                        new_repo,
+                                        recreated_pr.number,
+                                        new_merge_method,
+                                    )
+                                )
                         except Exception as merge_err:
                             self.log.error(
                                 "Failed to merge recreated PR %s#%s: %s",
@@ -3538,6 +3571,31 @@ class AsyncMergeManager:
 
         # For other failure types, don't retry
         return False
+
+    async def _get_merge_dispatch_lock(
+        self, owner: str, repo: str
+    ) -> asyncio.Lock:
+        """Return the ``asyncio.Lock`` that serialises merge dispatch for ``owner/repo``.
+
+        The lock is created lazily on first request and shared by
+        every worker targeting the same repository.  Workers
+        targeting different repositories receive distinct locks and
+        can dispatch in parallel.
+
+        Holding this lock around the actual ``merge_pull_request``
+        API call (and its retry loop) prevents back-to-back merges
+        on the same repo from racing GitHub's branch-protection
+        propagation, while leaving every other phase of the merge
+        flow — approve, rebase polling, Step 5.5's auto-merge wait —
+        free to run in parallel across workers.
+        """
+        key = f"{owner}/{repo}"
+        async with self._merge_dispatch_locks_lock:
+            lock = self._merge_dispatch_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._merge_dispatch_locks[key] = lock
+            return lock
 
     async def _get_org_settings(self, owner: str) -> dict[str, Any] | None:
         """
