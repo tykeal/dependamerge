@@ -40,12 +40,28 @@ jobs:
       pull-requests: read
     timeout-minutes: 5
     steps:
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+      # When the CONNECTION_WHITELIST repo/org variable is exposed
+      # to this run (i.e. not a fork PR), use it to enforce a
+      # block-mode egress policy.
+      - name: 'Harden runner (block egress with whitelist)'
+        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
         with:
           egress-policy: 'block'
           allowed-endpoints: >
             ${{ vars.CONNECTION_WHITELIST }}
+
+      # Fallback for fork PRs and other contexts where the
+      # CONNECTION_WHITELIST variable is not exposed to the
+      # workflow.  Audit-only mode logs all egress without
+      # blocking it so CI still runs.
+      - name: 'Harden runner (audit fallback, no whitelist available)'
+        if: ${{ vars.CONNECTION_WHITELIST == '' }}
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: 'audit'
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -76,12 +92,28 @@ jobs:
     env:
       GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
     steps:
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+      # When the CONNECTION_WHITELIST repo/org variable is exposed
+      # to this run (i.e. not a fork PR), use it to enforce a
+      # block-mode egress policy.
+      - name: 'Harden runner (block egress with whitelist)'
+        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
         with:
           egress-policy: 'block'
           allowed-endpoints: >
             ${{ vars.CONNECTION_WHITELIST }}
+
+      # Fallback for fork PRs and other contexts where the
+      # CONNECTION_WHITELIST variable is not exposed to the
+      # workflow.  Audit-only mode logs all egress without
+      # blocking it so CI still runs.
+      - name: 'Harden runner (audit fallback, no whitelist available)'
+        if: ${{ vars.CONNECTION_WHITELIST == '' }}
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: 'audit'
 
       - name: 'Clear Python dependency caches'
         env:
@@ -161,12 +193,28 @@ jobs:
     timeout-minutes: 12
     steps:
       # Harden the runner used by this workflow
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+      # When the CONNECTION_WHITELIST repo/org variable is exposed
+      # to this run (i.e. not a fork PR), use it to enforce a
+      # block-mode egress policy.
+      - name: 'Harden runner (block egress with whitelist)'
+        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
         with:
           egress-policy: 'block'
           allowed-endpoints: >
             ${{ vars.CONNECTION_WHITELIST }}
+
+      # Fallback for fork PRs and other contexts where the
+      # CONNECTION_WHITELIST variable is not exposed to the
+      # workflow.  Audit-only mode logs all egress without
+      # blocking it so CI still runs.
+      - name: 'Harden runner (audit fallback, no whitelist available)'
+        if: ${{ vars.CONNECTION_WHITELIST == '' }}
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: 'audit'
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -190,12 +238,28 @@ jobs:
     timeout-minutes: 12
     steps:
       # Harden the runner used by this workflow
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+      # When the CONNECTION_WHITELIST repo/org variable is exposed
+      # to this run (i.e. not a fork PR), use it to enforce a
+      # block-mode egress policy.
+      - name: 'Harden runner (block egress with whitelist)'
+        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
         with:
           egress-policy: 'block'
           allowed-endpoints: >
             ${{ vars.CONNECTION_WHITELIST }}
+
+      # Fallback for fork PRs and other contexts where the
+      # CONNECTION_WHITELIST variable is not exposed to the
+      # workflow.  Audit-only mode logs all egress without
+      # blocking it so CI still runs.
+      - name: 'Harden runner (audit fallback, no whitelist available)'
+        if: ${{ vars.CONNECTION_WHITELIST == '' }}
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: 'audit'
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -220,12 +284,28 @@ jobs:
     timeout-minutes: 10
     steps:
       # Harden the runner used by this workflow
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+      # When the CONNECTION_WHITELIST repo/org variable is exposed
+      # to this run (i.e. not a fork PR), use it to enforce a
+      # block-mode egress policy.
+      - name: 'Harden runner (block egress with whitelist)'
+        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
         with:
           egress-policy: 'block'
           allowed-endpoints: >
             ${{ vars.CONNECTION_WHITELIST }}
+
+      # Fallback for fork PRs and other contexts where the
+      # CONNECTION_WHITELIST variable is not exposed to the
+      # workflow.  Audit-only mode logs all egress without
+      # blocking it so CI still runs.
+      - name: 'Harden runner (audit fallback, no whitelist available)'
+        if: ${{ vars.CONNECTION_WHITELIST == '' }}
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: 'audit'
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -247,12 +327,28 @@ jobs:
       contents: read
     steps:
       # Harden the runner used by this workflow
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+      # When the CONNECTION_WHITELIST repo/org variable is exposed
+      # to this run (i.e. not a fork PR), use it to enforce a
+      # block-mode egress policy.
+      - name: 'Harden runner (block egress with whitelist)'
+        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
         with:
           egress-policy: 'block'
           allowed-endpoints: >
             ${{ vars.CONNECTION_WHITELIST }}
+
+      # Fallback for fork PRs and other contexts where the
+      # CONNECTION_WHITELIST variable is not exposed to the
+      # workflow.  Audit-only mode logs all egress without
+      # blocking it so CI still runs.
+      - name: 'Harden runner (audit fallback, no whitelist available)'
+        if: ${{ vars.CONNECTION_WHITELIST == '' }}
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: 'audit'
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -294,12 +390,28 @@ jobs:
       contents: read
     steps:
       # Harden the runner used by this workflow
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+      # When the CONNECTION_WHITELIST repo/org variable is exposed
+      # to this run (i.e. not a fork PR), use it to enforce a
+      # block-mode egress policy.
+      - name: 'Harden runner (block egress with whitelist)'
+        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
         with:
           egress-policy: 'block'
           allowed-endpoints: >
             ${{ vars.CONNECTION_WHITELIST }}
+
+      # Fallback for fork PRs and other contexts where the
+      # CONNECTION_WHITELIST variable is not exposed to the
+      # workflow.  Audit-only mode logs all egress without
+      # blocking it so CI still runs.
+      - name: 'Harden runner (audit fallback, no whitelist available)'
+        if: ${{ vars.CONNECTION_WHITELIST == '' }}
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: 'audit'
 
       - name: "Download SBOM artefact"
         # yamllint disable-line rule:line-length
