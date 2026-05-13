@@ -12,8 +12,28 @@ on:
       - opened
       - synchronize
       - reopened
-  # pull_request_target is required for autolabeler on PRs from forks
-  pull_request_target:
+  # pull_request_target is required for autolabeler on PRs from forks.
+  #
+  # This use of pull_request_target is safe and does NOT need
+  # manual-approval gating because:
+  #
+  #   1. The workflow performs no checkout of PR code
+  #      (no actions/checkout step).
+  #   2. The workflow body is loaded from the base branch
+  #      (pull_request_target semantics), not from the PR head.
+  #   3. The only step is release-drafter/autolabeler, pinned to
+  #      a commit SHA, which is a pure GitHub-API consumer and
+  #      never executes PR-provided content.
+  #   4. Permissions are scoped to pull-requests: write and
+  #      contents: read; no secrets are exposed to the job.
+  #   5. The runner is hardened with an egress block.
+  #
+  # See the SECURITY block on the autolabel job below for the
+  # full rationale. The zizmor `dangerous-triggers` audit is
+  # silenced here because the conditions it warns about (PR
+  # head code running with elevated privileges) cannot occur in
+  # this workflow.
+  pull_request_target:  # zizmor: ignore[dangerous-triggers]
     types:
       - opened
       - synchronize
