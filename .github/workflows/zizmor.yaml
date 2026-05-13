@@ -159,14 +159,36 @@ jobs:
               -o "${pin_file}" "${pin_url}"
             pin_source="lfreleng-actions/.github@${pin_ref}"
           fi
+          # Strictly validate the extracted pin before passing it
+          # to `uvx --from`. Without this check, a PR that edits
+          # the local pin file could feed uvx an arbitrary pip
+          # requirement spec (VCS/URL refs, --index-url and other
+          # options, environment markers, multiple lines, or
+          # additional packages), resulting in untrusted code
+          # execution on the runner under the GITHUB_TOKEN of the
+          # base repository.
+          #
+          # Accept exactly one line matching
+          #   ^zizmor==<version>$
+          # where <version> is a conservative subset of PEP 440
+          # (digits, dots, letters, plus, dot/underscore/dash,
+          # pre/post/local-segment punctuation). Reject anything
+          # else, including extra packages, whitespace, options,
+          # or markers.
+          pin_re='^zizmor==[A-Za-z0-9._+!~-]+$'
           # `|| true` keeps grep's no-match exit (1) from tripping
-          # `set -e`; the explicit empty check below produces a clearer
-          # error than a bare grep failure.
-          pin="$(grep -E '^zizmor==' "${pin_file}" || true)"
-          if [ -z "${pin}" ]; then
-            echo "error: no zizmor pin found in ${pin_source}" >&2
+          # `set -e`; the explicit count check below produces a
+          # clearer error than a bare grep failure.
+          match_count="$(grep -cE "${pin_re}" "${pin_file}" || true)"
+          if [ "${match_count}" != '1' ]; then
+            echo "error: ${pin_source} must contain exactly one" \
+                 "line matching ${pin_re} (found" \
+                 "${match_count})." >&2
+            echo "Refusing to invoke uvx with an unvalidated pin" \
+                 "to avoid arbitrary requirement-spec execution." >&2
             exit 2
           fi
+          pin="$(grep -E "${pin_re}" "${pin_file}")"
           echo "Using ${pin} (from ${pin_source})"
           uvx --from "${pin}" zizmor \
             --persona=regular \

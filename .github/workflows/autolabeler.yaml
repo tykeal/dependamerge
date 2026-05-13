@@ -24,8 +24,11 @@ on:
   #   3. The only step is release-drafter/autolabeler, pinned to
   #      a commit SHA, which is a pure GitHub-API consumer and
   #      never executes PR-provided content.
-  #   4. Permissions are scoped to pull-requests: write and
-  #      contents: read; no secrets are exposed to the job.
+  #   4. Permissions are scoped to the minimum needed:
+  #      pull-requests: write and contents: read. No
+  #      repository secrets are passed to the job beyond the
+  #      default GITHUB_TOKEN, which the job receives with the
+  #      permissions scope above and nothing more.
   #   5. The runner is hardened with an egress block.
   #
   # See the SECURITY block on the autolabel job below for the
