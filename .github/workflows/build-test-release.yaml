@@ -33,7 +33,7 @@ jobs:
       - name: 'Harden runner (block egress with whitelist)'
         if: ${{ vars.CONNECTION_WHITELIST != '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -46,7 +46,7 @@ jobs:
       - name: 'Harden runner (audit fallback, no whitelist available)'
         if: ${{ vars.CONNECTION_WHITELIST == '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'audit'
 
@@ -82,7 +82,7 @@ jobs:
       - name: 'Harden runner (block egress with whitelist)'
         if: ${{ vars.CONNECTION_WHITELIST != '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -95,7 +95,7 @@ jobs:
       - name: 'Harden runner (audit fallback, no whitelist available)'
         if: ${{ vars.CONNECTION_WHITELIST == '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'audit'
 
@@ -166,7 +166,7 @@ jobs:
       - name: 'Harden runner (block egress with whitelist)'
         if: ${{ vars.CONNECTION_WHITELIST != '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -179,7 +179,7 @@ jobs:
       - name: 'Harden runner (audit fallback, no whitelist available)'
         if: ${{ vars.CONNECTION_WHITELIST == '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'audit'
 
@@ -213,7 +213,7 @@ jobs:
       - name: 'Harden runner (block egress with whitelist)'
         if: ${{ vars.CONNECTION_WHITELIST != '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -226,7 +226,7 @@ jobs:
       - name: 'Harden runner (audit fallback, no whitelist available)'
         if: ${{ vars.CONNECTION_WHITELIST == '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'audit'
 
@@ -258,7 +258,7 @@ jobs:
       - name: 'Harden runner (block egress with whitelist)'
         if: ${{ vars.CONNECTION_WHITELIST != '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -271,7 +271,7 @@ jobs:
       - name: 'Harden runner (audit fallback, no whitelist available)'
         if: ${{ vars.CONNECTION_WHITELIST == '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'audit'
 
@@ -300,7 +300,7 @@ jobs:
       - name: 'Harden runner (block egress with whitelist)'
         if: ${{ vars.CONNECTION_WHITELIST != '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -313,7 +313,7 @@ jobs:
       - name: 'Harden runner (audit fallback, no whitelist available)'
         if: ${{ vars.CONNECTION_WHITELIST == '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'audit'
 
@@ -362,7 +362,7 @@ jobs:
       - name: 'Harden runner (block egress with whitelist)'
         if: ${{ vars.CONNECTION_WHITELIST != '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -375,7 +375,7 @@ jobs:
       - name: 'Harden runner (audit fallback, no whitelist available)'
         if: ${{ vars.CONNECTION_WHITELIST == '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'audit'
 
@@ -551,7 +551,7 @@ jobs:
       - name: 'Harden runner (block egress with whitelist)'
         if: ${{ vars.CONNECTION_WHITELIST != '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -564,7 +564,7 @@ jobs:
       - name: 'Harden runner (audit fallback, no whitelist available)'
         if: ${{ vars.CONNECTION_WHITELIST == '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'audit'
 
@@ -596,7 +596,7 @@ jobs:
       - name: 'Harden runner (block egress with whitelist)'
         if: ${{ vars.CONNECTION_WHITELIST != '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -609,7 +609,7 @@ jobs:
       - name: 'Harden runner (audit fallback, no whitelist available)'
         if: ${{ vars.CONNECTION_WHITELIST == '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'audit'
 
@@ -651,7 +651,7 @@ jobs:
       - name: 'Harden runner (block egress with whitelist)'
         if: ${{ vars.CONNECTION_WHITELIST != '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -664,7 +664,7 @@ jobs:
       - name: 'Harden runner (audit fallback, no whitelist available)'
         if: ${{ vars.CONNECTION_WHITELIST == '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'audit'
 
@@ -707,7 +707,7 @@ jobs:
       - name: 'Harden runner (block egress with whitelist)'
         if: ${{ vars.CONNECTION_WHITELIST != '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -720,7 +720,7 @@ jobs:
       - name: 'Harden runner (audit fallback, no whitelist available)'
         if: ${{ vars.CONNECTION_WHITELIST == '' }}
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'audit'
 
