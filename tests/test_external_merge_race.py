@@ -150,6 +150,50 @@ class TestEarlyExitClosedPrPath:
         assert result.error == "PR is already closed"
 
 
+class TestPermissionErrorFastFail:
+    """Tests for the permission-error fast-fail behaviour.
+
+    When the configured token lacks rights on a repository, every
+    PR in that repository will hit the same 403.  The manager
+    must:
+
+    * Record the repository as permission-failed when the first
+      403 lands so subsequent workers short-circuit instead of
+      replaying the same API round-trip.
+    * Print the verbose token-guidance block only on the first
+      failure for that repository, to avoid screensful of
+      duplicate output during a batch run.
+    * Never dump a Python stack trace to stderr for permission
+      errors (they are an expected, user-actionable failure
+      mode, not an unhandled exception).
+    """
+
+    @pytest.mark.asyncio
+    async def test_subsequent_pr_in_failed_repo_short_circuits(
+        self,
+    ) -> None:
+        """Once a repo is recorded as permission-failed, the next PR
+        in that repo must return FAILED without calling the API."""
+        mgr, client = make_merge_manager()
+        # Pre-populate the failed-repo set as if a sibling PR had
+        # already hit a 403.
+        mgr._permission_failed_repos.add("lfreleng-actions/git-commit-message-action")
+        pr = _make_pr()
+
+        result = await mgr._merge_single_pr(pr)
+
+        assert result.status == MergeStatus.FAILED
+        assert "token lacks required permissions" in (result.error or "")
+        # No API call should have been made; the short-circuit
+        # runs before any await on the client.
+        client.get.assert_not_called()
+
+    def test_permission_failed_repos_starts_empty(self) -> None:
+        """Sanity check: a fresh manager has no failed repos."""
+        mgr, _client = make_merge_manager()
+        assert mgr._permission_failed_repos == set()
+
+
 class TestProgressTrackerMergeSkipped:
     """Confirm the progress tracker exposes ``merge_skipped``."""
 

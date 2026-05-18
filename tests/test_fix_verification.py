@@ -15,6 +15,7 @@ from dependamerge.models import PullRequestInfo
 def test_final_verification():
     """Final test to demonstrate the fix is working"""
     with (
+        patch("dependamerge.cli._check_merge_permissions"),
         patch("dependamerge.cli.GitHubClient") as mock_client_class,
         patch("dependamerge.cli.PRComparator") as mock_comparator_class,
         patch("dependamerge.github_service.GitHubService") as mock_service_class,

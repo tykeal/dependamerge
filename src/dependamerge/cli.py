@@ -542,6 +542,14 @@ def _check_merge_permissions(ctx: _MergeContext) -> None:
     except GitHubPermissionError as e:
         console.print(f"\n❌ Permission check failed: {e}")
         raise typer.Exit(code=3) from e
+    except typer.Exit:
+        # The hard-failure branch above raises typer.Exit(code=3)
+        # to abort the run.  Without re-raising it here it would
+        # be caught by the broad ``except Exception`` below and
+        # silently downgraded to "Continuing anyway...", letting
+        # the merge proceed against a token we already know lacks
+        # the required permissions.
+        raise
     except Exception as e:
         console.print(f"⚠️  Could not verify permissions: {e}")
         console.print("   Continuing anyway...")

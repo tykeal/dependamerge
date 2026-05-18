@@ -192,6 +192,14 @@ class AsyncMergeManager:
         # Track PRs that were just approved (for post-approval merge retry)
         self._recently_approved: set[str] = set()
 
+        # Track repositories where the token has already failed a
+        # permission check during this run.  Subsequent PRs in the
+        # same repository are short-circuited with a clean skip
+        # message rather than triggering another round-trip to
+        # GitHub that will fail identically and emit another
+        # screenful of guidance.
+        self._permission_failed_repos: set[str] = set()
+
         # Track PRs where auto-merge has been enabled so that
         # post-timeout merge attempts can be skipped gracefully.
         self._auto_merge_enabled: set[str] = set()
@@ -838,6 +846,27 @@ class AsyncMergeManager:
         """
         start_time = time.time()
         repo_owner, repo_name = pr_info.repository_full_name.split("/", 1)
+
+        # Fast-fail when a previous PR in this batch has already
+        # hit a permission error against the same repository.  In
+        # that case the token genuinely lacks the rights to act on
+        # any PR in this repo, so attempting the GitHub API calls
+        # again would only produce another 403 and another copy of
+        # the token-guidance block.  Report the failure cleanly
+        # (single ❌ line, no traceback) and move on.
+        if pr_info.repository_full_name in self._permission_failed_repos:
+            result = MergeResult(pr_info=pr_info, status=MergeStatus.FAILED)
+            result.error = (
+                f"token lacks required permissions on {pr_info.repository_full_name}"
+            )
+            if self.progress_tracker:
+                self.progress_tracker.merge_failure()
+            self._console.print(
+                f"❌ Failed: {pr_info.html_url} "
+                "[token lacks permissions on this repository]"
+            )
+            result.duration = time.time() - start_time
+            return result
 
         # Early determination of merge method based on repository settings
         merge_method = await self._get_merge_method_for_repo(repo_owner, repo_name)
@@ -1772,11 +1801,23 @@ class AsyncMergeManager:
                         )
 
         except GitHubPermissionError as e:
-            # Handle permission errors with detailed guidance
+            # Handle permission errors with detailed guidance.
+            #
+            # When the token lacks rights on a repository the same
+            # error fires for every PR processed.  Record the repo
+            # so subsequent PRs in the batch short-circuit via the
+            # fast-fail check at the top of this method, and emit
+            # the verbose guidance block only the first time we
+            # see the failure for a given repository.
             result.status = MergeStatus.FAILED
             result.error = str(e)
             if self.progress_tracker:
                 self.progress_tracker.merge_failure()
+
+            first_failure_for_repo = (
+                pr_info.repository_full_name not in self._permission_failed_repos
+            )
+            self._permission_failed_repos.add(pr_info.repository_full_name)
 
             # Extract operation-specific error message
             operation_desc = e.operation.replace("_", " ")
@@ -1784,7 +1825,12 @@ class AsyncMergeManager:
                 f"❌ Failed: {pr_info.html_url} [permission denied: {operation_desc}]"
             )
 
-            # Provide token-specific guidance
+            if not first_failure_for_repo:
+                # Already printed the full guidance for this repo;
+                # do not repeat it for every remaining PR.
+                return result
+
+            # Provide token-specific guidance (printed once per repo)
             self._console.print("\n💡 Token Permission Issue:")
             self._console.print(f"   Problem: {e}")
 
@@ -1810,14 +1856,19 @@ class AsyncMergeManager:
                 self.progress_tracker.merge_failure()
 
             # Provide clean single-line error messages for other errors.
-            # Also log at error level with the stack trace so users
-            # debugging via log files (where stdout isn't captured)
-            # have full context.
+            # The stack trace is attached only when the logger is in
+            # DEBUG mode (i.e. the user passed ``--verbose``).  In the
+            # default WARNING setup the trace would otherwise be
+            # printed to stderr for every failure, swamping a
+            # repo-scoped batch run with several hundred lines of
+            # noise per PR when the underlying cause is something
+            # uniform (e.g. token without the required scope) that a
+            # single clean line already conveys.
             self.log.error(
                 "Failed to process PR %s: %s",
                 pr_info.html_url,
                 e,
-                exc_info=True,
+                exc_info=self.log.isEnabledFor(logging.DEBUG),
             )
             self._console.print(
                 f"❌ Failed: {pr_info.html_url} [processing error: {e}]"
@@ -3176,6 +3227,15 @@ class AsyncMergeManager:
                 "🤖 Dependamerge\nApproved this pull request ✅",
             )
             return True
+        except GitHubPermissionError:
+            # Let typed permission errors propagate to the caller's
+            # dedicated handler in ``_merge_single_pr``.  Wrapping
+            # them in a generic ``RuntimeError`` (as the old broad
+            # ``except Exception`` below did) hid them from that
+            # handler and routed the failure through the catch-all
+            # path, which dumps a full stack trace to stderr on
+            # every PR in the batch.
+            raise
         except Exception as e:
             # Handle specific error codes
             error_str = str(e)
@@ -3284,6 +3344,15 @@ class AsyncMergeManager:
                         )
                         break
 
+            except GitHubPermissionError:
+                # Token cannot merge on this repo — propagate to the
+                # caller so the PermissionError handler in
+                # ``_merge_single_pr`` reports it cleanly and records
+                # the repo for fast-fail of remaining PRs in the
+                # batch.  Retrying or breaking silently here would
+                # downgrade the failure into a generic
+                # "merge failed: clean" reason that misleads users.
+                raise
             except Exception as e:
                 error_msg = str(e)
 
