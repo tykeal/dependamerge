@@ -915,8 +915,28 @@ class AsyncMergeManager:
                     )
                     return result
 
-            # Check if PR is closed before processing
+            # Check if PR is closed before processing.  If it has
+            # been closed *and merged* by another process (a
+            # concurrent dependamerge run, a human admin, an
+            # auto-merge that landed mid-flight, etc.) we treat it
+            # as a skip rather than a failure: there is no
+            # remaining work or human follow-up to perform.
             if pr_info.state != "open":
+                already_merged = await self._is_pr_already_merged(
+                    pr_info, repo_owner, repo_name
+                )
+                if already_merged:
+                    result.status = MergeStatus.SKIPPED
+                    result.error = "already merged externally"
+                    if self.progress_tracker:
+                        self.progress_tracker.merge_skipped()
+                    log_and_print(
+                        self.log,
+                        self._console,
+                        (f"⏭️  Skipped: {pr_info.html_url} [already merged externally]"),
+                        level="info",
+                    )
+                    return result
                 result.status = MergeStatus.FAILED
                 result.error = "PR is already closed"
                 self._console.print(f"🛑 Failed: {pr_info.html_url} [already closed]")
@@ -1591,6 +1611,34 @@ class AsyncMergeManager:
                         level="debug",
                     )
                 else:
+                    # Before computing a failure reason, recheck
+                    # whether the PR was actually merged externally
+                    # (e.g. by a concurrent dependamerge run at org
+                    # scope, or by a human admin) while our merge
+                    # attempt was in flight.  When that has happened
+                    # there is no remaining work and no follow-up
+                    # action for the operator: classify the outcome
+                    # as SKIPPED rather than FAILED so the summary
+                    # does not request human attention.
+                    already_merged = await self._is_pr_already_merged(
+                        pr_info, repo_owner, repo_name
+                    )
+                    if already_merged:
+                        result.status = MergeStatus.SKIPPED
+                        result.error = "already merged externally"
+                        if self.progress_tracker:
+                            self.progress_tracker.merge_skipped()
+                        log_and_print(
+                            self.log,
+                            self._console,
+                            (
+                                f"⏭️  Skipped: {pr_info.html_url} "
+                                "[already merged externally]"
+                            ),
+                            level="info",
+                        )
+                        return result
+
                     # Compute failure summary once — used for both the
                     # recreate decision and the final error reporting.
                     failure_reason = self._get_failure_summary(pr_info)
@@ -1613,9 +1661,7 @@ class AsyncMergeManager:
                     #      again on a fresh head SHA.
                     recreated_pr = None
                     if pr_info.author == "dependabot[bot]" and not self.preview_mode:
-                        should_recreate = (
-                            "branch protection" in failure_reason.lower()
-                        )
+                        should_recreate = "branch protection" in failure_reason.lower()
                         if not should_recreate:
                             try:
                                 (
@@ -1667,10 +1713,8 @@ class AsyncMergeManager:
                             # Same per-repo dispatch serialisation as
                             # the main merge path — see
                             # ``_get_merge_dispatch_lock``.
-                            new_dispatch_lock = (
-                                await self._get_merge_dispatch_lock(
-                                    new_owner, new_repo
-                                )
+                            new_dispatch_lock = await self._get_merge_dispatch_lock(
+                                new_owner, new_repo
                             )
                             async with new_dispatch_lock:
                                 new_merged = (
@@ -2557,11 +2601,7 @@ class AsyncMergeManager:
                 return False
             if n in {"dco", "dco/dco", "dcobot"} or n.startswith("dco/"):
                 return True
-            return (
-                "signoff" in n
-                or "sign-off" in n
-                or "signed-off" in n
-            )
+            return "signoff" in n or "sign-off" in n or "signed-off" in n
 
         # 1. PR-level age floor — don't fire on PRs we caught right
         #    after they were opened or force-pushed; the DCO check
@@ -2601,8 +2641,7 @@ class AsyncMergeManager:
 
         try:
             runs = await self._github_client.get(
-                f"/repos/{repo_owner}/{repo_name}/commits/"
-                f"{pr_info.head_sha}/check-runs"
+                f"/repos/{repo_owner}/{repo_name}/commits/{pr_info.head_sha}/check-runs"
             )
         except Exception as exc:
             self.log.debug(
@@ -2635,8 +2674,7 @@ class AsyncMergeManager:
 
         try:
             statuses = await self._github_client.get(
-                f"/repos/{repo_owner}/{repo_name}/commits/"
-                f"{pr_info.head_sha}/status"
+                f"/repos/{repo_owner}/{repo_name}/commits/{pr_info.head_sha}/status"
             )
         except Exception as exc:
             self.log.debug(
@@ -3384,6 +3422,47 @@ class AsyncMergeManager:
         )
         return False
 
+    async def _is_pr_already_merged(
+        self, pr_info: PullRequestInfo, owner: str, repo: str
+    ) -> bool:
+        """Return ``True`` if the PR has been merged externally.
+
+        Called after our own merge attempt has failed (or before
+        attempting it, when the PR was already closed at fetch
+        time) to distinguish two outcomes:
+
+        * The PR is genuinely unmergeable and needs human
+          follow-up — classify as ``FAILED``.
+        * The PR was merged while we were processing it (a
+          concurrent ``dependamerge`` run at org scope, a human
+          admin, or auto-merge landing mid-flight) — classify as
+          ``SKIPPED`` because there is no remaining work.
+
+        Any API error during the recheck (network, rate limit,
+        permission, unexpected payload) degrades to ``False`` so
+        the caller falls back to the existing failure path.
+        The intent here is to upgrade the user experience for a
+        known benign race, not to mask genuine errors.
+        """
+        if not self._github_client:
+            return False
+        try:
+            pr_data = await self._github_client.get(
+                f"/repos/{owner}/{repo}/pulls/{pr_info.number}"
+            )
+        except Exception as e:
+            self.log.debug(
+                "Failed to recheck %s/%s#%s for external merge: %s",
+                owner,
+                repo,
+                pr_info.number,
+                e,
+            )
+            return False
+        if not isinstance(pr_data, dict):
+            return False
+        return pr_data.get("state") == "closed" and bool(pr_data.get("merged"))
+
     def _get_failure_summary(self, pr_info: PullRequestInfo) -> str:
         """
         Generate a detailed failure summary based on PR state.
@@ -3572,9 +3651,7 @@ class AsyncMergeManager:
         # For other failure types, don't retry
         return False
 
-    async def _get_merge_dispatch_lock(
-        self, owner: str, repo: str
-    ) -> asyncio.Lock:
+    async def _get_merge_dispatch_lock(self, owner: str, repo: str) -> asyncio.Lock:
         """Return the ``asyncio.Lock`` that serialises merge dispatch for ``owner/repo``.
 
         The lock is created lazily on first request and shared by

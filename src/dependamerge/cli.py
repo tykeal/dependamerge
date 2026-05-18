@@ -344,9 +344,9 @@ class _MergeContext:
     comparator: PRComparator | None = None
     source_pr: PullRequestInfo | None = None
     progress_tracker: MergeProgressTracker | None = None
-    all_similar_prs: list[
-        tuple[PullRequestInfo, ComparisonResult]
-    ] = field(default_factory=list)
+    all_similar_prs: list[tuple[PullRequestInfo, ComparisonResult]] = field(
+        default_factory=list
+    )
 
 
 def _validate_merge_inputs(
@@ -407,12 +407,8 @@ def _validate_merge_inputs(
         raise typer.Exit(1)
 
     if force == "all":
-        console.print(
-            "⚠️  Warning: Using --force=all will bypass most safety checks."
-        )
-        console.print(
-            "   This may attempt merges that will fail at GitHub API level."
-        )
+        console.print("⚠️  Warning: Using --force=all will bypass most safety checks.")
+        console.print("   This may attempt merges that will fail at GitHub API level.")
 
     return github2gerrit_mode
 
@@ -425,9 +421,7 @@ def _init_github_merge(ctx: _MergeContext) -> None:
     ctx.github_client = GitHubClient(ctx.token)
     assert ctx.github_client.token is not None
     ctx.token = ctx.github_client.token
-    ctx.owner, ctx.repo_name, ctx.pr_number = (
-        ctx.github_client.parse_pr_url(ctx.pr_url)
-    )
+    ctx.owner, ctx.repo_name, ctx.pr_number = ctx.github_client.parse_pr_url(ctx.pr_url)
 
     if ctx.show_progress:
         # Create the tracker but do NOT start it yet — it will be
@@ -436,9 +430,7 @@ def _init_github_merge(ctx: _MergeContext) -> None:
         # check) are fast and use plain console output instead.
         ctx.progress_tracker = MergeProgressTracker(ctx.owner)
 
-    console.print(
-        f"🔍 Examining source pull request in {ctx.owner}..."
-    )
+    console.print(f"🔍 Examining source pull request in {ctx.owner}...")
 
     ctx.comparator = PRComparator(ctx.similarity_threshold)
 
@@ -476,9 +468,7 @@ def _fetch_and_validate_source_pr(ctx: _MergeContext) -> None:
                 exception=e,
             )
         elif is_github_api_permission_error(e):
-            exit_for_github_api_error(
-                details="Failed to fetch PR details", exception=e
-            )
+            exit_for_github_api_error(details="Failed to fetch PR details", exception=e)
         else:
             exit_with_error(
                 ExitCode.GENERAL_ERROR,
@@ -532,9 +522,7 @@ def _check_merge_permissions(ctx: _MergeContext) -> None:
         if advisory_perms:
             for op in advisory_perms:
                 result = perm_results[op]
-                console.print(
-                    f"⚠️  {op}: {result['error']} (non-blocking)"
-                )
+                console.print(f"⚠️  {op}: {result['error']} (non-blocking)")
         if missing_perms:
             console.print("\n❌ Token Permission Check Failed:\n")
             for op in missing_perms:
@@ -542,16 +530,13 @@ def _check_merge_permissions(ctx: _MergeContext) -> None:
                 console.print(f"   • {op}: {result['error']}")
                 if result.get("guidance"):
                     console.print(
-                        f"     Classic: "
-                        f"{result['guidance'].get('classic', 'N/A')}"
+                        f"     Classic: {result['guidance'].get('classic', 'N/A')}"
                     )
                     console.print(
                         f"     Fine-grained: "
                         f"{result['guidance'].get('fine_grained', 'N/A')}"
                     )
-            console.print(
-                "\n💡 Update your token permissions and try again."
-            )
+            console.print("\n💡 Update your token permissions and try again.")
             raise typer.Exit(code=3)
         console.print("✅ Token has required permissions")
     except GitHubPermissionError as e:
@@ -580,20 +565,13 @@ def _validate_automation_author(ctx: _MergeContext) -> None:
     commit_messages = ctx.github_client.get_pull_request_commits(
         ctx.owner, ctx.repo_name, ctx.pr_number
     )
-    first_commit_line = (
-        commit_messages[0].split("\n")[0] if commit_messages else ""
-    )
-    expected_sha = _generate_override_sha(
-        ctx.source_pr, first_commit_line
-    )
+    first_commit_line = commit_messages[0].split("\n")[0] if commit_messages else ""
+    expected_sha = _generate_override_sha(ctx.source_pr, first_commit_line)
 
     if not ctx.override:
+        console.print("Source PR is not from a recognized automation tool.")
         console.print(
-            "Source PR is not from a recognized automation tool."
-        )
-        console.print(
-            f"To merge this and similar PRs, run again with: "
-            f"--override {expected_sha}"
+            f"To merge this and similar PRs, run again with: --override {expected_sha}"
         )
         console.print(
             f"This SHA is based on the author "
@@ -603,22 +581,14 @@ def _validate_automation_author(ctx: _MergeContext) -> None:
         )
         raise typer.Exit(0)
 
-    if not _validate_override_sha(
-        ctx.override, ctx.source_pr, first_commit_line
-    ):
+    if not _validate_override_sha(ctx.override, ctx.source_pr, first_commit_line):
         exit_with_error(
             ExitCode.VALIDATION_ERROR,
             message="❌ Invalid override SHA provided",
-            details=(
-                "Expected SHA for this PR and author: "
-                f"--override {expected_sha}"
-            ),
+            details=(f"Expected SHA for this PR and author: --override {expected_sha}"),
         )
 
-    console.print(
-        "Override SHA validated. "
-        "Proceeding with non-automation PR merge."
-    )
+    console.print("Override SHA validated. Proceeding with non-automation PR merge.")
 
 
 def _scan_and_find_similar(ctx: _MergeContext) -> None:
@@ -670,53 +640,32 @@ def _scan_and_find_similar(ctx: _MergeContext) -> None:
         summary = ctx.progress_tracker.get_summary()
         elapsed_time = summary.get("elapsed_time")
         total_prs_analyzed = summary.get("total_prs_analyzed")
-        completed_repositories = summary.get(
-            "completed_repositories"
-        )
+        completed_repositories = summary.get("completed_repositories")
         similar_prs_found = summary.get("similar_prs_found")
         errors_count = summary.get("errors_count", 0)
-        console.print(
-            f"\n✅ Analysis completed in {elapsed_time}"
-        )
+        console.print(f"\n✅ Analysis completed in {elapsed_time}")
         console.print(
             f"📊 Analyzed {total_prs_analyzed} PRs across "
             f"{completed_repositories} repositories"
         )
-        console.print(
-            f"🔍 Found {similar_prs_found} similar PRs"
-        )
+        console.print(f"🔍 Found {similar_prs_found} similar PRs")
         if errors_count > 0:
-            console.print(
-                f"⚠️  {errors_count} errors encountered "
-                "during analysis"
-            )
+            console.print(f"⚠️  {errors_count} errors encountered during analysis")
         console.print()
     else:
-        console.print(
-            f"\n🔍 Found {len(ctx.all_similar_prs)} "
-            "similar PRs"
-        )
+        console.print(f"\n🔍 Found {len(ctx.all_similar_prs)} similar PRs")
 
     if not ctx.all_similar_prs:
-        console.print(
-            "❌ No similar PRs found in the organization"
-        )
+        console.print("❌ No similar PRs found in the organization")
 
     for target_pr, comparison in ctx.all_similar_prs:
-        console.print(
-            f"  • {target_pr.repository_full_name} "
-            f"#{target_pr.number}"
-        )
-        console.print(
-            f"    {_format_condensed_similarity(comparison)}"
-        )
+        console.print(f"  • {target_pr.repository_full_name} #{target_pr.number}")
+        console.print(f"    {_format_condensed_similarity(comparison)}")
 
 
 def _run_parallel_merge(
     ctx: _MergeContext,
-    prs_to_merge: list[
-        tuple[PullRequestInfo, ComparisonResult | None]
-    ],
+    prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]],
     preview: bool,
     concurrency: int = 10,
 ) -> list[MergeResult]:
@@ -754,13 +703,8 @@ def _run_parallel_merge(
             rebase_local=ctx.rebase_local,
         ) as merge_manager:
             if not preview:
-                console.print(
-                    f"\n🚀 Merging {len(prs_to_merge)} "
-                    "pull requests..."
-                )
-            return await merge_manager.merge_prs_parallel(
-                prs_to_merge
-            )
+                console.print(f"\n🚀 Merging {len(prs_to_merge)} pull requests...")
+            return await merge_manager.merge_prs_parallel(prs_to_merge)
 
     return asyncio.run(_do_merge())
 
@@ -768,9 +712,7 @@ def _run_parallel_merge(
 def _handle_preview_confirmation(
     ctx: _MergeContext,
     merge_results: list[MergeResult],
-    all_prs_to_merge: list[
-        tuple[PullRequestInfo, ComparisonResult | None]
-    ],
+    all_prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]],
     merged_count: int,
     total_to_merge: int,
 ) -> None:
@@ -791,34 +733,22 @@ def _handle_preview_confirmation(
     commit_messages = ctx.github_client.get_pull_request_commits(
         ctx.owner, ctx.repo_name, ctx.pr_number
     )
-    first_commit_line = (
-        commit_messages[0].split("\n")[0] if commit_messages else ""
-    )
-    continue_sha_hash = _generate_continue_sha(
-        ctx.source_pr, first_commit_line
-    )
+    first_commit_line = commit_messages[0].split("\n")[0] if commit_messages else ""
+    continue_sha_hash = _generate_continue_sha(ctx.source_pr, first_commit_line)
     console.print()
-    console.print(
-        f"To proceed with merging enter: {continue_sha_hash}"
-    )
+    console.print(f"To proceed with merging enter: {continue_sha_hash}")
 
     try:
         if "pytest" in sys.modules or os.getenv("TESTING"):
-            console.print(
-                "⚠️  Test mode detected "
-                "- skipping interactive prompt"
-            )
+            console.print("⚠️  Test mode detected - skipping interactive prompt")
             return
 
         user_input = input(
-            "Enter the string above to continue "
-            "(or press Enter to cancel): "
+            "Enter the string above to continue (or press Enter to cancel): "
         ).strip()
 
         if user_input == continue_sha_hash:
-            _execute_confirmed_merge(
-                ctx, merge_results, all_prs_to_merge
-            )
+            _execute_confirmed_merge(ctx, merge_results, all_prs_to_merge)
         elif user_input == "":
             console.print("❌ Merge cancelled by user.")
         else:
@@ -832,9 +762,7 @@ def _handle_preview_confirmation(
 def _execute_confirmed_merge(
     ctx: _MergeContext,
     preview_results: list[MergeResult],
-    all_prs_to_merge: list[
-        tuple[PullRequestInfo, ComparisonResult | None]
-    ],
+    all_prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]],
 ) -> None:
     """Run the real merge after user confirmation."""
     mergeable_prs = [
@@ -843,26 +771,14 @@ def _execute_confirmed_merge(
         if result.status.value == "merged"
     ]
     merged_count = len(mergeable_prs)
-    console.print(
-        f"\n🔨 Merging {merged_count} mergeable pull requests..."
-    )
+    console.print(f"\n🔨 Merging {merged_count} mergeable pull requests...")
 
-    real_results = _run_parallel_merge(
-        ctx, mergeable_prs, preview=False
-    )
+    real_results = _run_parallel_merge(ctx, mergeable_prs, preview=False)
 
-    final_merged = sum(
-        1 for r in real_results if r.status.value == "merged"
-    )
-    final_failed = sum(
-        1 for r in real_results if r.status.value == "failed"
-    )
-    final_skipped = sum(
-        1 for r in real_results if r.status.value == "skipped"
-    )
-    final_blocked = sum(
-        1 for r in real_results if r.status.value == "blocked"
-    )
+    final_merged = sum(1 for r in real_results if r.status.value == "merged")
+    final_failed = sum(1 for r in real_results if r.status.value == "failed")
+    final_skipped = sum(1 for r in real_results if r.status.value == "skipped")
+    final_blocked = sum(1 for r in real_results if r.status.value == "blocked")
     final_auto_merge = sum(
         1 for r in real_results if r.status.value == "auto_merge_pending"
     )
@@ -870,6 +786,8 @@ def _execute_confirmed_merge(
     if final_auto_merge > 0:
         parts.append(f"{final_auto_merge} auto-merge pending")
     parts.append(f"{final_failed} failed")
+    if final_skipped > 0:
+        parts.append(f"{final_skipped} skipped")
     console.print(f"\n🚀 Final Results: {', '.join(parts)}")
     if final_skipped > 0:
         console.print(f"⏭️  Skipped {final_skipped} PRs")
@@ -884,27 +802,17 @@ def _display_merge_results(
     no_confirm: bool,
 ) -> None:
     """Print the final summary of merge results."""
-    merged_count = sum(
-        1 for r in merge_results if r.status.value == "merged"
-    )
-    failed_count = sum(
-        1 for r in merge_results if r.status.value == "failed"
-    )
-    skipped_count = sum(
-        1 for r in merge_results if r.status.value == "skipped"
-    )
-    blocked_count = sum(
-        1 for r in merge_results if r.status.value == "blocked"
-    )
+    merged_count = sum(1 for r in merge_results if r.status.value == "merged")
+    failed_count = sum(1 for r in merge_results if r.status.value == "failed")
+    skipped_count = sum(1 for r in merge_results if r.status.value == "skipped")
+    blocked_count = sum(1 for r in merge_results if r.status.value == "blocked")
     auto_merge_count = sum(
         1 for r in merge_results if r.status.value == "auto_merge_pending"
     )
 
     if failed_count > 0:
         if not no_confirm:
-            console.print(
-                f"❌ Would fail to merge {failed_count} PRs"
-            )
+            console.print(f"❌ Would fail to merge {failed_count} PRs")
         else:
             console.print(f"❌ Failed {failed_count} PRs")
     if skipped_count > 0:
@@ -919,6 +827,8 @@ def _display_merge_results(
         if auto_merge_count > 0:
             parts.append(f"{auto_merge_count} auto-merge pending")
         parts.append(f"{failed_count} failed")
+        if skipped_count > 0:
+            parts.append(f"{skipped_count} skipped")
         console.print(f"📈 Final Results: {', '.join(parts)}")
 
 
@@ -956,10 +866,7 @@ def _handle_repo_merge(
     ctx.owner = parsed_repo.owner
     ctx.repo_name = parsed_repo.repo
 
-    console.print(
-        f"🔍 Repository mode: fetching open PRs in "
-        f"{parsed_repo.project}..."
-    )
+    console.print(f"🔍 Repository mode: fetching open PRs in {parsed_repo.project}...")
 
     # --- Token permission check (reuse existing helper) ---
     _check_merge_permissions(ctx)
@@ -1003,10 +910,7 @@ def _handle_repo_merge(
 
     if not repo_prs:
         label = "automation " if only_automation else ""
-        console.print(
-            f"❌ No open {label}PRs found in "
-            f"{parsed_repo.project}"
-        )
+        console.print(f"❌ No open {label}PRs found in {parsed_repo.project}")
         return
 
     # --- Classify PRs as automation vs human ---
@@ -1027,67 +931,50 @@ def _handle_repo_merge(
         else:
             human_prs.append(pr)
 
-    console.print(
-        f"\n📊 Found {len(repo_prs)} open PR(s) in "
-        f"{parsed_repo.project}"
-    )
+    console.print(f"\n📊 Found {len(repo_prs)} open PR(s) in {parsed_repo.project}")
     if automation_prs:
-        console.print(
-            f"   🤖 Automation PRs: {len(automation_prs)}"
-        )
+        console.print(f"   🤖 Automation PRs: {len(automation_prs)}")
     if human_prs:
-        console.print(
-            f"   👤 Human PRs: {len(human_prs)}"
-        )
+        console.print(f"   👤 Human PRs: {len(human_prs)}")
 
     # List PRs that will be processed
     for pr in repo_prs:
         icon = "🤖" if _is_auto(pr.author) else "👤"
-        console.print(
-            f"  {icon} #{pr.number} {pr.title} "
-            f"(by {pr.author})"
-        )
+        console.print(f"  {icon} #{pr.number} {pr.title} (by {pr.author})")
 
     # --- Human PR confirmation gate ---
     # Only prompt when human PRs are actually in scope, not merely
     # because --include-human-prs was supplied.
     needs_human_confirm = bool(human_prs) and not ctx.no_confirm
     if needs_human_confirm:
-        console.print(
-            "\n⚠️  Human-authored PRs are included in this "
-            "merge operation."
-        )
-        console.print(
-            "   Review the list above carefully before "
-            "proceeding."
-        )
+        console.print("\n⚠️  Human-authored PRs are included in this merge operation.")
+        console.print("   Review the list above carefully before proceeding.")
         try:
-            user_input = typer.prompt(
-                "Type 'yes' to include human PRs, "
-                "or press Enter to skip them",
-                default="",
-                show_default=False,
-            ).strip().lower()
-            if user_input != "yes":
-                console.print(
-                    "ℹ️  Excluding human PRs from merge."
+            user_input = (
+                typer.prompt(
+                    "Type 'yes' to include human PRs, or press Enter to skip them",
+                    default="",
+                    show_default=False,
                 )
+                .strip()
+                .lower()
+            )
+            if user_input != "yes":
+                console.print("ℹ️  Excluding human PRs from merge.")
                 # Remove human PRs from the working set
                 repo_prs = automation_prs
                 human_prs = []
                 if not repo_prs:
-                    console.print(
-                        "❌ No automation PRs remain to merge."
-                    )
+                    console.print("❌ No automation PRs remain to merge.")
                     return
         except (KeyboardInterrupt, EOFError, typer.Abort):
             console.print("\n❌ Merge cancelled by user.")
             return
 
     # --- Build the merge list (ComparisonResult is None for repo mode) ---
-    all_prs_to_merge: list[
-        tuple[PullRequestInfo, ComparisonResult | None]
-    ] = [(pr, None) for pr in repo_prs]
+    all_prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]] = [
+        (pr, None) for pr in repo_prs
+    ]
 
     # --- Preview / merge using existing infrastructure ---
     if ctx.show_progress:
@@ -1126,10 +1013,7 @@ def _handle_repo_merge(
         console.print("❌ No PRs were processed")
         return
 
-    merged_count = sum(
-        1 for r in merge_results
-        if r.status.value == "merged"
-    )
+    merged_count = sum(1 for r in merge_results if r.status.value == "merged")
 
     if not ctx.no_confirm:
         # In preview mode, show what would happen, then prompt
@@ -1149,9 +1033,7 @@ def _handle_repo_merge(
 def _handle_repo_preview_confirmation(
     ctx: _MergeContext,
     merge_results: list[MergeResult],
-    all_prs_to_merge: list[
-        tuple[PullRequestInfo, ComparisonResult | None]
-    ],
+    all_prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]],
     merged_count: int,
     total_to_merge: int,
 ) -> None:
@@ -1167,31 +1049,21 @@ def _handle_repo_preview_confirmation(
         return
 
     # Generate a confirmation token from the repo context
-    combined = (
-        f"repo-merge:{ctx.owner}/{ctx.repo_name}:"
-        f"{merged_count}"
-    )
-    confirm_hash = hashlib.sha256(
-        combined.encode("utf-8")
-    ).hexdigest()[:16]
+    combined = f"repo-merge:{ctx.owner}/{ctx.repo_name}:{merged_count}"
+    confirm_hash = hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16]
 
     console.print()
-    console.print(
-        f"To proceed with merging enter: {confirm_hash}"
-    )
+    console.print(f"To proceed with merging enter: {confirm_hash}")
 
     try:
         user_input = typer.prompt(
-            "Enter the string above to continue "
-            "(or press Enter to cancel)",
+            "Enter the string above to continue (or press Enter to cancel)",
             default="",
             show_default=False,
         ).strip()
 
         if user_input == confirm_hash:
-            _execute_repo_confirmed_merge(
-                ctx, merge_results, all_prs_to_merge
-            )
+            _execute_repo_confirmed_merge(ctx, merge_results, all_prs_to_merge)
         elif user_input == "":
             console.print("❌ Merge cancelled by user.")
         else:
@@ -1203,9 +1075,7 @@ def _handle_repo_preview_confirmation(
 def _execute_repo_confirmed_merge(
     ctx: _MergeContext,
     preview_results: list[MergeResult],
-    all_prs_to_merge: list[
-        tuple[PullRequestInfo, ComparisonResult | None]
-    ],
+    all_prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]],
 ) -> None:
     """Run the real merge after user confirmation (repo mode)."""
     mergeable_prs = [
@@ -1214,9 +1084,7 @@ def _execute_repo_confirmed_merge(
         if result.status.value == "merged"
     ]
     merged_count = len(mergeable_prs)
-    console.print(
-        f"\n🔨 Merging {merged_count} mergeable pull requests..."
-    )
+    console.print(f"\n🔨 Merging {merged_count} mergeable pull requests...")
 
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
@@ -1240,18 +1108,10 @@ def _execute_repo_confirmed_merge(
         if ctx.show_progress and ctx.progress_tracker:
             ctx.progress_tracker.stop()
 
-    final_merged = sum(
-        1 for r in real_results if r.status.value == "merged"
-    )
-    final_failed = sum(
-        1 for r in real_results if r.status.value == "failed"
-    )
-    final_skipped = sum(
-        1 for r in real_results if r.status.value == "skipped"
-    )
-    final_blocked = sum(
-        1 for r in real_results if r.status.value == "blocked"
-    )
+    final_merged = sum(1 for r in real_results if r.status.value == "merged")
+    final_failed = sum(1 for r in real_results if r.status.value == "failed")
+    final_skipped = sum(1 for r in real_results if r.status.value == "skipped")
+    final_blocked = sum(1 for r in real_results if r.status.value == "blocked")
     final_auto_merge = sum(
         1 for r in real_results if r.status.value == "auto_merge_pending"
     )
@@ -1259,6 +1119,8 @@ def _execute_repo_confirmed_merge(
     if final_auto_merge > 0:
         parts.append(f"{final_auto_merge} auto-merge pending")
     parts.append(f"{final_failed} failed")
+    if final_skipped > 0:
+        parts.append(f"{final_skipped} skipped")
     console.print(f"\n🚀 Final Results: {', '.join(parts)}")
     if final_skipped > 0:
         console.print(f"⏭️  Skipped {final_skipped} PRs")
@@ -1306,8 +1168,12 @@ def _handle_gerrit_merge(
         console.print("❌ Gerrit credentials not found.")
         console.print("   Options:")
         console.print("   1. Create a ~/.netrc file with Gerrit credentials")
-        console.print("   2. Set GERRIT_USERNAME and GERRIT_PASSWORD environment variables")
-        console.print("   Tip: Source your .secrets.gerrit file and run use_lf or use_onap")
+        console.print(
+            "   2. Set GERRIT_USERNAME and GERRIT_PASSWORD environment variables"
+        )
+        console.print(
+            "   Tip: Source your .secrets.gerrit file and run use_lf or use_onap"
+        )
         raise typer.Exit(1)
 
     if verbose:
@@ -1370,7 +1236,9 @@ def _handle_gerrit_merge(
                     console.print("\n   Conflicting files:")
                     for file_path in rebase_result["conflicting_files"]:
                         console.print(f"   • {file_path}")
-                console.print("\n💡 To resolve: manually rebase the change locally and push a new patchset.")
+                console.print(
+                    "\n💡 To resolve: manually rebase the change locally and push a new patchset."
+                )
                 console.print(f"   git review -d {source_change.number}")
                 console.print(f"   git rebase origin/{source_change.branch}")
                 console.print("   # resolve conflicts, then:")
@@ -1393,15 +1261,19 @@ def _handle_gerrit_merge(
 
         if similar_changes:
             for change, comparison in similar_changes:
-                console.print(f"  • {change.project} #{change.number}: {change.subject}")
+                console.print(
+                    f"  • {change.project} #{change.number}: {change.subject}"
+                )
                 console.print(f"    {_format_gerrit_similarity(comparison)}")
 
         # Prepare list of changes to submit (similar + source)
         source_entry: tuple[GerritChangeInfo, GerritComparisonResult | None] = (
-            source_change, None
+            source_change,
+            None,
         )
         all_changes: list[tuple[GerritChangeInfo, GerritComparisonResult | None]] = [
-            *similar_changes, source_entry
+            *similar_changes,
+            source_entry,
         ]
 
         # Check permissions on the source change before proceeding
@@ -1419,11 +1291,17 @@ def _handle_gerrit_merge(
 
         if not no_confirm:
             # Preview mode - show permission status
-            console.print(f"\n📊 Preview: {len(all_changes)} changes would be reviewed and submitted")
+            console.print(
+                f"\n📊 Preview: {len(all_changes)} changes would be reviewed and submitted"
+            )
             if source_change.has_required_permissions():
-                console.print("   ✅ You appear to have required permissions (+2 Code-Review, submit)")
+                console.print(
+                    "   ✅ You appear to have required permissions (+2 Code-Review, submit)"
+                )
             else:
-                console.print("   ⚠️  You may not have all required permissions (see warnings above)")
+                console.print(
+                    "   ⚠️  You may not have all required permissions (see warnings above)"
+                )
             console.print("\nTo proceed, run with --no-confirm flag")
             return
 
@@ -1455,7 +1333,9 @@ def _handle_gerrit_merge(
         # Show details for failed submissions
         for result in results:
             if not result.success:
-                console.print(f"\n   ❌ {result.project} #{result.change_number}: {result.error}")
+                console.print(
+                    f"\n   ❌ {result.project} #{result.change_number}: {result.error}"
+                )
 
     except typer.Exit:
         # Re-raise typer.Exit without treating it as an error
@@ -1471,6 +1351,7 @@ def _handle_gerrit_merge(
         console.print(f"❌ Error during Gerrit merge operation: {e}")
         if verbose:
             import traceback
+
             traceback.print_exc()
         raise typer.Exit(1) from None
 
@@ -1824,11 +1705,13 @@ def merge(
         # Build full list and run parallel merge
         assert ctx.source_pr is not None
         source_entry: tuple[PullRequestInfo, ComparisonResult | None] = (
-            ctx.source_pr, None
+            ctx.source_pr,
+            None,
         )
-        all_prs_to_merge: list[
-            tuple[PullRequestInfo, ComparisonResult | None]
-        ] = [*ctx.all_similar_prs, source_entry]
+        all_prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]] = [
+            *ctx.all_similar_prs,
+            source_entry,
+        ]
         merge_results = _run_parallel_merge(
             ctx, all_prs_to_merge, preview=not ctx.no_confirm
         )
@@ -1838,10 +1721,7 @@ def merge(
             console.print("❌ No PRs were processed")
             return
 
-        merged_count = sum(
-            1 for r in merge_results
-            if r.status.value == "merged"
-        )
+        merged_count = sum(1 for r in merge_results if r.status.value == "merged")
 
         if not ctx.no_confirm:
             _handle_preview_confirmation(
@@ -1912,13 +1792,9 @@ def _print_debug_matching(ctx: _MergeContext) -> None:
         "   Extracted package: "
         f"'{ctx.comparator._extract_package_name(ctx.source_pr.title)}'"
     )
-    console.print(
-        f"   Similarity threshold: {ctx.similarity_threshold}"
-    )
+    console.print(f"   Similarity threshold: {ctx.similarity_threshold}")
     if ctx.source_pr.body:
-        console.print(
-            f"   Body preview: {ctx.source_pr.body[:100]}..."
-        )
+        console.print(f"   Body preview: {ctx.source_pr.body[:100]}...")
         console.print(
             "   Is dependabot body: "
             f"{ctx.comparator._is_dependabot_body(ctx.source_pr.body)}"
@@ -1926,7 +1802,6 @@ def _print_debug_matching(ctx: _MergeContext) -> None:
     else:
         console.print("   ⚠️  Source PR has no body")
     console.print()
-
 
 
 def _display_pr_info(
