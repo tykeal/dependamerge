@@ -298,7 +298,7 @@ class GitHubAsync:
                 message="Token authentication failed - token may be expired or invalid",
                 token_type_guidance={
                     "classic": "Regenerate your token at: https://github.com/settings/tokens",
-                    "fine_grained": "Check token expiration at: https://github.com/settings/tokens?type=beta",
+                    "fine_grained": "Check token expiration at: https://github.com/settings/personal-access-tokens",
                     "fix": "Run: gh auth refresh -h github.com",
                 },
             )

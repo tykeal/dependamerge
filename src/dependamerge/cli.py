@@ -504,25 +504,28 @@ def _check_merge_permissions(ctx: _MergeContext) -> None:
 
     try:
         perm_results = asyncio.run(_check())
-        # Separate blocking failures from advisory warnings.
-        # branch_protection (Administration: Read) is advisory — the
-        # merge flow tolerates missing visibility and the token can
-        # still approve/merge successfully without it.
-        _ADVISORY_OPS = {"branch_protection"}
+        # Every permission probed by the pre-flight check is now
+        # required by some part of the merge flow:
+        #
+        # * ``approve``, ``merge``, ``update_branch`` — obviously
+        #   needed for the core merge actions.
+        # * ``branch_protection`` — used by the signature-preserving
+        #   local-rebase gate (``requires_commit_signatures``) and
+        #   by Step 5.5's block-reason analysis.  A token without
+        #   it degrades the merge flow in ways that are confusing
+        #   to diagnose at runtime, so treat it as blocking up-front.
+        #
+        # There is consequently no advisory class — a missing
+        # permission is always a hard failure.  If a future
+        # operation is genuinely optional, partition
+        # ``missing_perms`` into blocking and advisory subsets
+        # (and re-introduce the ``⚠️ … (non-blocking)`` display
+        # for the advisory subset) at that point.
         missing_perms = [
             op
             for op, result in perm_results.items()
-            if not result["has_permission"] and op not in _ADVISORY_OPS
+            if not result["has_permission"]
         ]
-        advisory_perms = [
-            op
-            for op, result in perm_results.items()
-            if not result["has_permission"] and op in _ADVISORY_OPS
-        ]
-        if advisory_perms:
-            for op in advisory_perms:
-                result = perm_results[op]
-                console.print(f"⚠️  {op}: {result['error']} (non-blocking)")
         if missing_perms:
             console.print("\n❌ Token Permission Check Failed:\n")
             for op in missing_perms:
