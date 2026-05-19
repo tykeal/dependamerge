@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import sys
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -528,18 +529,61 @@ def _check_merge_permissions(ctx: _MergeContext) -> None:
         ]
         if missing_perms:
             console.print("\n❌ Token Permission Check Failed:\n")
+            # Group failing operations by their guidance tuple so we
+            # don't repeat the same URL block once per failed
+            # operation.  In the common 401 / expired-token case
+            # every operation lands on the same guidance, which
+            # used to produce four near-identical six-line blocks;
+            # under the grouped renderer it collapses to a single
+            # list of operations followed by one guidance block.
+            # The 403 case (per-operation scope guidance) naturally
+            # falls out as one group per distinct guidance tuple,
+            # so each operation still gets its own scope hint.
+            groups: OrderedDict[
+                tuple[str | None, str | None, str | None],
+                list[tuple[str, str]],
+            ] = OrderedDict()
             for op in missing_perms:
                 result = perm_results[op]
-                console.print(f"   • {op}: {result['error']}")
-                if result.get("guidance"):
-                    console.print(
-                        f"     Classic: {result['guidance'].get('classic', 'N/A')}"
-                    )
-                    console.print(
-                        f"     Fine-grained: "
-                        f"{result['guidance'].get('fine_grained', 'N/A')}"
-                    )
-            console.print("\n💡 Update your token permissions and try again.")
+                guidance = result.get("guidance") or {}
+                key = (
+                    guidance.get("classic"),
+                    guidance.get("fine_grained"),
+                    guidance.get("fix"),
+                )
+                groups.setdefault(key, []).append(
+                    (op, result.get("error", ""))
+                )
+
+            for key, items in groups.items():
+                classic, fine_grained, fix = key
+                # List the failing operations in this group.
+                for op, _err in items:
+                    console.print(f"   • {op}")
+                # Show the shared error message once if every op
+                # in the group reports the same one (the 401 case);
+                # otherwise show each operation's message inline
+                # so distinct failures stay distinguishable.
+                distinct_errors = {err for _, err in items if err}
+                if len(distinct_errors) == 1:
+                    console.print(f"\n   {next(iter(distinct_errors))}")
+                elif distinct_errors:
+                    console.print()
+                    for op, err in items:
+                        if err:
+                            console.print(f"   {op}: {err}")
+                # Single guidance block for the whole group.
+                if classic or fine_grained or fix:
+                    console.print()
+                    if classic:
+                        console.print(f"   Classic:       {classic}")
+                    if fine_grained:
+                        console.print(f"   Fine-grained:  {fine_grained}")
+                    if fix:
+                        console.print(f"   Fix:           {fix}")
+                console.print()  # blank line between groups
+
+            console.print("💡 Update your token permissions and try again.")
             raise typer.Exit(code=3)
         console.print("✅ Token has required permissions")
     except GitHubPermissionError as e:
