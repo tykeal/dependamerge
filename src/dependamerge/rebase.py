@@ -59,6 +59,7 @@ from .git_ops import (
     clone,
     ensure_git_available,
     fetch,
+    fetch_branch,
     push_force_with_lease,
     rebase,
     rebase_abort,
@@ -379,10 +380,17 @@ async def local_rebase_pr(
         # Fetch the base branch — from upstream when the PR is
         # from a fork, from origin otherwise. We need it
         # available locally before we can rebase onto it.
+        #
+        # Use :func:`fetch_branch` rather than the bare ``fetch``
+        # form: the ``--single-branch`` clone above restricts the
+        # remote's configured refspec to the PR head branch, so a
+        # bare ``git fetch origin <base>`` would only populate
+        # ``FETCH_HEAD`` and a subsequent ``git rebase origin/<base>``
+        # would fail with ``fatal: invalid upstream 'origin/<base>'``.
         try:
             if is_fork:
                 add_remote("upstream", upstream_url, cwd=workspace, logger=log.debug)
-                fetch(
+                fetch_branch(
                     "upstream",
                     base_branch,
                     cwd=workspace,
@@ -391,7 +399,7 @@ async def local_rebase_pr(
                 )
                 rebase_onto = f"upstream/{base_branch}"
             else:
-                fetch(
+                fetch_branch(
                     "origin",
                     base_branch,
                     cwd=workspace,

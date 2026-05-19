@@ -322,7 +322,28 @@ def fetch(
     prune: bool = False,
     logger: Callable[[str], None] | None = None,
 ) -> None:
-    """Fetch refs with optional shallow/unshallow behavior."""
+    """Fetch refs with optional shallow/unshallow behavior.
+
+    .. warning::
+
+       Passing a *bare* branch name (e.g. ``fetch("origin", "main")``)
+       only populates ``FETCH_HEAD``; it does **not** update
+       ``refs/remotes/<remote>/<branch>`` unless the remote's
+       configured fetch refspec already covers that branch.  After a
+       ``--single-branch`` clone (which is :func:`clone`'s default)
+       the configured refspec covers only the branch the clone
+       targeted, so a subsequent ``fetch("origin", "main")`` leaves
+       ``origin/main`` *undefined* locally and any downstream
+       ``rebase`` / ``merge`` / ``rev-list`` against ``origin/main``
+       fails with ``fatal: invalid upstream 'origin/main'``.
+
+       When the caller wants the fetched branch to be usable as a
+       remote-tracking ref (the usual case), use :func:`fetch_branch`
+       instead, which always writes through an explicit refspec
+       mapping.  Callers that genuinely want
+       ``FETCH_HEAD``-only semantics (e.g. preparing a one-shot
+       ``git merge FETCH_HEAD``) can keep using the bare form here.
+    """
     args = ["git", "fetch", remote]
     if prune:
         args.append("--prune")
@@ -336,6 +357,49 @@ def fetch(
     else:
         args.extend(list(refspecs))
     run_git(args, cwd=cwd, logger=logger)
+
+
+def fetch_branch(
+    remote: str,
+    branch: str,
+    *,
+    cwd: PathLike,
+    depth: int | None = None,
+    force: bool = True,
+    logger: Callable[[str], None] | None = None,
+) -> None:
+    """Fetch ``branch`` from ``remote`` into ``refs/remotes/<remote>/<branch>``.
+
+    Wraps :func:`fetch` with an explicit refspec mapping so the
+    remote-tracking ref always lands locally, regardless of the
+    remote's configured fetch refspec.  This is the safe form to
+    use after a ``--single-branch`` clone (which is :func:`clone`'s
+    default) when subsequent code needs to refer to
+    ``<remote>/<branch>`` — e.g. as the target of
+    :func:`rebase` / :func:`rev_list_count` / a ``log <r>/<b>..HEAD``
+    invocation.
+
+    A bare ``git fetch <remote> <branch>`` would only populate
+    ``FETCH_HEAD`` in that scenario and the downstream rebase would
+    fail with ``fatal: invalid upstream '<remote>/<branch>'``
+    — see :func:`fetch` for the full background.
+
+    Args:
+        remote: Remote name (e.g. ``"origin"`` or ``"upstream"``).
+        branch: Branch name on the remote (no ``refs/heads/`` prefix).
+        cwd: Working directory in which to run ``git``.
+        depth: Optional shallow-fetch depth.  ``None`` means
+            "inherit the existing depth" (no ``--depth`` flag).
+        force: When True (the default), prepend ``+`` to the
+            refspec so the remote-tracking ref is updated even when
+            the remote has been force-pushed (the common case for
+            dependency-update bot branches that get re-pushed).
+        logger: Optional logger callback.
+    """
+    prefix = "+" if force else ""
+    refspec = f"{prefix}refs/heads/{branch}:refs/remotes/{remote}/{branch}"
+    fetch(remote, refspec, cwd=cwd, depth=depth, logger=logger)
+
 
 
 def checkout(
