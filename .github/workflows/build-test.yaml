@@ -50,11 +50,11 @@ jobs:
       # forks, which previously forced a fallback to audit mode).
       #
       # Temporarily pinned to a branch in a personal fork while
-      # lfreleng-actions/harden-runner-block-action#5 is in
+      # lfreleng-actions/harden-runner-block-action#7 is in
       # review; update to a tagged release in lfreleng-actions/
       # once that PR merges.
       # yamllint disable-line rule:line-length
-      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/whitelist-loader
+      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/allow-list-loader
         with:
           org: 'lfreleng-actions'
 
@@ -106,11 +106,11 @@ jobs:
       # forks, which previously forced a fallback to audit mode).
       #
       # Temporarily pinned to a branch in a personal fork while
-      # lfreleng-actions/harden-runner-block-action#5 is in
+      # lfreleng-actions/harden-runner-block-action#7 is in
       # review; update to a tagged release in lfreleng-actions/
       # once that PR merges.
       # yamllint disable-line rule:line-length
-      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/whitelist-loader
+      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/allow-list-loader
         with:
           org: 'lfreleng-actions'
 
@@ -210,11 +210,11 @@ jobs:
       # forks, which previously forced a fallback to audit mode).
       #
       # Temporarily pinned to a branch in a personal fork while
-      # lfreleng-actions/harden-runner-block-action#5 is in
+      # lfreleng-actions/harden-runner-block-action#7 is in
       # review; update to a tagged release in lfreleng-actions/
       # once that PR merges.
       # yamllint disable-line rule:line-length
-      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/whitelist-loader
+      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/allow-list-loader
         with:
           org: 'lfreleng-actions'
 
@@ -258,11 +258,11 @@ jobs:
       # forks, which previously forced a fallback to audit mode).
       #
       # Temporarily pinned to a branch in a personal fork while
-      # lfreleng-actions/harden-runner-block-action#5 is in
+      # lfreleng-actions/harden-runner-block-action#7 is in
       # review; update to a tagged release in lfreleng-actions/
       # once that PR merges.
       # yamllint disable-line rule:line-length
-      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/whitelist-loader
+      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/allow-list-loader
         with:
           org: 'lfreleng-actions'
 
@@ -307,11 +307,11 @@ jobs:
       # forks, which previously forced a fallback to audit mode).
       #
       # Temporarily pinned to a branch in a personal fork while
-      # lfreleng-actions/harden-runner-block-action#5 is in
+      # lfreleng-actions/harden-runner-block-action#7 is in
       # review; update to a tagged release in lfreleng-actions/
       # once that PR merges.
       # yamllint disable-line rule:line-length
-      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/whitelist-loader
+      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/allow-list-loader
         with:
           org: 'lfreleng-actions'
 
@@ -353,11 +353,11 @@ jobs:
       # forks, which previously forced a fallback to audit mode).
       #
       # Temporarily pinned to a branch in a personal fork while
-      # lfreleng-actions/harden-runner-block-action#5 is in
+      # lfreleng-actions/harden-runner-block-action#7 is in
       # review; update to a tagged release in lfreleng-actions/
       # once that PR merges.
       # yamllint disable-line rule:line-length
-      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/whitelist-loader
+      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/allow-list-loader
         with:
           org: 'lfreleng-actions'
 
@@ -419,11 +419,11 @@ jobs:
       # forks, which previously forced a fallback to audit mode).
       #
       # Temporarily pinned to a branch in a personal fork while
-      # lfreleng-actions/harden-runner-block-action#5 is in
+      # lfreleng-actions/harden-runner-block-action#7 is in
       # review; update to a tagged release in lfreleng-actions/
       # once that PR merges.
       # yamllint disable-line rule:line-length
-      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/whitelist-loader
+      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/allow-list-loader
         with:
           org: 'lfreleng-actions'
 
