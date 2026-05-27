@@ -27,28 +27,27 @@ jobs:
       pull-requests: read
     timeout-minutes: 5
     steps:
-      # When the CONNECTION_WHITELIST repo/org variable is exposed
-      # to this run (i.e. not a fork PR), use it to enforce a
-      # block-mode egress policy.
-      - name: 'Harden runner (block egress with whitelist)'
-        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+      # Load the egress allow-list out-of-band from
+      # lfreleng-actions/.github and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below
+      # to consume in 'block' mode. Loading out-of-band means
+      # the workflow no longer depends on any org-level GitHub
+      # variable being exposed at runtime (org variables are
+      # unreachable from workflows triggered by PRs raised from
+      # forks, which previously forced a fallback to audit mode).
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
+        with:
+          org: 'lfreleng-actions'
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
-            ${{ vars.CONNECTION_WHITELIST }}
-
-      # Fallback for fork PRs and other contexts where the
-      # CONNECTION_WHITELIST variable is not exposed to the
-      # workflow.  Audit-only mode logs all egress without
-      # blocking it so CI still runs.
-      - name: 'Harden runner (audit fallback, no whitelist available)'
-        if: ${{ vars.CONNECTION_WHITELIST == '' }}
-        # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
-        with:
-          egress-policy: 'audit'
+            ${{ env.CONNECTION_ALLOW_LIST }}
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -75,29 +74,27 @@ jobs:
     outputs:
       tag: "${{ steps.tag-validate.outputs.tag_name }}"
     steps:
-      # Harden the runner used by this workflow
-      # When the CONNECTION_WHITELIST repo/org variable is exposed
-      # to this run (i.e. not a fork PR), use it to enforce a
-      # block-mode egress policy.
-      - name: 'Harden runner (block egress with whitelist)'
-        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+      # Load the egress allow-list out-of-band from
+      # lfreleng-actions/.github and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below
+      # to consume in 'block' mode. Loading out-of-band means
+      # the workflow no longer depends on any org-level GitHub
+      # variable being exposed at runtime (org variables are
+      # unreachable from workflows triggered by PRs raised from
+      # forks, which previously forced a fallback to audit mode).
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
+        with:
+          org: 'lfreleng-actions'
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
-            ${{ vars.CONNECTION_WHITELIST }}
-
-      # Fallback for fork PRs and other contexts where the
-      # CONNECTION_WHITELIST variable is not exposed to the
-      # workflow.  Audit-only mode logs all egress without
-      # blocking it so CI still runs.
-      - name: 'Harden runner (audit fallback, no whitelist available)'
-        if: ${{ vars.CONNECTION_WHITELIST == '' }}
-        # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
-        with:
-          egress-policy: 'audit'
+            ${{ env.CONNECTION_ALLOW_LIST }}
 
       - name: 'Checkout repository'
         # yamllint disable-line rule:line-length
@@ -159,29 +156,27 @@ jobs:
     env:
       GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
     steps:
-      # Harden the runner used by this workflow
-      # When the CONNECTION_WHITELIST repo/org variable is exposed
-      # to this run (i.e. not a fork PR), use it to enforce a
-      # block-mode egress policy.
-      - name: 'Harden runner (block egress with whitelist)'
-        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+      # Load the egress allow-list out-of-band from
+      # lfreleng-actions/.github and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below
+      # to consume in 'block' mode. Loading out-of-band means
+      # the workflow no longer depends on any org-level GitHub
+      # variable being exposed at runtime (org variables are
+      # unreachable from workflows triggered by PRs raised from
+      # forks, which previously forced a fallback to audit mode).
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
+        with:
+          org: 'lfreleng-actions'
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
-            ${{ vars.CONNECTION_WHITELIST }}
-
-      # Fallback for fork PRs and other contexts where the
-      # CONNECTION_WHITELIST variable is not exposed to the
-      # workflow.  Audit-only mode logs all egress without
-      # blocking it so CI still runs.
-      - name: 'Harden runner (audit fallback, no whitelist available)'
-        if: ${{ vars.CONNECTION_WHITELIST == '' }}
-        # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
-        with:
-          egress-policy: 'audit'
+            ${{ env.CONNECTION_ALLOW_LIST }}
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -189,7 +184,7 @@ jobs:
       - name: 'Build Python project'
         id: 'python-build'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/python-build-action@38b9a4e7ee34e56d178f5bd248df52e41f7d496e  # v1.0.6
+        uses: lfreleng-actions/python-build-action@5f570d5d17a7315074a824a91c6a705b6fc5c7dd  # v1.1.2
         with:
           sigstore_sign: true
           attestations: true
@@ -206,29 +201,27 @@ jobs:
       contents: read
     timeout-minutes: 12
     steps:
-      # Harden the runner used by this workflow
-      # When the CONNECTION_WHITELIST repo/org variable is exposed
-      # to this run (i.e. not a fork PR), use it to enforce a
-      # block-mode egress policy.
-      - name: 'Harden runner (block egress with whitelist)'
-        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+      # Load the egress allow-list out-of-band from
+      # lfreleng-actions/.github and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below
+      # to consume in 'block' mode. Loading out-of-band means
+      # the workflow no longer depends on any org-level GitHub
+      # variable being exposed at runtime (org variables are
+      # unreachable from workflows triggered by PRs raised from
+      # forks, which previously forced a fallback to audit mode).
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
+        with:
+          org: 'lfreleng-actions'
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
-            ${{ vars.CONNECTION_WHITELIST }}
-
-      # Fallback for fork PRs and other contexts where the
-      # CONNECTION_WHITELIST variable is not exposed to the
-      # workflow.  Audit-only mode logs all egress without
-      # blocking it so CI still runs.
-      - name: 'Harden runner (audit fallback, no whitelist available)'
-        if: ${{ vars.CONNECTION_WHITELIST == '' }}
-        # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
-        with:
-          egress-policy: 'audit'
+            ${{ env.CONNECTION_ALLOW_LIST }}
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -251,36 +244,34 @@ jobs:
       contents: read
     timeout-minutes: 10
     steps:
-      # Harden the runner used by this workflow
-      # When the CONNECTION_WHITELIST repo/org variable is exposed
-      # to this run (i.e. not a fork PR), use it to enforce a
-      # block-mode egress policy.
-      - name: 'Harden runner (block egress with whitelist)'
-        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+      # Load the egress allow-list out-of-band from
+      # lfreleng-actions/.github and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below
+      # to consume in 'block' mode. Loading out-of-band means
+      # the workflow no longer depends on any org-level GitHub
+      # variable being exposed at runtime (org variables are
+      # unreachable from workflows triggered by PRs raised from
+      # forks, which previously forced a fallback to audit mode).
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
+        with:
+          org: 'lfreleng-actions'
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
-            ${{ vars.CONNECTION_WHITELIST }}
-
-      # Fallback for fork PRs and other contexts where the
-      # CONNECTION_WHITELIST variable is not exposed to the
-      # workflow.  Audit-only mode logs all egress without
-      # blocking it so CI still runs.
-      - name: 'Harden runner (audit fallback, no whitelist available)'
-        if: ${{ vars.CONNECTION_WHITELIST == '' }}
-        # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
-        with:
-          egress-policy: 'audit'
+            ${{ env.CONNECTION_ALLOW_LIST }}
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: 'Audit Python project'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/python-audit-action@275c85f883b03f5342c1fafd8173b6d996670a1d  # v0.2.7
+        uses: lfreleng-actions/python-audit-action@37dd0da54e2d66194f9d46b7000dbba5d62601f9  # v0.2.8
         with:
           python_version: "${{ matrix.python-version }}"
           permit_fail: "${{ vars.NO_BLOCK_AUDIT_FAIL == 'true' }}"
@@ -293,29 +284,27 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Harden the runner used by this workflow
-      # When the CONNECTION_WHITELIST repo/org variable is exposed
-      # to this run (i.e. not a fork PR), use it to enforce a
-      # block-mode egress policy.
-      - name: 'Harden runner (block egress with whitelist)'
-        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+      # Load the egress allow-list out-of-band from
+      # lfreleng-actions/.github and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below
+      # to consume in 'block' mode. Loading out-of-band means
+      # the workflow no longer depends on any org-level GitHub
+      # variable being exposed at runtime (org variables are
+      # unreachable from workflows triggered by PRs raised from
+      # forks, which previously forced a fallback to audit mode).
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
+        with:
+          org: 'lfreleng-actions'
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
-            ${{ vars.CONNECTION_WHITELIST }}
-
-      # Fallback for fork PRs and other contexts where the
-      # CONNECTION_WHITELIST variable is not exposed to the
-      # workflow.  Audit-only mode logs all egress without
-      # blocking it so CI still runs.
-      - name: 'Harden runner (audit fallback, no whitelist available)'
-        if: ${{ vars.CONNECTION_WHITELIST == '' }}
-        # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
-        with:
-          egress-policy: 'audit'
+            ${{ env.CONNECTION_ALLOW_LIST }}
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -355,29 +344,27 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Harden the runner used by this workflow
-      # When the CONNECTION_WHITELIST repo/org variable is exposed
-      # to this run (i.e. not a fork PR), use it to enforce a
-      # block-mode egress policy.
-      - name: 'Harden runner (block egress with whitelist)'
-        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+      # Load the egress allow-list out-of-band from
+      # lfreleng-actions/.github and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below
+      # to consume in 'block' mode. Loading out-of-band means
+      # the workflow no longer depends on any org-level GitHub
+      # variable being exposed at runtime (org variables are
+      # unreachable from workflows triggered by PRs raised from
+      # forks, which previously forced a fallback to audit mode).
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
+        with:
+          org: 'lfreleng-actions'
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
-            ${{ vars.CONNECTION_WHITELIST }}
-
-      # Fallback for fork PRs and other contexts where the
-      # CONNECTION_WHITELIST variable is not exposed to the
-      # workflow.  Audit-only mode logs all egress without
-      # blocking it so CI still runs.
-      - name: 'Harden runner (audit fallback, no whitelist available)'
-        if: ${{ vars.CONNECTION_WHITELIST == '' }}
-        # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
-        with:
-          egress-policy: 'audit'
+            ${{ env.CONNECTION_ALLOW_LIST }}
 
       - name: "Download SBOM artefact"
         # yamllint disable-line rule:line-length
@@ -544,29 +531,27 @@ jobs:
       id-token: write  # IMPORTANT: mandatory for trusted publishing
     timeout-minutes: 5
     steps:
-      # Harden the runner used by this workflow
-      # When the CONNECTION_WHITELIST repo/org variable is exposed
-      # to this run (i.e. not a fork PR), use it to enforce a
-      # block-mode egress policy.
-      - name: 'Harden runner (block egress with whitelist)'
-        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+      # Load the egress allow-list out-of-band from
+      # lfreleng-actions/.github and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below
+      # to consume in 'block' mode. Loading out-of-band means
+      # the workflow no longer depends on any org-level GitHub
+      # variable being exposed at runtime (org variables are
+      # unreachable from workflows triggered by PRs raised from
+      # forks, which previously forced a fallback to audit mode).
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
+        with:
+          org: 'lfreleng-actions'
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
-            ${{ vars.CONNECTION_WHITELIST }}
-
-      # Fallback for fork PRs and other contexts where the
-      # CONNECTION_WHITELIST variable is not exposed to the
-      # workflow.  Audit-only mode logs all egress without
-      # blocking it so CI still runs.
-      - name: 'Harden runner (audit fallback, no whitelist available)'
-        if: ${{ vars.CONNECTION_WHITELIST == '' }}
-        # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
-        with:
-          egress-policy: 'audit'
+            ${{ env.CONNECTION_ALLOW_LIST }}
 
       - name: 'Test PyPI publishing'
         # yamllint disable-line rule:line-length
@@ -589,29 +574,27 @@ jobs:
       id-token: write  # IMPORTANT: mandatory for trusted publishing
     timeout-minutes: 5
     steps:
-      # Harden the runner used by this workflow
-      # When the CONNECTION_WHITELIST repo/org variable is exposed
-      # to this run (i.e. not a fork PR), use it to enforce a
-      # block-mode egress policy.
-      - name: 'Harden runner (block egress with whitelist)'
-        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+      # Load the egress allow-list out-of-band from
+      # lfreleng-actions/.github and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below
+      # to consume in 'block' mode. Loading out-of-band means
+      # the workflow no longer depends on any org-level GitHub
+      # variable being exposed at runtime (org variables are
+      # unreachable from workflows triggered by PRs raised from
+      # forks, which previously forced a fallback to audit mode).
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
+        with:
+          org: 'lfreleng-actions'
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
-            ${{ vars.CONNECTION_WHITELIST }}
-
-      # Fallback for fork PRs and other contexts where the
-      # CONNECTION_WHITELIST variable is not exposed to the
-      # workflow.  Audit-only mode logs all egress without
-      # blocking it so CI still runs.
-      - name: 'Harden runner (audit fallback, no whitelist available)'
-        if: ${{ vars.CONNECTION_WHITELIST == '' }}
-        # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
-        with:
-          egress-policy: 'audit'
+            ${{ env.CONNECTION_ALLOW_LIST }}
 
       - name: 'PyPI release'
         # yamllint disable-line rule:line-length
@@ -644,29 +627,27 @@ jobs:
     env:
       GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
     steps:
-      # Harden the runner used by this workflow
-      # When the CONNECTION_WHITELIST repo/org variable is exposed
-      # to this run (i.e. not a fork PR), use it to enforce a
-      # block-mode egress policy.
-      - name: 'Harden runner (block egress with whitelist)'
-        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+      # Load the egress allow-list out-of-band from
+      # lfreleng-actions/.github and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below
+      # to consume in 'block' mode. Loading out-of-band means
+      # the workflow no longer depends on any org-level GitHub
+      # variable being exposed at runtime (org variables are
+      # unreachable from workflows triggered by PRs raised from
+      # forks, which previously forced a fallback to audit mode).
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
+        with:
+          org: 'lfreleng-actions'
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
-            ${{ vars.CONNECTION_WHITELIST }}
-
-      # Fallback for fork PRs and other contexts where the
-      # CONNECTION_WHITELIST variable is not exposed to the
-      # workflow.  Audit-only mode logs all egress without
-      # blocking it so CI still runs.
-      - name: 'Harden runner (audit fallback, no whitelist available)'
-        if: ${{ vars.CONNECTION_WHITELIST == '' }}
-        # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
-        with:
-          egress-policy: 'audit'
+            ${{ env.CONNECTION_ALLOW_LIST }}
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -700,29 +681,27 @@ jobs:
       # yamllint disable-line rule:line-length
       release_url: "${{ steps.promote-release.outputs.release_url || steps.set-promoted-url.outputs.release_url }}"
     steps:
-      # Harden the runner used by this workflow
-      # When the CONNECTION_WHITELIST repo/org variable is exposed
-      # to this run (i.e. not a fork PR), use it to enforce a
-      # block-mode egress policy.
-      - name: 'Harden runner (block egress with whitelist)'
-        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+      # Load the egress allow-list out-of-band from
+      # lfreleng-actions/.github and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below
+      # to consume in 'block' mode. Loading out-of-band means
+      # the workflow no longer depends on any org-level GitHub
+      # variable being exposed at runtime (org variables are
+      # unreachable from workflows triggered by PRs raised from
+      # forks, which previously forced a fallback to audit mode).
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
+        with:
+          org: 'lfreleng-actions'
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
-            ${{ vars.CONNECTION_WHITELIST }}
-
-      # Fallback for fork PRs and other contexts where the
-      # CONNECTION_WHITELIST variable is not exposed to the
-      # workflow.  Audit-only mode logs all egress without
-      # blocking it so CI still runs.
-      - name: 'Harden runner (audit fallback, no whitelist available)'
-        if: ${{ vars.CONNECTION_WHITELIST == '' }}
-        # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
-        with:
-          egress-policy: 'audit'
+            ${{ env.CONNECTION_ALLOW_LIST }}
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
