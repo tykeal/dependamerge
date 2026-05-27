@@ -72,29 +72,32 @@ jobs:
     runs-on: 'ubuntu-latest'
     timeout-minutes: 3
     steps:
-      # Harden the runner used by this workflow
-      # When the CONNECTION_WHITELIST repo/org variable is exposed
-      # to this run (i.e. not a fork PR), use it to enforce a
-      # block-mode egress policy.
-      - name: 'Harden runner (block egress with whitelist)'
-        if: ${{ vars.CONNECTION_WHITELIST != '' }}
+      # Load the egress allow-list out-of-band from
+      # lfreleng-actions/.github and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below
+      # to consume in 'block' mode. Loading out-of-band means
+      # the workflow no longer depends on any org-level GitHub
+      # variable being exposed at runtime (org variables are
+      # unreachable from workflows triggered by PRs raised from
+      # forks, which previously forced a fallback to audit mode).
+      #
+      # Temporarily pinned to a branch in a personal fork while
+      # lfreleng-actions/harden-runner-block-action#5 is in
+      # review; update to a tagged release in lfreleng-actions/
+      # once that PR merges.
+      # yamllint disable-line rule:line-length
+      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/whitelist-loader
+        with:
+          org: 'lfreleng-actions'
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
-            ${{ vars.CONNECTION_WHITELIST }}
-
-      # Fallback for fork PRs and other contexts where the
-      # CONNECTION_WHITELIST variable is not exposed to the
-      # workflow.  Audit-only mode logs all egress without
-      # blocking it so CI still runs.
-      - name: 'Harden runner (audit fallback, no whitelist available)'
-        if: ${{ vars.CONNECTION_WHITELIST == '' }}
-        # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
-        with:
-          egress-policy: 'audit'
+            ${{ env.CONNECTION_ALLOW_LIST }}
 
       # yamllint disable-line rule:line-length
       - uses: release-drafter/release-drafter/autolabeler@c2e2804cc59f45f57076a99af580d0fedb697927  # v7.3.0
