@@ -18,18 +18,28 @@ on:
   # manual-approval gating because:
   #
   #   1. The workflow performs no checkout of PR code
-  #      (no actions/checkout step).
+  #      (no actions/checkout step), so no PR-provided source
+  #      ever runs.
   #   2. The workflow body is loaded from the base branch
   #      (pull_request_target semantics), not from the PR head.
-  #   3. The only step is release-drafter/autolabeler, pinned to
-  #      a commit SHA, which is a pure GitHub-API consumer and
-  #      never executes PR-provided content.
+  #   3. Every step is pinned to a full commit SHA and is a
+  #      well-scoped, non-code-executing consumer:
+  #        - `lfreleng-actions/harden-runner-block-action`
+  #          fetches one allow-list file over HTTPS, sanitises
+  #          it, and publishes it as $CONNECTION_ALLOW_LIST.
+  #          No PR content is read or executed.
+  #        - `step-security/harden-runner` installs the egress
+  #          block filter from $CONNECTION_ALLOW_LIST. Pure
+  #          runner-hardening; reads no PR content.
+  #        - `release-drafter/autolabeler` makes only GitHub
+  #          API calls. No code execution, no PR content read.
   #   4. Permissions are scoped to the minimum needed:
   #      pull-requests: write and contents: read. No
   #      repository secrets are passed to the job beyond the
   #      default GITHUB_TOKEN, which the job receives with the
   #      permissions scope above and nothing more.
-  #   5. The runner is hardened with an egress block.
+  #   5. The runner is hardened with an egress block applied
+  #      before the autolabeler step runs.
   #
   # See the SECURITY block on the autolabel job below for the
   # full rationale. The zizmor `dangerous-triggers` audit is
