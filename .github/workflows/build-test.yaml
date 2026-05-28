@@ -48,20 +48,15 @@ jobs:
       # variable being exposed at runtime (org variables are
       # unreachable from workflows triggered by PRs raised from
       # forks, which previously forced a fallback to audit mode).
-      #
-      # Temporarily pinned to a branch in a personal fork while
-      # lfreleng-actions/harden-runner-block-action#7 is in
-      # review; update to a tagged release in lfreleng-actions/
-      # once that PR merges.
       # yamllint disable-line rule:line-length
-      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/allow-list-loader
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
         with:
           org: 'lfreleng-actions'
 
       # Harden the runner with the just-loaded allow-list.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -104,20 +99,15 @@ jobs:
       # variable being exposed at runtime (org variables are
       # unreachable from workflows triggered by PRs raised from
       # forks, which previously forced a fallback to audit mode).
-      #
-      # Temporarily pinned to a branch in a personal fork while
-      # lfreleng-actions/harden-runner-block-action#7 is in
-      # review; update to a tagged release in lfreleng-actions/
-      # once that PR merges.
       # yamllint disable-line rule:line-length
-      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/allow-list-loader
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
         with:
           org: 'lfreleng-actions'
 
       # Harden the runner with the just-loaded allow-list.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -208,20 +198,15 @@ jobs:
       # variable being exposed at runtime (org variables are
       # unreachable from workflows triggered by PRs raised from
       # forks, which previously forced a fallback to audit mode).
-      #
-      # Temporarily pinned to a branch in a personal fork while
-      # lfreleng-actions/harden-runner-block-action#7 is in
-      # review; update to a tagged release in lfreleng-actions/
-      # once that PR merges.
       # yamllint disable-line rule:line-length
-      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/allow-list-loader
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
         with:
           org: 'lfreleng-actions'
 
       # Harden the runner with the just-loaded allow-list.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -233,7 +218,7 @@ jobs:
       - name: 'Build Python project'
         id: python-build
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/python-build-action@38b9a4e7ee34e56d178f5bd248df52e41f7d496e  # v1.0.6
+        uses: lfreleng-actions/python-build-action@5f570d5d17a7315074a824a91c6a705b6fc5c7dd  # v1.1.2
 
   python-tests:
     name: 'Python Tests'
@@ -256,20 +241,15 @@ jobs:
       # variable being exposed at runtime (org variables are
       # unreachable from workflows triggered by PRs raised from
       # forks, which previously forced a fallback to audit mode).
-      #
-      # Temporarily pinned to a branch in a personal fork while
-      # lfreleng-actions/harden-runner-block-action#7 is in
-      # review; update to a tagged release in lfreleng-actions/
-      # once that PR merges.
       # yamllint disable-line rule:line-length
-      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/allow-list-loader
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
         with:
           org: 'lfreleng-actions'
 
       # Harden the runner with the just-loaded allow-list.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -305,20 +285,15 @@ jobs:
       # variable being exposed at runtime (org variables are
       # unreachable from workflows triggered by PRs raised from
       # forks, which previously forced a fallback to audit mode).
-      #
-      # Temporarily pinned to a branch in a personal fork while
-      # lfreleng-actions/harden-runner-block-action#7 is in
-      # review; update to a tagged release in lfreleng-actions/
-      # once that PR merges.
       # yamllint disable-line rule:line-length
-      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/allow-list-loader
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
         with:
           org: 'lfreleng-actions'
 
       # Harden the runner with the just-loaded allow-list.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -329,7 +304,7 @@ jobs:
 
       - name: "Audit dependencies ${{ matrix.python-version }}"
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/python-audit-action@275c85f883b03f5342c1fafd8173b6d996670a1d  # v0.2.7
+        uses: lfreleng-actions/python-audit-action@37dd0da54e2d66194f9d46b7000dbba5d62601f9  # v0.2.8
         with:
           python_version: "${{ matrix.python-version }}"
           permit_fail: "${{ vars.NO_BLOCK_AUDIT_FAIL == 'true' }}"
@@ -351,20 +326,15 @@ jobs:
       # variable being exposed at runtime (org variables are
       # unreachable from workflows triggered by PRs raised from
       # forks, which previously forced a fallback to audit mode).
-      #
-      # Temporarily pinned to a branch in a personal fork while
-      # lfreleng-actions/harden-runner-block-action#7 is in
-      # review; update to a tagged release in lfreleng-actions/
-      # once that PR merges.
       # yamllint disable-line rule:line-length
-      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/allow-list-loader
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
         with:
           org: 'lfreleng-actions'
 
       # Harden the runner with the just-loaded allow-list.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -417,20 +387,15 @@ jobs:
       # variable being exposed at runtime (org variables are
       # unreachable from workflows triggered by PRs raised from
       # forks, which previously forced a fallback to audit mode).
-      #
-      # Temporarily pinned to a branch in a personal fork while
-      # lfreleng-actions/harden-runner-block-action#7 is in
-      # review; update to a tagged release in lfreleng-actions/
-      # once that PR merges.
       # yamllint disable-line rule:line-length
-      - uses: modeseven-lfreleng-actions/harden-runner-block-action@feat/allow-list-loader
+      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
         with:
           org: 'lfreleng-actions'
 
       # Harden the runner with the just-loaded allow-list.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
