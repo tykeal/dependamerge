@@ -275,9 +275,7 @@ class ProgressTracker:
 
         # Elapsed time
         elapsed = datetime.now() - self.start_time
-        text.append(
-            f"\n   ⏱️  Elapsed: {self._format_duration(elapsed)}", style="dim"
-        )
+        text.append(f"\n   ⏱️  Elapsed: {self._format_duration(elapsed)}", style="dim")
 
         return text
 
@@ -370,6 +368,7 @@ class MergeProgressTracker(ProgressTracker):
         self.similar_prs_found = 0
         self.prs_merged = 0
         self.prs_failed = 0
+        self.prs_skipped = 0
         self.prs_closed = 0
         self.is_close_operation = is_close_operation
         self._custom_label = operation_label
@@ -406,6 +405,19 @@ class MergeProgressTracker(ProgressTracker):
             self.completed_prs += 1
         self._refresh_display()
 
+    def merge_skipped(self) -> None:
+        """Record a PR skipped because it was merged externally.
+
+        Distinct from ``merge_failure`` because the operator does
+        not need to follow up: the PR is already merged, just not
+        by us.  Tracked separately so the final summary can show
+        a non-zero ⏭️ Skipped count alongside Merged / Failed.
+        """
+        self.prs_skipped += 1
+        if self.total_prs > 0:
+            self.completed_prs += 1
+        self._refresh_display()
+
     def increment_closed(self) -> None:
         """Record a successful close."""
         self.prs_closed += 1
@@ -436,9 +448,7 @@ class MergeProgressTracker(ProgressTracker):
         # Resolve label and icon — use custom values when provided,
         # otherwise fall back to the default close/merge text.
         default_label = (
-            "Closing PRs"
-            if self.is_close_operation
-            else "Searching for similar PRs"
+            "Closing PRs" if self.is_close_operation else "Searching for similar PRs"
         )
         label = self._custom_label or default_label
 
@@ -489,6 +499,8 @@ class MergeProgressTracker(ProgressTracker):
             stats_parts.append(f"🚪 Closed: {self.prs_closed}")
         if self.prs_failed > 0:
             stats_parts.append(f"❌ Failed: {self.prs_failed}")
+        if self.prs_skipped > 0:
+            stats_parts.append(f"⏭️  Skipped: {self.prs_skipped}")
 
         if stats_parts:
             text.append(f"\n   📊 {' | '.join(stats_parts)}", style="dim")
@@ -512,9 +524,7 @@ class MergeProgressTracker(ProgressTracker):
 
         # Elapsed time
         elapsed = datetime.now() - self.start_time
-        text.append(
-            f"\n   ⏱️  Elapsed: {self._format_duration(elapsed)}", style="dim"
-        )
+        text.append(f"\n   ⏱️  Elapsed: {self._format_duration(elapsed)}", style="dim")
 
         return text
 
@@ -526,6 +536,7 @@ class MergeProgressTracker(ProgressTracker):
                 "similar_prs_found": self.similar_prs_found,
                 "prs_merged": self.prs_merged,
                 "prs_failed": self.prs_failed,
+                "prs_skipped": self.prs_skipped,
                 "prs_closed": self.prs_closed,
                 "total_prs": self.total_prs,
                 "completed_prs": self.completed_prs,
@@ -562,6 +573,7 @@ class DummyProgressTracker(ProgressTracker):
         self.similar_prs_found = 0
         self.prs_merged = 0
         self.prs_failed = 0
+        self.prs_skipped = 0
         self.prs_closed = 0
         self.is_close_operation = False
         self._custom_label: str | None = None
@@ -612,6 +624,9 @@ class DummyProgressTracker(ProgressTracker):
         pass
 
     def merge_failure(self) -> None:
+        pass
+
+    def merge_skipped(self) -> None:
         pass
 
     def _refresh_display(self) -> None:

@@ -151,6 +151,27 @@ class GitHubClient:
                     repository_full_name=f"{owner}/{repo}",
                     html_url=pr.get("html_url") or "",
                     reviews=reviews,
+                    # Populate head/base repo identity so the
+                    # signature-preserving local-rebase path can
+                    # tell whether the PR is from a fork (and
+                    # which remote to push to).  Without these,
+                    # ``rebase.local_rebase_pr()`` fails closed
+                    # to avoid pushing to the wrong repository.
+                    head_repo_full_name=(
+                        ((pr.get("head") or {}).get("repo") or {}).get("full_name")
+                    ),
+                    head_repo_clone_url=(
+                        ((pr.get("head") or {}).get("repo") or {}).get("clone_url")
+                    ),
+                    base_repo_full_name=(
+                        ((pr.get("base") or {}).get("repo") or {}).get("full_name")
+                    ),
+                    base_repo_clone_url=(
+                        ((pr.get("base") or {}).get("repo") or {}).get("clone_url")
+                    ),
+                    is_fork=(
+                        ((pr.get("head") or {}).get("repo") or {}).get("fork")
+                    ),
                 )
 
         return asyncio.run(_run())  # type: ignore[no-any-return]

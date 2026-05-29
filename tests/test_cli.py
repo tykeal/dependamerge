@@ -4,6 +4,7 @@
 import hashlib
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
 from typer.testing import CliRunner
 
 from dependamerge.cli import _generate_override_sha, _validate_override_sha, app
@@ -12,6 +13,21 @@ from dependamerge.models import PullRequestInfo
 
 class TestCLI:
     runner: CliRunner = CliRunner()
+
+    @pytest.fixture(autouse=True)
+    def _mock_pre_flight_permission_check(self):
+        """Auto-mock the pre-flight token permission check.
+
+        The real check makes live GitHub API calls and aborts the
+        command with ``typer.Exit(3)`` when the configured token
+        lacks the required scopes.  Tests in this class use mock
+        ``GitHubClient`` / ``GitHubAsync`` instances and a dummy
+        token, so the live check would always fail and abort
+        before exercising the code under test.  Patch it out for
+        the duration of every test in the class.
+        """
+        with patch("dependamerge.cli._check_merge_permissions") as mock_check:
+            yield mock_check
 
     def setup_method(self):
         self.runner = CliRunner()
@@ -26,7 +42,10 @@ class TestCLI:
     @patch("dependamerge.cli.PRComparator")
     @patch("dependamerge.github_service.GitHubService")
     def test_merge_command_interactive_default(
-        self, mock_service_class, mock_comparator_class, mock_client_class
+        self,
+        mock_service_class,
+        mock_comparator_class,
+        mock_client_class,
     ):
         # Setup mocks
         mock_client = Mock()

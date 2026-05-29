@@ -41,6 +41,7 @@ from .git_ops import (
     commit_amend_no_edit,
     create_secure_tempdir,
     fetch,
+    fetch_branch,
     list_conflicted_files,
     push_force_with_lease,
     rebase,
@@ -426,12 +427,26 @@ class FixOrchestrator:
         # Ensure we have base branch available for rebase
         if ctx.head_repo_full_name != ctx.base_repo_full_name:
             add_remote("upstream", upstream_url, cwd=workspace, logger=self._log)
-            fetch(
+            # Use ``fetch_branch`` so ``upstream/<base_branch>``
+            # lands as a remote-tracking ref — the ``--single-branch``
+            # clone above restricts the origin's configured refspec
+            # to the PR head branch, so a bare
+            # ``git fetch upstream <base>`` would only populate
+            # ``FETCH_HEAD`` and the downstream
+            # ``git rebase upstream/<base>`` in
+            # :meth:`InteractiveResolver.resolve` would fail with
+            # ``fatal: invalid upstream 'upstream/<base>'``.
+            fetch_branch(
                 "upstream", ctx.base_branch, cwd=workspace, depth=50, logger=self._log
             )
         else:
-            # Same repo; fetch the base branch from origin if not present
-            fetch("origin", ctx.base_branch, cwd=workspace, depth=50, logger=self._log)
+            # Same repo; fetch the base branch from origin into the
+            # remote-tracking ref (see comment in the fork branch
+            # above for why ``fetch_branch`` is required rather than
+            # a bare ``fetch``).
+            fetch_branch(
+                "origin", ctx.base_branch, cwd=workspace, depth=50, logger=self._log
+            )
 
         # Ensure we are on the head branch explicitly (detached HEAD safety)
         checkout(ctx.head_branch, cwd=workspace, create=False, logger=self._log)
