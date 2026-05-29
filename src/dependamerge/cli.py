@@ -523,9 +523,7 @@ def _check_merge_permissions(ctx: _MergeContext) -> None:
         # (and re-introduce the ``⚠️ … (non-blocking)`` display
         # for the advisory subset) at that point.
         missing_perms = [
-            op
-            for op, result in perm_results.items()
-            if not result["has_permission"]
+            op for op, result in perm_results.items() if not result["has_permission"]
         ]
         if missing_perms:
             console.print("\n❌ Token Permission Check Failed:\n")
@@ -551,9 +549,7 @@ def _check_merge_permissions(ctx: _MergeContext) -> None:
                     guidance.get("fine_grained"),
                     guidance.get("fix"),
                 )
-                groups.setdefault(key, []).append(
-                    (op, result.get("error", ""))
-                )
+                groups.setdefault(key, []).append((op, result.get("error", "")))
 
             for key, items in groups.items():
                 classic, fine_grained, fix = key
@@ -706,12 +702,19 @@ def _scan_and_find_similar(ctx: _MergeContext) -> None:
         console.print(f"🔍 Found {similar_prs_found} similar PRs")
         if errors_count > 0:
             console.print(f"⚠️  {errors_count} errors encountered during analysis")
-        console.print()
+        # The trailing blank line delineates the similar-PR list that
+        # follows.  When no similar PRs were found there is no list to
+        # separate, so the blank line is suppressed (see below).
+        if ctx.all_similar_prs:
+            console.print()
     else:
         console.print(f"\n🔍 Found {len(ctx.all_similar_prs)} similar PRs")
 
     if not ctx.all_similar_prs:
-        console.print("❌ No similar PRs found in the organization")
+        # Not a failure: the supplied PR is simply the only one to
+        # merge.  Use a neutral "skip ahead" glyph rather than ❌ so
+        # the output does not read like an error.
+        console.print("⏩ No similar PRs found in the organization")
 
     for target_pr, comparison in ctx.all_similar_prs:
         console.print(f"  • {target_pr.repository_full_name} #{target_pr.number}")
@@ -723,6 +726,7 @@ def _run_parallel_merge(
     prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]],
     preview: bool,
     concurrency: int = 10,
+    leading_blank: bool = True,
 ) -> list[MergeResult]:
     """Execute a parallel merge (preview or real) and return results.
 
@@ -738,6 +742,11 @@ def _run_parallel_merge(
             lock, so a value > 1 is safe and lets the worker pool
             keep processing other PRs while one PR sits in Step 5.5's
             auto-merge wait loop — see ``_get_merge_dispatch_lock``.
+        leading_blank: When True (default), the ``🚀 Merging ...``
+            banner is preceded by a blank line to separate it from a
+            preceding similar-PR list.  Callers pass False when no
+            list was printed (e.g. no similar PRs were found) so the
+            output stays compact.
     """
 
     async def _do_merge():
@@ -758,7 +767,10 @@ def _run_parallel_merge(
             rebase_local=ctx.rebase_local,
         ) as merge_manager:
             if not preview:
-                console.print(f"\n🚀 Merging {len(prs_to_merge)} pull requests...")
+                prefix = "\n" if leading_blank else ""
+                console.print(
+                    f"{prefix}🚀 Merging {len(prs_to_merge)} pull requests..."
+                )
             return await merge_manager.merge_prs_parallel(prs_to_merge)
 
     return asyncio.run(_do_merge())
@@ -1016,14 +1028,15 @@ def _handle_repo_merge(
 
     console.print(f"\n📊 Found {len(repo_prs)} open PR(s) in {parsed_repo.project}")
     if automation_prs:
-        console.print(f"   🤖 Automation PRs: {len(automation_prs)}")
+        console.print(f"🤖 Automation PRs: {len(automation_prs)}")
     if human_prs:
-        console.print(f"   👤 Human PRs: {len(human_prs)}")
+        console.print(f"👤 Human PRs: {len(human_prs)}")
 
-    # List PRs that will be processed
+    # List PRs that will be processed. The trailing ``(by {author})``
+    # already reveals whether each PR is automation or human, so a
+    # per-row icon would only duplicate the summary counts above.
     for pr in repo_prs:
-        icon = "🤖" if _is_auto(pr.author) else "👤"
-        console.print(f"  {icon} #{pr.number} {pr.title} (by {pr.author})")
+        console.print(f"  #{pr.number} {pr.title} (by {pr.author})")
 
     # --- Human PR confirmation gate ---
     # Only prompt when human PRs are actually in scope, not merely
@@ -1798,7 +1811,12 @@ def merge(
             source_entry,
         ]
         merge_results = _run_parallel_merge(
-            ctx, all_prs_to_merge, preview=not ctx.no_confirm
+            ctx,
+            all_prs_to_merge,
+            preview=not ctx.no_confirm,
+            # No similar-PR list was printed when none were found, so
+            # skip the blank line before the merge banner.
+            leading_blank=bool(ctx.all_similar_prs),
         )
 
         # Process and display results
@@ -2112,7 +2130,10 @@ def close(
             console.print(f"\n🔍 Found {len(all_similar_prs)} similar PRs")
 
         if not all_similar_prs:
-            console.print("❌ No similar PRs found in the organization")
+            # Not a failure: the supplied PR is simply the only one to
+            # close.  Use a neutral glyph rather than ❌ so the output
+            # does not read like an error.
+            console.print("⏩ No similar PRs found in the organization")
 
         for target_pr, comparison in all_similar_prs:
             console.print(f"  • {target_pr.repository_full_name} #{target_pr.number}")
