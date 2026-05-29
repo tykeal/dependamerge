@@ -53,12 +53,13 @@ from .progress_tracker import MergeProgressTracker
 DEFAULT_MERGE_TIMEOUT: float = 300.0  # seconds (5 minutes)
 DEFAULT_MERGE_RECHECK_INTERVAL: float = 10.0  # seconds between polls
 
-# A DCO check normally completes within a few seconds.  When it has
+# Required verification checks (DCO, lint, build, etc.) normally
+# start reporting within a few seconds.  When a *required* check has
 # been pending for longer than this on a PR that itself was created
 # / last updated more than this many seconds ago, the check is
-# treated as stuck.  Used by ``_detect_stuck_dco`` to decide whether
-# to ask dependabot to recreate the PR.
-STUCK_DCO_THRESHOLD_SECONDS: float = 60.0
+# treated as stuck.  Used by ``_detect_stuck_required_check`` to
+# decide whether to ask dependabot to recreate the PR.
+STUCK_CHECK_THRESHOLD_SECONDS: float = 60.0
 
 
 class MergeStatus(Enum):
@@ -1686,15 +1687,20 @@ class AsyncMergeManager:
                     # Two recreate triggers are considered:
                     #   1. Branch-protection failures (the original
                     #      unsigned-commit case).
-                    #   2. A DCO check that has been stuck (queued /
-                    #      in_progress / pending) for longer than
-                    #      ``STUCK_DCO_THRESHOLD_SECONDS`` on a PR
+                    #   2. A *required* verification check that has
+                    #      been stuck (queued / in_progress / pending)
+                    #      for longer than
+                    #      ``STUCK_CHECK_THRESHOLD_SECONDS`` on a PR
                     #      that itself was created and last updated
-                    #      that long ago. DCO normally completes in
-                    #      seconds; when it does not, the only
-                    #      reliable recovery for dependabot PRs is
-                    #      to recreate the PR so the check fires
-                    #      again on a fresh head SHA.
+                    #      that long ago. Required checks (DCO, lint,
+                    #      build, etc.) normally start reporting in
+                    #      seconds; when one stalls indefinitely, the
+                    #      only reliable recovery for dependabot PRs
+                    #      is to recreate the PR so the checks fire
+                    #      again on a fresh head SHA. pre-commit.ci is
+                    #      excluded here — it has its own dedicated
+                    #      recovery via ``_trigger_stale_precommit_ci``
+                    #      (which posts ``pre-commit.ci run``).
                     recreated_pr = None
                     if pr_info.author == "dependabot[bot]" and not self.preview_mode:
                         should_recreate = "branch protection" in failure_reason.lower()
@@ -1704,10 +1710,11 @@ class AsyncMergeManager:
                                     is_stuck,
                                     stuck_check,
                                     stuck_age,
-                                ) = await self._detect_stuck_dco(pr_info)
+                                ) = await self._detect_stuck_required_check(pr_info)
                             except Exception as exc:
                                 self.log.debug(
-                                    "_detect_stuck_dco failed for %s#%s: %s",
+                                    "_detect_stuck_required_check failed for "
+                                    "%s#%s: %s",
                                     pr_info.repository_full_name,
                                     pr_info.number,
                                     exc,
@@ -1722,7 +1729,8 @@ class AsyncMergeManager:
                                 # not get silently swallowed by the
                                 # console parser.
                                 self._console.print(
-                                    f"⏳ Stuck DCO detected: {pr_info.html_url} "
+                                    f"⏳ Stuck required check detected: "
+                                    f"{pr_info.html_url} "
                                     f"[{stuck_check} pending for "
                                     f"{stuck_age:.0f}s, requesting recreate]",
                                     markup=False,
@@ -2601,23 +2609,40 @@ class AsyncMergeManager:
         )
         return False
 
-    async def _detect_stuck_dco(
+    async def _detect_stuck_required_check(
         self,
         pr_info: PullRequestInfo,
     ) -> tuple[bool, str | None, float]:
-        """Detect whether a DCO check on ``pr_info`` is stuck.
+        """Detect whether a *required* verification check is stuck.
 
-        The DCO check normally finishes within a handful of seconds.
-        When it has been queued / in-progress for longer than
-        :data:`STUCK_DCO_THRESHOLD_SECONDS` on a PR that itself was
+        Required checks (DCO, lint, build, license scans, etc.)
+        normally start reporting within a handful of seconds.  When
+        one has been queued / in-progress / pending for longer than
+        :data:`STUCK_CHECK_THRESHOLD_SECONDS` on a PR that itself was
         created and last updated more than that long ago, treat it
         as stuck so the caller can decide whether to ask dependabot
-        to recreate the PR.
+        to recreate the PR (the only reliable recovery for a
+        dependabot PR with no ``recreate``/``rebase`` macro of its
+        own once a required check has stalled indefinitely).
+
+        Only checks that are *required* on the PR's base branch are
+        considered, since a non-required check cannot block the
+        merge.  DCO-shaped checks are additionally always treated as
+        eligible as a safety net: the GitHub DCO App check is the
+        canonical stuck-check case and is effectively always blocking
+        where it is enabled, even when the required-checks lookup
+        cannot enumerate it.
+
+        ``pre-commit.ci`` checks are explicitly excluded here even
+        when required — they have their own dedicated recovery via
+        :meth:`_trigger_stale_precommit_ci`, which posts the
+        ``pre-commit.ci run`` comment (dependabot's ``recreate`` macro
+        does not retrigger pre-commit.ci).
 
         The age floor on PR ``created_at`` / ``updated_at`` avoids
         false positives on PRs that were touched seconds before we
-        observed them — in those cases the DCO check is simply
-        running normally and should be allowed to finish.
+        observed them — in those cases the check is simply running
+        normally and should be allowed to finish.
 
         Args:
             pr_info: The pull request being evaluated.
@@ -2633,7 +2658,7 @@ class AsyncMergeManager:
             return False, None, 0.0
 
         repo_owner, repo_name = pr_info.repository_full_name.split("/", 1)
-        threshold = STUCK_DCO_THRESHOLD_SECONDS
+        threshold = STUCK_CHECK_THRESHOLD_SECONDS
 
         from datetime import datetime, timezone
 
@@ -2661,9 +2686,21 @@ class AsyncMergeManager:
                 return True
             return "signoff" in n or "sign-off" in n or "signed-off" in n
 
+        def _is_precommit_name(name: str) -> bool:
+            """Return True when ``name`` is a pre-commit.ci check.
+
+            pre-commit.ci reports as ``pre-commit.ci - pr`` (and the
+            ``- ci`` variant).  It is excluded from this detector
+            because dependabot's ``recreate`` macro does not
+            retrigger it; ``_trigger_stale_precommit_ci`` handles it
+            via the ``pre-commit.ci run`` comment instead.
+            """
+            n = (name or "").strip().lower()
+            return "pre-commit.ci" in n or "pre-commit-ci" in n
+
         # 1. PR-level age floor — don't fire on PRs we caught right
-        #    after they were opened or force-pushed; the DCO check
-        #    on those is simply running normally.
+        #    after they were opened or force-pushed; checks on those
+        #    are simply running normally.
         now = datetime.now(timezone.utc)
         try:
             pr_data = await self._github_client.get(
@@ -2671,7 +2708,7 @@ class AsyncMergeManager:
             )
         except Exception as exc:
             self.log.debug(
-                "_detect_stuck_dco: pr fetch failed for %s#%s: %s",
+                "_detect_stuck_required_check: pr fetch failed for %s#%s: %s",
                 pr_info.repository_full_name,
                 pr_info.number,
                 exc,
@@ -2693,7 +2730,45 @@ class AsyncMergeManager:
         if pr_age < threshold or pr_idle < threshold:
             return False, None, 0.0
 
-        # 2. Examine check-runs and status contexts on the head SHA.
+        # 2. Determine which checks are *required* on the base branch
+        #    so a non-blocking check is never treated as stuck.  On
+        #    any failure we fall back to an empty set, leaving the
+        #    DCO safety net (below) as the only eligible matcher.
+        required_contexts: set[str] = set()
+        try:
+            required = await self._github_client.get_required_status_checks(
+                repo_owner, repo_name, pr_info.base_branch or "main"
+            )
+            if isinstance(required, list):
+                required_contexts = {
+                    str(c.get("context", "")).strip().lower()
+                    for c in required
+                    if isinstance(c, dict) and c.get("context")
+                }
+        except Exception as exc:
+            self.log.debug(
+                "_detect_stuck_required_check: required-checks fetch failed "
+                "for %s#%s: %s",
+                pr_info.repository_full_name,
+                pr_info.number,
+                exc,
+            )
+            required_contexts = set()
+
+        def _is_eligible(name: str) -> bool:
+            """Return True when a stuck ``name`` should drive recreate.
+
+            Eligible when the check is required on the base branch or
+            is a DCO-shaped check (safety net), and is *not* a
+            pre-commit.ci check (handled separately).
+            """
+            if _is_precommit_name(name):
+                return False
+            return (name or "").strip().lower() in required_contexts or _is_dco_name(
+                name
+            )
+
+        # 3. Examine check-runs and status contexts on the head SHA.
         candidate_name: str | None = None
         candidate_age: float = 0.0
 
@@ -2703,7 +2778,8 @@ class AsyncMergeManager:
             )
         except Exception as exc:
             self.log.debug(
-                "_detect_stuck_dco: check-runs fetch failed for %s#%s: %s",
+                "_detect_stuck_required_check: check-runs fetch failed for "
+                "%s#%s: %s",
                 pr_info.repository_full_name,
                 pr_info.number,
                 exc,
@@ -2715,7 +2791,7 @@ class AsyncMergeManager:
                 if not isinstance(run, dict):
                     continue
                 name = run.get("name", "")
-                if not _is_dco_name(name):
+                if not _is_eligible(name):
                     continue
                 status = run.get("status")
                 if status not in ("queued", "in_progress"):
@@ -2736,7 +2812,7 @@ class AsyncMergeManager:
             )
         except Exception as exc:
             self.log.debug(
-                "_detect_stuck_dco: status fetch failed for %s#%s: %s",
+                "_detect_stuck_required_check: status fetch failed for " "%s#%s: %s",
                 pr_info.repository_full_name,
                 pr_info.number,
                 exc,
@@ -2748,7 +2824,7 @@ class AsyncMergeManager:
                 if not isinstance(s, dict):
                     continue
                 ctx = s.get("context", "")
-                if not _is_dco_name(ctx):
+                if not _is_eligible(ctx):
                     continue
                 if s.get("state") != "pending":
                     continue

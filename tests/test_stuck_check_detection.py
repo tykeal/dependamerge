@@ -2,13 +2,17 @@
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 """
-Unit tests for ``AsyncMergeManager._detect_stuck_dco``.
+Unit tests for ``AsyncMergeManager._detect_stuck_required_check``.
 
 Covers:
 - DCO check stuck longer than the threshold on a sufficiently old
   PR -> detected (returns ``(True, name, age)``).
 - Sub-threshold stuck DCO check -> not detected.
-- Stuck pending check whose name is not DCO-shaped -> not detected.
+- Stuck pending check whose name is not DCO-shaped and not required
+  -> not detected.
+- A stuck *required* non-DCO check (e.g. ``build``) -> detected.
+- A stuck *required* pre-commit.ci check -> not detected (it has its
+  own recovery via ``_trigger_stale_precommit_ci``).
 - DCO check stuck but PR was just touched (updated_at younger than
   threshold) -> not detected (age floor protects against false
   positives on freshly-pushed PRs).
@@ -16,7 +20,7 @@ Covers:
 - Stuck status-context (older API) DCO entry -> detected.
 - API failures degrade to ``(False, None, 0.0)``.
 - ``_merge_single_pr`` triggers ``_trigger_dependabot_recreate`` when
-  ``_detect_stuck_dco`` returns True for a dependabot PR.
+  ``_detect_stuck_required_check`` returns True for a dependabot PR.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -25,7 +29,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from dependamerge.merge_manager import STUCK_DCO_THRESHOLD_SECONDS
+from dependamerge.merge_manager import STUCK_CHECK_THRESHOLD_SECONDS
 from dependamerge.models import PullRequestInfo
 
 
@@ -77,7 +81,7 @@ def _build_get_responder(
     """Return an ``AsyncMock``-compatible side effect dispatcher.
 
     Routes ``GET`` requests to the right canned response based on the
-    URL path — this mirrors how ``_detect_stuck_dco`` actually calls
+    URL path — this mirrors how ``_detect_stuck_required_check`` actually calls
     the client.
     """
 
@@ -93,7 +97,7 @@ def _build_get_responder(
 
 
 # ---------------------------------------------------------------------------
-# _detect_stuck_dco — positive and negative cases
+# _detect_stuck_required_check — positive and negative cases
 # ---------------------------------------------------------------------------
 
 
@@ -106,7 +110,7 @@ class TestDetectStuckDcoCheckRuns:
         on an old-enough PR is detected."""
         mgr, client = _make_manager()
         now = datetime.now(timezone.utc)
-        old = now - timedelta(seconds=STUCK_DCO_THRESHOLD_SECONDS + 30)
+        old = now - timedelta(seconds=STUCK_CHECK_THRESHOLD_SECONDS + 30)
         pr = _make_pr_info()
 
         client.get = AsyncMock(
@@ -129,10 +133,10 @@ class TestDetectStuckDcoCheckRuns:
             )
         )
 
-        is_stuck, name, age = await mgr._detect_stuck_dco(pr)
+        is_stuck, name, age = await mgr._detect_stuck_required_check(pr)
         assert is_stuck is True
         assert name == "DCO"
-        assert age >= STUCK_DCO_THRESHOLD_SECONDS
+        assert age >= STUCK_CHECK_THRESHOLD_SECONDS
 
     @pytest.mark.asyncio
     async def test_sub_threshold_age_is_not_stuck(self) -> None:
@@ -140,7 +144,7 @@ class TestDetectStuckDcoCheckRuns:
         mgr, client = _make_manager()
         now = datetime.now(timezone.utc)
         # PR is old enough; the check itself is too young.
-        pr_age = now - timedelta(seconds=STUCK_DCO_THRESHOLD_SECONDS + 30)
+        pr_age = now - timedelta(seconds=STUCK_CHECK_THRESHOLD_SECONDS + 30)
         check_started = now - timedelta(seconds=10)
         pr = _make_pr_info()
 
@@ -165,7 +169,7 @@ class TestDetectStuckDcoCheckRuns:
 
         # The PR-level idle floor (updated_at) catches this case
         # before we even look at check timing.
-        is_stuck, name, age = await mgr._detect_stuck_dco(pr)
+        is_stuck, name, age = await mgr._detect_stuck_required_check(pr)
         assert is_stuck is False
         assert name is None
         assert age == 0.0
@@ -175,7 +179,7 @@ class TestDetectStuckDcoCheckRuns:
         """A completed DCO check (success or failure) is not stuck."""
         mgr, client = _make_manager()
         now = datetime.now(timezone.utc)
-        old = now - timedelta(seconds=STUCK_DCO_THRESHOLD_SECONDS + 30)
+        old = now - timedelta(seconds=STUCK_CHECK_THRESHOLD_SECONDS + 30)
         pr = _make_pr_info()
 
         client.get = AsyncMock(
@@ -198,16 +202,17 @@ class TestDetectStuckDcoCheckRuns:
             )
         )
 
-        is_stuck, name, age = await mgr._detect_stuck_dco(pr)
+        is_stuck, name, age = await mgr._detect_stuck_required_check(pr)
         assert is_stuck is False
         assert name is None
 
     @pytest.mark.asyncio
-    async def test_stuck_non_dco_check_is_ignored(self) -> None:
-        """A stuck check whose name is not DCO-shaped is not detected."""
+    async def test_stuck_non_dco_non_required_check_is_ignored(self) -> None:
+        """A stuck check that is neither DCO-shaped nor required on
+        the base branch is not detected."""
         mgr, client = _make_manager()
         now = datetime.now(timezone.utc)
-        old = now - timedelta(seconds=STUCK_DCO_THRESHOLD_SECONDS + 30)
+        old = now - timedelta(seconds=STUCK_CHECK_THRESHOLD_SECONDS + 30)
         pr = _make_pr_info()
 
         client.get = AsyncMock(
@@ -229,7 +234,89 @@ class TestDetectStuckDcoCheckRuns:
             )
         )
 
-        is_stuck, name, age = await mgr._detect_stuck_dco(pr)
+        is_stuck, name, age = await mgr._detect_stuck_required_check(pr)
+        assert is_stuck is False
+        assert name is None
+
+    @pytest.mark.asyncio
+    async def test_detects_stuck_required_non_dco_check(self) -> None:
+        """A stuck *required* non-DCO check (e.g. ``build``) is detected.
+
+        Generalises the original DCO-only behaviour: any required
+        verification check that stalls indefinitely should drive the
+        dependabot recreate recovery.
+        """
+        mgr, client = _make_manager()
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(seconds=STUCK_CHECK_THRESHOLD_SECONDS + 30)
+        pr = _make_pr_info()
+
+        # ``build`` is required on the base branch.
+        client.get_required_status_checks = AsyncMock(
+            return_value=[{"context": "build"}]
+        )
+        client.get = AsyncMock(
+            side_effect=_build_get_responder(
+                pr_response={
+                    "created_at": _iso(old),
+                    "updated_at": _iso(old),
+                },
+                check_runs_response={
+                    "check_runs": [
+                        {
+                            "name": "build",
+                            "status": "in_progress",
+                            "started_at": _iso(old),
+                        }
+                    ],
+                },
+                status_response={"statuses": []},
+            )
+        )
+
+        is_stuck, name, age = await mgr._detect_stuck_required_check(pr)
+        assert is_stuck is True
+        assert name == "build"
+        assert age >= STUCK_CHECK_THRESHOLD_SECONDS
+
+    @pytest.mark.asyncio
+    async def test_stuck_required_precommit_ci_is_ignored(self) -> None:
+        """A stuck *required* pre-commit.ci check is not detected here.
+
+        pre-commit.ci has its own recovery path
+        (``_trigger_stale_precommit_ci`` posts ``pre-commit.ci run``);
+        dependabot's ``recreate`` macro does not retrigger it, so it
+        must be excluded from the recreate-driving detector even when
+        it is a required, stuck check.
+        """
+        mgr, client = _make_manager()
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(seconds=STUCK_CHECK_THRESHOLD_SECONDS + 30)
+        pr = _make_pr_info()
+
+        client.get_required_status_checks = AsyncMock(
+            return_value=[{"context": "pre-commit.ci - pr"}]
+        )
+        client.get = AsyncMock(
+            side_effect=_build_get_responder(
+                pr_response={
+                    "created_at": _iso(old),
+                    "updated_at": _iso(old),
+                },
+                check_runs_response={
+                    "check_runs": [
+                        {
+                            "name": "pre-commit.ci - pr",
+                            "status": "in_progress",
+                            "started_at": _iso(old),
+                        }
+                    ],
+                },
+                status_response={"statuses": []},
+            )
+        )
+
+        is_stuck, name, _age = await mgr._detect_stuck_required_check(pr)
         assert is_stuck is False
         assert name is None
 
@@ -260,7 +347,7 @@ class TestDetectStuckDcoCheckRuns:
             )
         )
 
-        is_stuck, name, age = await mgr._detect_stuck_dco(pr)
+        is_stuck, name, age = await mgr._detect_stuck_required_check(pr)
         assert is_stuck is False
         assert name is None
 
@@ -269,7 +356,7 @@ class TestDetectStuckDcoCheckRuns:
         """The ``dco/dco`` status-context naming is matched."""
         mgr, client = _make_manager()
         now = datetime.now(timezone.utc)
-        old = now - timedelta(seconds=STUCK_DCO_THRESHOLD_SECONDS + 30)
+        old = now - timedelta(seconds=STUCK_CHECK_THRESHOLD_SECONDS + 30)
         pr = _make_pr_info()
 
         client.get = AsyncMock(
@@ -291,7 +378,7 @@ class TestDetectStuckDcoCheckRuns:
             )
         )
 
-        is_stuck, name, _age = await mgr._detect_stuck_dco(pr)
+        is_stuck, name, _age = await mgr._detect_stuck_required_check(pr)
         assert is_stuck is True
         assert name == "dco/dco"
 
@@ -303,7 +390,7 @@ class TestDetectStuckDcoStatusContexts:
     async def test_detects_stuck_dco_status_context(self) -> None:
         mgr, client = _make_manager()
         now = datetime.now(timezone.utc)
-        old = now - timedelta(seconds=STUCK_DCO_THRESHOLD_SECONDS + 30)
+        old = now - timedelta(seconds=STUCK_CHECK_THRESHOLD_SECONDS + 30)
         pr = _make_pr_info()
 
         client.get = AsyncMock(
@@ -325,10 +412,10 @@ class TestDetectStuckDcoStatusContexts:
             )
         )
 
-        is_stuck, name, age = await mgr._detect_stuck_dco(pr)
+        is_stuck, name, age = await mgr._detect_stuck_required_check(pr)
         assert is_stuck is True
         assert name == "DCO"
-        assert age >= STUCK_DCO_THRESHOLD_SECONDS
+        assert age >= STUCK_CHECK_THRESHOLD_SECONDS
 
 
 class TestDetectStuckDcoRobustness:
@@ -340,7 +427,7 @@ class TestDetectStuckDcoRobustness:
         client.get = AsyncMock(side_effect=RuntimeError("boom"))
         pr = _make_pr_info()
 
-        is_stuck, name, age = await mgr._detect_stuck_dco(pr)
+        is_stuck, name, age = await mgr._detect_stuck_required_check(pr)
         assert is_stuck is False
         assert name is None
         assert age == 0.0
@@ -361,7 +448,7 @@ class TestDetectStuckDcoRobustness:
             )
         )
 
-        is_stuck, name, age = await mgr._detect_stuck_dco(pr)
+        is_stuck, name, age = await mgr._detect_stuck_required_check(pr)
         assert is_stuck is False
         assert name is None
         assert age == 0.0
@@ -373,7 +460,7 @@ class TestDetectStuckDcoRobustness:
         mgr._github_client = None
         pr = _make_pr_info()
 
-        is_stuck, name, age = await mgr._detect_stuck_dco(pr)
+        is_stuck, name, age = await mgr._detect_stuck_required_check(pr)
         assert is_stuck is False
         assert name is None
         assert age == 0.0
