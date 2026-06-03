@@ -5,6 +5,17 @@ SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 # Dependamerge
 
+<!-- markdownlint-disable MD013 -->
+
+[![Source Code](https://img.shields.io/badge/Source_Code-GitHub?logo=github&logoColor=white&color=blue)](https://github.com/lfreleng-actions/dependamerge)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/lfreleng-actions/dependamerge/badge)](https://scorecard.dev/viewer/?uri=github.com/lfreleng-actions/dependamerge)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![PyPI](https://img.shields.io/pypi/v/dependamerge.svg?label=PyPI)](https://pypi.org/project/dependamerge/)
+[![TestPyPI](https://img.shields.io/pypi/v/dependamerge.svg?label=TestPyPI&pypiBaseUrl=https://test.pypi.org)](https://test.pypi.org/project/dependamerge/)
+[![CodeQL](https://github.com/lfreleng-actions/dependamerge/actions/workflows/codeql.yml/badge.svg)](https://github.com/lfreleng-actions/dependamerge/actions/workflows/codeql.yml)
+
+<!-- markdownlint-enable MD013 -->
+
 Command-line tool for the management of pull requests in a GitHub organization
 and changes on Gerrit Code Review servers.
 
