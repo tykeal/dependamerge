@@ -91,9 +91,10 @@ jobs:
       # unreachable from workflows triggered by PRs raised from
       # forks, which previously forced a fallback to audit mode).
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@18993b53be1b9327579eb1a2ba318d8a22c39f72  # v0.1.0
+      - uses: lfreleng-actions/harden-runner-block-action@42663a22f7abe31521cbc6120901353a4b2849bc  # v0.2.0
         with:
-          org: 'lfreleng-actions'
+          # yamllint disable-line rule:line-length
+          config: 'lfreleng-actions//.github/harden-runner/lfreleng-actions/allow_list.txt@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
 
       # Harden the runner with the just-loaded allow-list.
       - name: 'Harden runner (block)'
