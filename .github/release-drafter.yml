@@ -102,9 +102,9 @@ version-resolver:
   default: patch
 # yamllint disable rule:line-length
 template: |
-  [![Downloads for this release](https://img.shields.io/github/downloads/lfit/dependamerge/v$RESOLVED_VERSION/total.svg)](https://github.com/lfit/dependamerge/releases/v$RESOLVED_VERSION)
+  [![Downloads for this release](https://img.shields.io/github/downloads/lfreleng-actions/dependamerge/v$RESOLVED_VERSION/total.svg)](https://github.com/lfreleng-actions/dependamerge/releases/v$RESOLVED_VERSION)
 
   $CHANGES
 
   ## Links
-  - [Submit bugs/feature requests](https://github.com/lfit/dependamerge/issues)
+  - [Submit bugs/feature requests](https://github.com/lfreleng-actions/dependamerge/issues)
