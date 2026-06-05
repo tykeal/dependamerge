@@ -727,6 +727,7 @@ def _run_parallel_merge(
     preview: bool,
     concurrency: int = 10,
     leading_blank: bool = True,
+    repo_scoped: bool = False,
 ) -> list[MergeResult]:
     """Execute a parallel merge (preview or real) and return results.
 
@@ -747,6 +748,11 @@ def _run_parallel_merge(
             preceding similar-PR list.  Callers pass False when no
             list was printed (e.g. no similar PRs were found) so the
             output stays compact.
+        repo_scoped: When True, all PRs target a single repository, so
+            each worker refreshes its PR's live merge state just before
+            dispatching the merge (a sibling merge can make a PR
+            ``dirty`` / ``behind`` mid-batch).  Left False for org-wide
+            runs.  See ``AsyncMergeManager._refresh_pr_mergeability``.
     """
 
     async def _do_merge():
@@ -765,6 +771,7 @@ def _run_parallel_merge(
             no_netrc=ctx.no_netrc,
             netrc_file=ctx.netrc_file,
             rebase_local=ctx.rebase_local,
+            repo_scoped=repo_scoped,
         ) as merge_manager:
             if not preview:
                 prefix = "\n" if leading_blank else ""
@@ -1100,6 +1107,10 @@ def _handle_repo_merge(
             # PRs in the batch.  Cap by PR count so we don't spawn
             # more workers than there is work.
             concurrency=min(5, len(all_prs_to_merge)) or 1,
+            # All PRs target the same repo, so a sibling merge can make
+            # a queued PR ``dirty`` / ``behind`` mid-batch; refresh
+            # live state before each merge dispatch.
+            repo_scoped=True,
         )
     finally:
         if ctx.show_progress and ctx.progress_tracker:
@@ -1199,6 +1210,9 @@ def _execute_repo_confirmed_merge(
             # Per-repo merge dispatch lock makes parallel workers
             # safe; cap by PR count.
             concurrency=min(5, len(mergeable_prs)) or 1,
+            # Single-repo batch — refresh live merge state before each
+            # dispatch (a sibling merge can introduce a conflict).
+            repo_scoped=True,
         )
     finally:
         if ctx.show_progress and ctx.progress_tracker:

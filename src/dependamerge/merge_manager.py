@@ -53,6 +53,16 @@ from .progress_tracker import MergeProgressTracker
 DEFAULT_MERGE_TIMEOUT: float = 300.0  # seconds (5 minutes)
 DEFAULT_MERGE_RECHECK_INTERVAL: float = 10.0  # seconds between polls
 
+# After a sibling PR merges (or a concurrent dependamerge run lands a
+# change), GitHub recomputes a PR's mergeability asynchronously and
+# briefly reports ``mergeable=null`` / ``mergeable_state="unknown"`` —
+# typically for a few seconds.  Before dispatching a merge in a
+# repo-scoped batch we re-read the PR and, when GitHub is still
+# computing, poll up to this many seconds for a concrete value so the
+# merge decision is made against fresh state rather than the
+# (possibly stale) fetch-time snapshot.
+MERGEABILITY_REFRESH_TIMEOUT_SECONDS: float = 10.0
+
 # Required verification checks (DCO, lint, build, etc.) normally
 # start reporting within a few seconds.  When a *required* check has
 # been pending for longer than this on a PR that itself was created
@@ -114,6 +124,7 @@ class AsyncMergeManager:
         no_netrc: bool = False,
         netrc_file: Path | None = None,
         rebase_local: bool = True,
+        repo_scoped: bool = False,
     ):
         self.token = token
         self.default_merge_method = merge_method
@@ -137,6 +148,15 @@ class AsyncMergeManager:
         # the legacy REST-only path (simpler but loses signature
         # verification on signed branches).
         self.rebase_local = rebase_local
+        # When True, the batch targets a single repository, so a merge
+        # by one worker can make a sibling PR ``dirty`` / ``behind``
+        # between the up-front fetch and this worker's dispatch.  In
+        # that mode we refresh each PR's live merge state immediately
+        # before dispatching the merge (see
+        # ``_refresh_pr_mergeability``).  Left False for org-wide runs,
+        # where PRs target different repositories and the snapshot is
+        # not invalidated by our own merges.
+        self._repo_scoped = repo_scoped
         self.log = logging.getLogger(__name__)
 
         # Centralised merge-operation timing
@@ -1606,9 +1626,30 @@ class AsyncMergeManager:
                         repo_owner, repo_name
                     )
                     async with dispatch_lock:
-                        merged = await self._merge_pr_with_retry(
-                            pr_info, repo_owner, repo_name
-                        )
+                        # In a repo-scoped batch, an earlier merge in
+                        # this repo (or a concurrent dependamerge run)
+                        # may have made this PR ``dirty`` / ``behind``
+                        # since it was fetched.  Refresh the live state
+                        # now that we hold the dispatch lock — this is
+                        # the only point that is both serialised and
+                        # ordered after any sibling merge.  See
+                        # ``_refresh_pr_mergeability``.
+                        if self._repo_scoped:
+                            await self._refresh_pr_mergeability(
+                                pr_info, repo_owner, repo_name
+                            )
+                        if pr_info.mergeable_state == "dirty":
+                            # A real merge conflict the merge API
+                            # cannot resolve.  Skip the doomed attempt
+                            # so the failure path reports the accurate
+                            # cause ("merge conflicts") instead of
+                            # "Failed to merge after all retry
+                            # attempts".
+                            merged = False
+                        else:
+                            merged = await self._merge_pr_with_retry(
+                                pr_info, repo_owner, repo_name
+                            )
 
                 if merged is None:
                     # Auto-merge is active — PR will merge asynchronously.
@@ -3614,6 +3655,117 @@ class AsyncMergeManager:
         if not isinstance(pr_data, dict):
             return False
         return pr_data.get("state") == "closed" and bool(pr_data.get("merged"))
+
+    async def _refresh_pr_mergeability(
+        self, pr_info: PullRequestInfo, owner: str, repo: str
+    ) -> None:
+        """Refresh ``pr_info`` with the PR's current live merge state.
+
+        The batch of PRs is fetched once up front, so a worker may act
+        on a snapshot taken seconds-to-minutes earlier.  In a
+        repo-scoped run this is routinely wrong: merging one PR can
+        immediately make a sibling PR ``dirty`` (the classic
+        ``uv.lock`` / workflow-pin conflict) or ``behind``.  A
+        concurrent ``dependamerge`` run elsewhere in the org can do the
+        same.  We therefore re-read the PR's state immediately before
+        dispatching the merge, rather than trusting the fetch-time
+        snapshot.
+
+        GitHub recomputes ``mergeable`` / ``mergeable_state``
+        asynchronously after the base branch moves, reporting
+        ``mergeable=None`` and ``mergeable_state="unknown"`` (or an
+        empty string) in the gap — usually for a few seconds.  When we
+        catch the PR in that window we poll up to
+        :data:`MERGEABILITY_REFRESH_TIMEOUT_SECONDS` for a concrete
+        value so the merge decision is made against real data.
+
+        Mutates ``pr_info`` in place (``state``, ``mergeable``,
+        ``mergeable_state``, ``head_sha``).  Best-effort: any API error
+        leaves the existing snapshot untouched so the caller's
+        downstream logic still runs.
+        """
+        if not self._github_client:
+            return
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + MERGEABILITY_REFRESH_TIMEOUT_SECONDS
+        # Poll cadence for the "still computing" window.  Kept short
+        # (GitHub usually settles in ~5s) but never longer than the
+        # configured recheck interval.
+        poll_interval = min(2.0, self._merge_recheck_interval)
+
+        while True:
+            try:
+                data = await self._github_client.get(
+                    f"/repos/{owner}/{repo}/pulls/{pr_info.number}"
+                )
+            except Exception as exc:
+                self.log.debug(
+                    "Mergeability refresh failed for %s/%s#%s: %s",
+                    owner,
+                    repo,
+                    pr_info.number,
+                    exc,
+                )
+                return
+
+            if not isinstance(data, dict):
+                return
+
+            state = data.get("state")
+            if isinstance(state, str) and state:
+                pr_info.state = state
+            head_sha = (data.get("head") or {}).get("sha")
+            if head_sha:
+                pr_info.head_sha = head_sha
+
+            mergeable = data.get("mergeable")
+            mergeable_state = data.get("mergeable_state")
+
+            # A closed PR will never resolve to a concrete mergeable
+            # value; record what we have and let the caller's
+            # closed-PR handling take over.
+            if state == "closed":
+                pr_info.mergeable = mergeable
+                pr_info.mergeable_state = mergeable_state
+                return
+
+            # GitHub signals "still computing" with a null ``mergeable``
+            # and an ``unknown``/empty ``mergeable_state``.  Keep
+            # polling until it settles or the deadline passes.
+            still_computing = mergeable is None or mergeable_state in (
+                None,
+                "",
+                "unknown",
+            )
+            if not still_computing:
+                pr_info.mergeable = mergeable
+                pr_info.mergeable_state = mergeable_state
+                return
+
+            now = loop.time()
+            if now >= deadline:
+                # Timed out waiting for GitHub to settle.  Record the
+                # latest values we did get (even if still computing) so
+                # downstream logic sees GitHub's current best answer
+                # rather than the older snapshot.
+                if mergeable is not None:
+                    pr_info.mergeable = mergeable
+                if mergeable_state not in (None, ""):
+                    pr_info.mergeable_state = mergeable_state
+                self.log.debug(
+                    "Mergeability for %s/%s#%s still computing after %.0fs; "
+                    "proceeding with mergeable=%s state=%s",
+                    owner,
+                    repo,
+                    pr_info.number,
+                    MERGEABILITY_REFRESH_TIMEOUT_SECONDS,
+                    pr_info.mergeable,
+                    pr_info.mergeable_state,
+                )
+                return
+
+            await asyncio.sleep(min(poll_interval, deadline - now))
 
     def _get_failure_summary(self, pr_info: PullRequestInfo) -> str:
         """
