@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from typer.testing import CliRunner
 
-from dependamerge.cli import _generate_override_sha, _validate_override_sha, app
+from dependamerge.cli import (
+    _format_failure_reason,
+    _generate_override_sha,
+    _validate_override_sha,
+    app,
+)
 from dependamerge.models import PullRequestInfo
 
 
@@ -736,3 +741,39 @@ class TestCLI:
         assert result.exit_code == 0
         assert "not from a recognized automation tool" in result.stdout
         assert "--override" in result.stdout
+
+
+class TestFormatFailureReason:
+    """Tests for the failed-PR summary reason formatter."""
+
+    def test_plain_reason_is_unchanged(self):
+        assert _format_failure_reason("merge conflicts") == ["merge conflicts"]
+
+    def test_ruleset_not_satisfied_is_expanded(self):
+        reason = (
+            "Repository rule violations found Required workflows "
+            "'Autolabeler, Semantic Pull Request 🛠️, "
+            "Audit GitHub Actions 📌' are not satisfied"
+        )
+        assert _format_failure_reason(reason) == [
+            "Repository rule violations found",
+            "Required workflows not satisfied:",
+            "• Autolabeler",
+            "• Semantic Pull Request 🛠️",
+            "• Audit GitHub Actions 📌",
+        ]
+
+    def test_ruleset_failed_variant_uses_failed_header(self):
+        reason = (
+            "Repository rule violations found Required workflows 'Autolabeler' failed"
+        )
+        assert _format_failure_reason(reason) == [
+            "Repository rule violations found",
+            "Required workflows failed:",
+            "• Autolabeler",
+        ]
+
+    def test_non_ruleset_message_left_alone(self):
+        # Without the ruleset prefix, leave the reason unchanged.
+        reason = "Required workflows 'X' are not satisfied"
+        assert _format_failure_reason(reason) == [reason]

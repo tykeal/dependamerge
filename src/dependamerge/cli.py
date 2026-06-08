@@ -873,6 +873,33 @@ def _execute_confirmed_merge(
     _print_failed_pr_details(real_results)
 
 
+def _format_failure_reason(reason: str) -> list[str]:
+    """Expand a failure reason into display lines.
+
+    A repository-ruleset "required workflows" violation is rendered as
+    a header plus a bulleted list of the offending workflows (the raw
+    GitHub message crams them into one long quoted, comma-separated
+    string).  Every other reason is returned unchanged as a single
+    line.
+    """
+    marker = "Required workflows "
+    if "Repository rule violations found" in reason and marker in reason:
+        after_marker = reason.split(marker, 1)[1]
+        if "'" in after_marker:
+            # ``'A, B, C' are not satisfied`` -> names, then verb.
+            _, _, after_first = after_marker.partition("'")
+            quoted, _, rest = after_first.partition("'")
+            workflows = [w.strip() for w in quoted.split(",") if w.strip()]
+            verb = "failed:" if "fail" in rest.lower() else "not satisfied:"
+            if workflows:
+                return [
+                    "Repository rule violations found",
+                    f"Required workflows {verb}",
+                    *(f"• {name}" for name in workflows),
+                ]
+    return [reason]
+
+
 def _print_failed_pr_details(
     merge_results: list[MergeResult],
 ) -> None:
@@ -890,7 +917,11 @@ def _print_failed_pr_details(
     for r in failed:
         url = getattr(r.pr_info, "html_url", "<unknown>")
         reason = r.error or "no reason reported"
-        console.print(f"   • {url}\n     {reason}")
+        body = "\n".join(
+            f"     {line}" for line in _format_failure_reason(reason)
+        )
+        # markup=False so bracketed reasons are not eaten by Rich.
+        console.print(f"   • {url}\n{body}", markup=False)
 
 
 def _display_merge_results(

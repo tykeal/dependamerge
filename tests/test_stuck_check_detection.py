@@ -558,9 +558,11 @@ class TestReportMergeFailure:
         # The result error now surfaces the real reason so the
         # end-of-run summary is informative (was a generic message).
         assert out.error == "branch protection rules prevent merge"
+        # The inline line is now terse (URL only); the reason is
+        # reserved for the end-of-run summary to avoid duplication.
         printed = _printed(mock_console)
         assert "❌ Failed" in printed
-        assert "branch protection" in printed
+        assert "branch protection" not in printed
 
     @pytest.mark.asyncio
     async def test_dependabot_skips_stuck_detection(self) -> None:

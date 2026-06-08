@@ -4199,14 +4199,12 @@ class AsyncMergeManager:
             result.error = failure_reason or "Failed to merge after all retry attempts"
         if self.progress_tracker:
             self.progress_tracker.merge_failure()
-        # The ``⚠️ Stuck check`` line above is the cause for stuck PRs;
-        # only emit the generic failure line otherwise.  ``markup=False``
-        # keeps Rich from swallowing the bracketed reason.
+        # Keep the live line terse: the full (often long) reason is
+        # shown in the end-of-run summary via ``result.error``, so
+        # repeating it inline only duplicates it.  The ``⚠️ Stuck
+        # check`` line above already carries the cause for stuck PRs.
         if not stuck_reported:
-            self._console.print(
-                f"❌ Failed: {pr_info.html_url} [{failure_reason}]",
-                markup=False,
-            )
+            self._console.print(f"❌ Failed: {pr_info.html_url}", markup=False)
         return result
 
     def _get_failure_summary(self, pr_info: PullRequestInfo) -> str:
