@@ -3993,9 +3993,6 @@ class AsyncMergeManager:
                 f"🔀 Merge conflict: {pr_info.html_url}",
                 level="info",
             )
-            self._console.print(
-                f"❌ Failed: {pr_info.html_url} [merge conflicts]", markup=False
-            )
             result.status = MergeStatus.FAILED
             result.error = "merge conflicts"
             if self.progress_tracker:
@@ -4011,8 +4008,11 @@ class AsyncMergeManager:
             level="info",
         )
         if not await self._request_dependabot_rebase(pr_info, owner, repo):
-            self._console.print(
-                f"❌ Failed: {pr_info.html_url} [merge conflicts]", markup=False
+            log_and_print(
+                self.log,
+                self._console,
+                f"🔀 Merge conflict: {pr_info.html_url}",
+                level="info",
             )
             result.status = MergeStatus.FAILED
             result.error = "merge conflicts"
@@ -4040,8 +4040,11 @@ class AsyncMergeManager:
         if pr_info.mergeable_state == "dirty":
             # Timed out still conflicting — the rebase did not happen
             # or could not resolve the conflict.
-            self._console.print(
-                f"❌ Failed: {pr_info.html_url} [merge conflicts]", markup=False
+            log_and_print(
+                self.log,
+                self._console,
+                f"🔀 Merge conflict: {pr_info.html_url}",
+                level="info",
             )
             result.status = MergeStatus.FAILED
             result.error = "merge conflicts"
@@ -4132,11 +4135,7 @@ class AsyncMergeManager:
         )
         if self.progress_tracker:
             self.progress_tracker.merge_failure()
-        self._console.print(
-            f"❌ Failed: {pr_info.html_url} "
-            "[rebase landed but merge/auto-merge unavailable]",
-            markup=False,
-        )
+        self._console.print(f"❌ Failed: {pr_info.html_url}", markup=False)
         return result
 
     async def _report_merge_failure(

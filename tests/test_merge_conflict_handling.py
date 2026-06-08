@@ -136,6 +136,7 @@ class TestHandleMergeConflict:
                 mgr, "_wait_for_auto_merge", new_callable=AsyncMock
             ) as mock_wait,
             patch("dependamerge.merge_manager.log_and_print") as mock_log,
+            patch.object(mgr, "_console") as mock_console,
         ):
             result = await mgr._handle_merge_conflict(
                 pr, "lfreleng-actions", "lftools-uv", _result(pr)
@@ -149,6 +150,11 @@ class TestHandleMergeConflict:
         assert any(
             "🔀 Merge conflict" in str(call.args[2]) for call in mock_log.call_args_list
         )
+        # ...and it is NOT duplicated with a redundant ❌ Failed line.
+        printed = " ".join(
+            str(c.args[0]) for c in mock_console.print.call_args_list if c.args
+        )
+        assert "❌ Failed" not in printed
 
     @pytest.mark.asyncio
     async def test_rebase_request_failure_fails(self) -> None:
