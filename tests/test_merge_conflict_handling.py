@@ -310,6 +310,101 @@ class TestHandleMergeConflict:
         assert result.status == MergeStatus.FAILED
         assert "closed without merging" in (result.error or "")
 
+    @pytest.mark.asyncio
+    async def test_rebase_clears_but_auto_merge_unavailable_merges_directly(
+        self,
+    ) -> None:
+        """Rebase clears to clean but auto-merge fails -> merge directly.
+
+        Regression for the Copilot finding: when
+        ``_enable_auto_merge_for_pr`` returns False we must not return
+        a misleading AUTO_MERGE_PENDING; if the PR is mergeable we
+        merge it ourselves.
+        """
+        mgr, _client = make_merge_manager()
+        pr = _make_pr()
+        calls = {"n": 0}
+
+        async def fake_wait(pr_info, owner, repo, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                pr_info.mergeable_state = "clean"
+                return (False, False)
+            return (False, False)
+
+        with (
+            patch.object(
+                mgr,
+                "_request_dependabot_rebase",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(mgr, "_wait_for_auto_merge", new=fake_wait),
+            patch.object(mgr, "_approve_pr", new_callable=AsyncMock, return_value=True),
+            patch.object(
+                mgr,
+                "_enable_auto_merge_for_pr",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                mgr,
+                "_merge_pr_with_retry",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_merge,
+        ):
+            result = await mgr._handle_merge_conflict(
+                pr, "lfreleng-actions", "lftools-uv", _result(pr)
+            )
+
+        assert result.status == MergeStatus.MERGED
+        mock_merge.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_rebase_clears_but_auto_merge_unavailable_and_not_clean(
+        self,
+    ) -> None:
+        """Auto-merge unavailable and PR not mergeable -> FAILED (not pending)."""
+        mgr, _client = make_merge_manager()
+        pr = _make_pr()
+        calls = {"n": 0}
+
+        async def fake_wait(pr_info, owner, repo, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                pr_info.mergeable_state = "blocked"
+                return (False, False)
+            return (False, False)
+
+        with (
+            patch.object(
+                mgr,
+                "_request_dependabot_rebase",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(mgr, "_wait_for_auto_merge", new=fake_wait),
+            patch.object(mgr, "_approve_pr", new_callable=AsyncMock, return_value=True),
+            patch.object(
+                mgr,
+                "_enable_auto_merge_for_pr",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                mgr, "_merge_pr_with_retry", new_callable=AsyncMock
+            ) as mock_merge,
+        ):
+            result = await mgr._handle_merge_conflict(
+                pr, "lfreleng-actions", "lftools-uv", _result(pr)
+            )
+
+        # Must NOT be AUTO_MERGE_PENDING (auto-merge was never armed).
+        assert result.status == MergeStatus.FAILED
+        assert "auto-merge unavailable" in (result.error or "")
+        mock_merge.assert_not_called()
+
 
 class TestConflictRoutingFromMergeSinglePr:
     """``_merge_single_pr`` routes ``dirty`` PRs to the conflict handler."""

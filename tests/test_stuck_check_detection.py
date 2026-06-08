@@ -555,7 +555,9 @@ class TestReportMergeFailure:
             )
 
         assert out.status == MergeStatus.FAILED
-        assert out.error == "Failed to merge after all retry attempts"
+        # The result error now surfaces the real reason so the
+        # end-of-run summary is informative (was a generic message).
+        assert out.error == "branch protection rules prevent merge"
         printed = _printed(mock_console)
         assert "❌ Failed" in printed
         assert "branch protection" in printed

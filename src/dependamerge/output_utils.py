@@ -44,8 +44,15 @@ def log_and_print(
     """
     log_func = getattr(logger, level.lower(), logger.info)
     log_func(message)
+    # ``markup=False`` is important: status messages routinely embed a
+    # bracketed reason (e.g. "❌ Failed: <url> [merge conflicts]").  With
+    # Rich markup enabled (the default), ``[merge conflicts]`` is parsed
+    # as a style tag and silently dropped, so the reason never reaches
+    # the user.  These messages never use intentional Rich markup — the
+    # ``style`` argument is the supported styling path — so disabling
+    # markup is safe and keeps the reason visible.
     if style:
-        console.print(message, style=style)
+        console.print(message, style=style, markup=False)
     else:
         # Route through the Rich console rather than the builtin
         # ``print`` so output coordinates correctly with any active
@@ -53,4 +60,4 @@ def log_and_print(
         # ``print`` here causes the Live re-draw to garble or eat
         # interleaved messages (e.g. per-PR ✅/❌ lines emitted
         # while a progress tracker is running).
-        console.print(message)
+        console.print(message, markup=False)

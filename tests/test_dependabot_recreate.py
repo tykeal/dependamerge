@@ -841,7 +841,9 @@ class TestMergeSinglePrRecreateIntegration:
             result = await mgr._merge_single_pr(pr)
 
         assert result.status == MergeStatus.FAILED
-        assert "Failed to merge" in (result.error or "")
+        # The failure now surfaces the real reason (from
+        # _get_failure_summary) rather than a generic retry message.
+        assert "branch protection rules prevent merge" in (result.error or "")
 
     @pytest.mark.asyncio
     async def test_recreate_new_pr_merge_fails(self):
