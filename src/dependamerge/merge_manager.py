@@ -71,6 +71,13 @@ MERGEABILITY_REFRESH_TIMEOUT_SECONDS: float = 10.0
 # decide whether to ask dependabot to recreate the PR.
 STUCK_CHECK_THRESHOLD_SECONDS: float = 60.0
 
+# pre-commit.ci normally reports back within a few minutes.  A
+# ``pre-commit.ci - pr`` status stuck in ``pending`` for longer than
+# this is treated as a hung run that needs a fresh ``pre-commit.ci
+# run`` trigger.  Kept deliberately generous so a slow-but-normal run
+# is never interrupted; used by ``_trigger_stale_precommit_ci``.
+PRECOMMIT_CI_STUCK_PENDING_SECONDS: float = 300.0
+
 
 class MergeStatus(Enum):
     """Status of a PR merge operation."""
@@ -2410,13 +2417,19 @@ class AsyncMergeManager:
         return True, "All merge requirements appear to be met"
 
     async def _trigger_stale_precommit_ci(self, pr_info: PullRequestInfo) -> bool:
-        """
-        Detect and retrigger a stuck pre-commit.ci run by posting a comment.
+        """Detect and retrigger a stuck pre-commit.ci run by posting a comment.
 
-        pre-commit.ci uses the commit status API and sometimes fails to report
-        any status at all, leaving the PR permanently blocked when
-        'pre-commit.ci - pr' is a required status check. Posting the comment
-        ``pre-commit.ci run`` triggers a fresh run.
+        pre-commit.ci uses the commit status API and sometimes gets
+        stuck — either never reporting a status at all, or leaving the
+        ``pre-commit.ci - pr`` context in ``pending`` indefinitely.
+        Either way the PR stays blocked when that context is a required
+        status check.  Posting ``pre-commit.ci run`` triggers a fresh
+        run.
+
+        A run is treated as stuck when the status is missing entirely,
+        or when it has been ``pending`` for longer than
+        :data:`PRECOMMIT_CI_STUCK_PENDING_SECONDS` (a slow-but-normal
+        run within that window is left alone).
 
         Args:
             pr_info: Pull request information
@@ -2444,16 +2457,17 @@ class AsyncMergeManager:
         except Exception:
             return False
 
-        # 2. Check whether the status has already been reported
+        # 2. Inspect the existing pre-commit.ci status.  Retrigger when
+        #    it is missing entirely or has been ``pending`` past the
+        #    stuck threshold; leave any other state (success / failure
+        #    / error, or a pending run still within its normal window).
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
         try:
             status_data = await self._github_client.get(
                 f"/repos/{repo_owner}/{repo_name}/commits/{pr_info.head_sha}/status"
             )
-            if isinstance(status_data, dict):
-                for s in status_data.get("statuses", []):
-                    if isinstance(s, dict) and s.get("context") == precommit_context:
-                        # Status exists (success, pending, failure, etc.) — not stale
-                        return False
         except Exception as e:
             self.log.debug(
                 "Failed to fetch commit status for pre-commit.ci check on %s#%s "
@@ -2465,9 +2479,50 @@ class AsyncMergeManager:
             )
             return False
 
-        # 3. Status is missing entirely — check for an existing trigger comment
-        # before posting a duplicate (avoids spam if dependamerge runs repeatedly
-        # while the status is still missing).
+        precommit_status: dict[str, Any] | None = None
+        if isinstance(status_data, dict):
+            for s in status_data.get("statuses", []):
+                if isinstance(s, dict) and s.get("context") == precommit_context:
+                    precommit_status = s
+                    break
+
+        if precommit_status is not None:
+            state = precommit_status.get("state")
+            if state != "pending":
+                # A reported, non-pending result (success / failure /
+                # error) is not stale — nothing to retrigger.
+                return False
+            # Pending: only stuck once it has been pending longer than
+            # the threshold.  Use ``updated_at`` (when pre-commit.ci
+            # set the pending status), falling back to ``created_at``.
+            raw_ts = precommit_status.get("updated_at") or precommit_status.get(
+                "created_at"
+            )
+            pending_age: float | None = None
+            if isinstance(raw_ts, str) and raw_ts:
+                try:
+                    ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                    pending_age = (now - ts).total_seconds()
+                except ValueError:
+                    pending_age = None
+            if (
+                pending_age is None
+                or pending_age < PRECOMMIT_CI_STUCK_PENDING_SECONDS
+            ):
+                # Still within the normal window (or no timestamp to
+                # judge by) — leave the run to finish.
+                return False
+            self.log.info(
+                "pre-commit.ci on %s#%s pending for %.0fs; treating as stuck.",
+                pr_info.repository_full_name,
+                pr_info.number,
+                pending_age,
+            )
+
+        # 3. The run is stale (missing, or stuck pending) — check for
+        # an existing trigger comment before posting a duplicate
+        # (avoids spam if dependamerge runs repeatedly while the
+        # status is still not progressing).
         try:
             comments = await self._github_client.get(
                 f"/repos/{repo_owner}/{repo_name}/issues/{pr_info.number}/comments?per_page=100"
@@ -2492,8 +2547,7 @@ class AsyncMergeManager:
         log_and_print(
             self.log,
             self._console,
-            f"⏳ Triggering pre-commit.ci re-run: {pr_info.html_url} "
-            "[status never reported]",
+            f"🔄 Re-triggering pre-commit.ci: {pr_info.html_url}",
             level="info",
         )
 
