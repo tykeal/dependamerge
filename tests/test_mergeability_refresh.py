@@ -1,16 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-"""Tests for pre-dispatch mergeability refresh in ``AsyncMergeManager``.
+"""Tests for repo-scoped mergeability conflict detection in ``AsyncMergeManager``.
 
 In a repo-scoped batch the PR list is fetched once up front, so a
 worker can act on a stale snapshot: merging one PR may make a sibling
 PR ``dirty`` (a ``uv.lock`` / workflow-pin conflict) before its own
-merge is dispatched.  ``_refresh_pr_mergeability`` re-reads the PR's
-live state immediately before the merge dispatch (inside the per-repo
-dispatch lock, the only point ordered after any sibling merge) so the
-conflict is detected and reported accurately instead of producing a
-misleading "Failed to merge after all retry attempts".
+merge is dispatched.  Two complementary checks catch this:
+
+* ``_is_pr_dirty_now`` is the **pre-dispatch** check — a single GET
+  run *inside* the per-repo dispatch lock (the only point ordered
+  after any sibling merge), immediately before the merge dispatch, so
+  a freshly-conflicted PR skips the doomed merge entirely.
+* ``_refresh_pr_mergeability`` is the **post-failure** check — it
+  polls GitHub's recompute window and therefore runs only *after* a
+  failed merge attempt and *off* the dispatch lock, catching a PR that
+  turned ``dirty`` during our own merge window instead of producing a
+  misleading "Failed to merge after all retry attempts".
 """
 
 from __future__ import annotations

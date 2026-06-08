@@ -841,13 +841,21 @@ class GitHubAsync:
 
                 raise Exception(error_msg) from e
             except Exception as inner_e:
-                # If we can't get PR details, just re-raise the original error
-                if isinstance(inner_e, Exception) and "Failed to merge PR" in str(
-                    inner_e
-                ):
+                # The enhanced-error path raised successfully (the
+                # message starts with "Failed to merge PR") — propagate
+                # it unchanged.
+                if "Failed to merge PR" in str(inner_e):
                     raise inner_e from e
-                else:
-                    raise e from inner_e
+                # Otherwise the PR-state re-fetch itself failed.  Still
+                # surface GitHub's response body (the actionable reason)
+                # when we captured it, rather than dropping back to the
+                # bare status-line ``HTTPStatusError``.
+                if github_detail:
+                    raise Exception(
+                        f"Failed to merge PR #{number} in {owner}/{repo}. "
+                        f"GitHub: {github_detail}"
+                    ) from e
+                raise e from inner_e
 
 
     async def enable_auto_merge(

@@ -411,6 +411,44 @@ class TestHandleMergeConflict:
         assert "auto-merge unavailable" in (result.error or "")
         mock_merge.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_approval_failure_after_rebase_is_reported(self) -> None:
+        """An approval error after the rebase is reported locally, not bubbled."""
+        mgr, _client = make_merge_manager()
+        pr = _make_pr()
+
+        async def fake_wait(pr_info, owner, repo, **kwargs):
+            # Rebase cleared the conflict (now blocked, awaiting review).
+            pr_info.mergeable_state = "blocked"
+            return (False, False)
+
+        with (
+            patch.object(
+                mgr,
+                "_request_dependabot_rebase",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(mgr, "_wait_for_auto_merge", new=fake_wait),
+            patch.object(
+                mgr,
+                "_approve_pr",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("403 Forbidden"),
+            ),
+            patch.object(
+                mgr, "_enable_auto_merge_for_pr", new_callable=AsyncMock
+            ) as mock_enable,
+        ):
+            result = await mgr._handle_merge_conflict(
+                pr, "lfreleng-actions", "lftools-uv", _result(pr)
+            )
+
+        assert result.status == MergeStatus.FAILED
+        assert "approval failed" in (result.error or "")
+        # The failure is handled before auto-merge is even attempted.
+        mock_enable.assert_not_called()
+
 
 class TestConflictRoutingFromMergeSinglePr:
     """``_merge_single_pr`` routes ``dirty`` PRs to the conflict handler."""

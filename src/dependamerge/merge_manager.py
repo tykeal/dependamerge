@@ -3646,9 +3646,20 @@ class AsyncMergeManager:
         immediately make a sibling PR ``dirty`` (the classic
         ``uv.lock`` / workflow-pin conflict) or ``behind``.  A
         concurrent ``dependamerge`` run elsewhere in the org can do the
-        same.  We therefore re-read the PR's state immediately before
-        dispatching the merge, rather than trusting the fetch-time
-        snapshot.
+        same.
+
+        This method is the **post-failure** half of the conflict-
+        detection pair, called from ``_merge_single_pr`` *after* a
+        repo-scoped merge attempt returns falsy and always **outside**
+        the per-repo dispatch lock.  It catches the case where a PR
+        turned ``dirty`` *during* our own merge window (a sibling
+        merged between the pre-dispatch check and the merge call) so a
+        freshly-conflicted PR is routed to conflict recovery rather
+        than reported as a generic merge failure.  The complementary
+        **pre-dispatch** check is the single-GET ``_is_pr_dirty_now``,
+        which runs *inside* the dispatch lock; the polling done here
+        deliberately stays off that lock so GitHub's recompute window
+        never serialises the whole repo batch.
 
         GitHub recomputes ``mergeable`` / ``mergeable_state``
         asynchronously after the base branch moves, reporting
@@ -3840,7 +3851,15 @@ class AsyncMergeManager:
                             pr_info.mergeable = refreshed_mergeable
                     if "mergeable_state" in refreshed_wait:
                         refreshed_state = refreshed_wait.get("mergeable_state")
-                        if refreshed_state is not None:
+                        # Preserve the previous concrete state while
+                        # GitHub is still recomputing mergeability: it
+                        # returns ``null`` / ``""`` / ``"unknown"``
+                        # transiently, and overwriting with those would
+                        # push the state out of ``continue_states`` and
+                        # break the wait loop early (e.g. a ``blocked``
+                        # PR briefly going ``unknown`` would exit and
+                        # trigger a premature manual merge).
+                        if refreshed_state not in (None, "", "unknown"):
                             pr_info.mergeable_state = refreshed_state
                     # The head can change while we wait (rebase,
                     # force-push); keep it current so any later
@@ -3855,6 +3874,18 @@ class AsyncMergeManager:
                         )
                         pr_info.state = "closed"
                         break
+                # A PR that becomes immediately mergeable while still
+                # ``unstable`` (only a non-required check is red) will
+                # never reach ``clean`` and never leave ``unstable``,
+                # so keeping it in ``continue_states`` would spin the
+                # wait to the deadline — the exact slow hang the
+                # Step 5.5 routing fix removes for PRs that *start*
+                # mergeable.  Break out as soon as GitHub reports
+                # ``unstable`` + ``mergeable is True`` so the caller can
+                # dispatch (auto-merge, already armed before this wait,
+                # will land it; failing that the caller merges directly).
+                if pr_info.mergeable_state == "unstable" and pr_info.mergeable is True:
+                    break
                 # Continue waiting only while the PR is in a state the
                 # caller still considers rescuable; any other value
                 # means it became mergeable, closed, or hit a terminal
@@ -4056,8 +4087,25 @@ class AsyncMergeManager:
         # before — approving the pre-rebase head would just be
         # dismissed by dependabot's force-push, producing the
         # duplicate approvals we want to avoid) and try to enable
-        # auto-merge.
-        await self._approve_pr(owner, repo, pr_info.number)
+        # auto-merge.  Handle an approval failure (permission / API
+        # error) here rather than letting it bubble to the generic
+        # catch-all, which would lose the conflict-recovery context.
+        try:
+            await self._approve_pr(owner, repo, pr_info.number)
+        except Exception as exc:
+            self.log.warning(
+                "Failed to approve %s/%s#%s after rebase: %s",
+                owner,
+                repo,
+                pr_info.number,
+                exc,
+            )
+            result.status = MergeStatus.FAILED
+            result.error = f"rebase cleared the conflict but approval failed: {exc}"
+            if self.progress_tracker:
+                self.progress_tracker.merge_failure()
+            self._console.print(f"❌ Failed: {pr_info.html_url}", markup=False)
+            return result
         auto_ok = await self._enable_auto_merge_for_pr(pr_info, owner, repo)
         if auto_ok:
             log_and_print(

@@ -1369,3 +1369,80 @@ class TestBlockReasonIndicatesPendingChecks:
             )
             is False
         )
+
+
+class TestWaitForAutoMergeRecompute:
+    """`_wait_for_auto_merge` must survive GitHub's recompute window."""
+
+    @pytest.mark.asyncio
+    async def test_transient_unknown_does_not_break_loop_early(self) -> None:
+        """A transient 'unknown' must not exit the wait or clobber state."""
+        mgr, client = make_merge_manager()
+        pr = _DEFAULT_PR.model_copy(
+            update={"mergeable_state": "blocked", "state": "open"}
+        )
+        # 1st poll: GitHub still recomputing (unknown / null).
+        # 2nd poll: auto-merge has landed (closed + merged).
+        client.get = AsyncMock(
+            side_effect=[
+                {"mergeable_state": "unknown", "mergeable": None},
+                {"state": "closed", "merged": True},
+            ]
+        )
+        with patch("dependamerge.merge_manager.asyncio.sleep", new_callable=AsyncMock):
+            closed, merged = await mgr._wait_for_auto_merge(
+                pr,
+                "owner",
+                "repo",
+                continue_states=("blocked", "behind", "unstable"),
+            )
+
+        # Without the fix the loop would break after the first poll
+        # ("unknown" not in continue_states); with it, it waits through
+        # the recompute and observes the merge.
+        assert client.get.await_count == 2
+        assert closed is True
+        assert merged is True
+        # The transient "unknown" never overwrote the prior state.
+        assert pr.mergeable_state == "blocked"
+
+    @pytest.mark.asyncio
+    async def test_unstable_mergeable_true_breaks_wait_early(self) -> None:
+        """unstable + mergeable=True must exit the wait, not spin to timeout."""
+        # Enter the wait while still computing (mergeable=None), then
+        # GitHub settles on unstable + mergeable=True.  Because
+        # ``unstable`` is in continue_states, the loop would otherwise
+        # keep waiting until the deadline; the fix breaks out as soon as
+        # the PR is immediately mergeable so the caller can dispatch.
+        mgr, client = make_merge_manager(merge_timeout=30.0)
+        pr = _DEFAULT_PR.model_copy(
+            update={
+                "mergeable_state": "blocked",
+                "mergeable": None,
+                "state": "open",
+            }
+        )
+        client.get = AsyncMock(
+            side_effect=[
+                {"mergeable_state": "unknown", "mergeable": None},
+                {"mergeable_state": "unstable", "mergeable": True},
+                # A third poll would only be reached if the loop failed
+                # to break; surface that as an explicit stuck state.
+                {"mergeable_state": "unstable", "mergeable": True},
+            ]
+        )
+        with patch("dependamerge.merge_manager.asyncio.sleep", new_callable=AsyncMock):
+            closed, merged = await mgr._wait_for_auto_merge(
+                pr,
+                "owner",
+                "repo",
+                continue_states=("blocked", "behind", "unstable"),
+            )
+
+        # Broke out on the 2nd poll (unstable + mergeable=True); never
+        # polled a 3rd time or ran to the deadline.
+        assert client.get.await_count == 2
+        assert closed is False
+        assert merged is False
+        assert pr.mergeable_state == "unstable"
+        assert pr.mergeable is True

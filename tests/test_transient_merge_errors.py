@@ -552,6 +552,27 @@ class TestMergeApiBodyCapture:
 
         assert result is True
 
+    @pytest.mark.asyncio
+    async def test_surfaces_body_when_state_refetch_fails(self):
+        """If the PR-state re-fetch fails, still surface GitHub's body."""
+        from dependamerge.github_async import GitHubAsync
+
+        api = GitHubAsync(token="t")
+        api.put = AsyncMock(
+            side_effect=_make_405_with_body(
+                "Required workflows 'Autolabeler' are not satisfied"
+            )
+        )
+        # The follow-up PR-state GET also fails.
+        api.get = AsyncMock(side_effect=RuntimeError("re-fetch failed"))
+
+        with pytest.raises(Exception) as excinfo:
+            await api.merge_pull_request("o", "r", 1, "merge")
+
+        msg = str(excinfo.value)
+        assert "GitHub:" in msg
+        assert "Required workflows" in msg
+
 
 class TestFailureSummarySurfacesGitHubDetail:
     """``_get_failure_summary`` surfaces the GitHub-supplied reason."""
