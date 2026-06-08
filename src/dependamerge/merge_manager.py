@@ -1549,37 +1549,53 @@ class AsyncMergeManager:
                     dispatch_lock = await self._get_merge_dispatch_lock(
                         repo_owner, repo_name
                     )
-                    conflict_detected = False
+                    dirty_before_dispatch = False
                     async with dispatch_lock:
-                        # In a repo-scoped batch, an earlier merge in
-                        # this repo (or a concurrent dependamerge run)
-                        # may have made this PR ``dirty`` / ``behind``
-                        # since it was fetched.  Refresh the live state
-                        # now that we hold the dispatch lock — this is
-                        # the only point that is both serialised and
-                        # ordered after any sibling merge.  See
-                        # ``_refresh_pr_mergeability``.
+                        # Re-read live merge state *before* dispatch — a
+                        # single GET, no recompute poll.  In a
+                        # repo-scoped batch an earlier sibling merge can
+                        # turn this PR ``dirty`` between the one-shot
+                        # fetch and dispatch (the classic shared
+                        # ``uv.lock`` conflict); routing it straight to
+                        # conflict recovery avoids dispatching a doomed
+                        # merge that 405s and then churns the retry loop
+                        # against the stale ``clean`` snapshot.  We keep
+                        # this to a single GET (not the polling
+                        # ``_refresh_pr_mergeability``) because the
+                        # dispatch lock is the one point serialised *and*
+                        # ordered after a sibling merge, so polling
+                        # GitHub's recompute window here would serialise
+                        # the whole repo batch.
                         if self._repo_scoped:
-                            await self._refresh_pr_mergeability(
+                            dirty_before_dispatch = await self._is_pr_dirty_now(
                                 pr_info, repo_owner, repo_name
                             )
-                        if pr_info.mergeable_state == "dirty":
-                            # A real merge conflict (a sibling merged
-                            # first).  Defer recovery until *after* we
-                            # release the dispatch lock: the conflict
-                            # handler can wait for the full
-                            # ``merge_timeout`` and must not block other
-                            # PRs' merges on this repo.
-                            conflict_detected = True
+                        if dirty_before_dispatch:
                             merged = False
                         else:
                             merged = await self._merge_pr_with_retry(
                                 pr_info, repo_owner, repo_name
                             )
-                    if conflict_detected:
+                    # Conflict recovery runs *outside* the dispatch lock
+                    # so the rebase wait never blocks sibling merges.
+                    if dirty_before_dispatch:
                         return await self._handle_merge_conflict(
                             pr_info, repo_owner, repo_name, result
                         )
+                    # A PR can also turn ``dirty`` *during* our own merge
+                    # window (a sibling merged between the pre-dispatch
+                    # check and the merge call).  The post-failure
+                    # refresh — off the lock, with its recompute poll —
+                    # catches that so a freshly-dirty PR is never
+                    # reported as a generic merge failure.
+                    if not merged and self._repo_scoped:
+                        await self._refresh_pr_mergeability(
+                            pr_info, repo_owner, repo_name
+                        )
+                        if pr_info.mergeable_state == "dirty":
+                            return await self._handle_merge_conflict(
+                                pr_info, repo_owner, repo_name, result
+                            )
 
                 if merged is None:
                     # Auto-merge is active — PR will merge asynchronously.
@@ -2515,7 +2531,12 @@ class AsyncMergeManager:
                 try:
                     ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
                     pending_age = (now - ts).total_seconds()
-                except ValueError:
+                except (ValueError, TypeError):
+                    # ``ValueError``: unparsable timestamp.
+                    # ``TypeError``: a timestamp lacking tz info parses
+                    # to a naive datetime, which cannot be subtracted
+                    # from the tz-aware ``now``.  Either way, degrade to
+                    # ``None`` (fail closed) rather than abort the run.
                     pending_age = None
             if (
                 pending_age is None
@@ -2687,9 +2708,17 @@ class AsyncMergeManager:
                 return None
             try:
                 # GitHub returns RFC 3339 with a trailing ``Z``.
-                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+                ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
             except ValueError:
                 return None
+            # A timestamp without tz info parses to a naive datetime,
+            # which raises ``TypeError`` when subtracted from the
+            # tz-aware ``now`` below.  Treat it as unparsable (fail
+            # closed) so the detector degrades gracefully instead of
+            # aborting the merge run.
+            if ts.tzinfo is None:
+                return None
+            return ts
 
         def _is_dco_name(name: str) -> bool:
             """Return True when ``name`` looks like a DCO check.
@@ -3635,6 +3664,73 @@ class AsyncMergeManager:
             return False
         return pr_data.get("state") == "closed" and bool(pr_data.get("merged"))
 
+    async def _is_pr_dirty_now(
+        self, pr_info: PullRequestInfo, owner: str, repo: str
+    ) -> bool:
+        """Best-effort single GET: ``True`` only if the PR is *concretely* dirty.
+
+        Called inside the per-repo dispatch lock, immediately before the
+        merge is dispatched, to catch a PR that an earlier sibling merge
+        in the same repo-scoped batch has turned ``dirty`` (the classic
+        shared-``uv.lock`` conflict) since the one-shot fetch snapshot.
+        Routing such a PR straight to conflict recovery avoids
+        dispatching a doomed merge that 405s and then churns
+        :meth:`_merge_pr_with_retry`'s retry loop against the stale
+        ``clean`` snapshot (which misreads the 405 as a transient error
+        on a mergeable PR and sleeps under the dispatch lock before
+        re-fetching).
+
+        Deliberately a *single* GET with no recompute poll — unlike
+        :meth:`_refresh_pr_mergeability`, which polls GitHub's
+        "still computing" window and therefore runs only *after* a
+        failed merge, off the lock.  The dispatch lock is the one point
+        serialised *and* ordered after a sibling merge, so polling here
+        would serialise the whole repo batch.  We therefore act only on
+        a *concrete* ``dirty``; a still-computing, closed, non-dirty, or
+        errored result returns ``False`` so the merge attempt proceeds
+        and the off-lock post-failure refresh settles anything that
+        turns out to be a fresh conflict.
+
+        Mutates ``pr_info`` (``mergeable``, ``mergeable_state``,
+        ``head_sha``) only when it confirms a concrete ``dirty``, so the
+        conflict handler and failure summary report accurate state.  The
+        snapshot is otherwise left untouched — in particular a transient
+        ``unknown`` never overwrites a concrete ``clean``, preserving the
+        transient-405-on-``clean`` retry path in
+        :meth:`_merge_pr_with_retry`.
+        """
+        if not self._github_client:
+            return False
+        try:
+            data = await self._github_client.get(
+                f"/repos/{owner}/{repo}/pulls/{pr_info.number}"
+            )
+        except Exception as exc:
+            self.log.debug(
+                "Pre-dispatch dirty check failed for %s/%s#%s: %s",
+                owner,
+                repo,
+                pr_info.number,
+                exc,
+            )
+            return False
+        if not isinstance(data, dict):
+            return False
+        # A closed PR is handled by the caller's closed-PR path, not as
+        # a conflict.
+        if data.get("state") == "closed":
+            return False
+        if data.get("mergeable_state") != "dirty":
+            return False
+        # Concrete conflict: record it so ``_handle_merge_conflict`` and
+        # the failure summary act on accurate, current state.
+        pr_info.mergeable = data.get("mergeable")
+        pr_info.mergeable_state = "dirty"
+        head_sha = (data.get("head") or {}).get("sha")
+        if head_sha:
+            pr_info.head_sha = head_sha
+        return True
+
     async def _refresh_pr_mergeability(
         self, pr_info: PullRequestInfo, owner: str, repo: str
     ) -> None:
@@ -3738,11 +3834,18 @@ class AsyncMergeManager:
                 # Timed out waiting for GitHub to settle.  Record the
                 # latest values we did get (even if still computing) so
                 # downstream logic sees GitHub's current best answer
-                # rather than the older snapshot.
+                # rather than the older snapshot.  Reaching here means we
+                # are still in the recompute window, where GitHub signals
+                # "still computing" with ``mergeable=None`` and a
+                # ``mergeable_state`` of ``None``, ``""`` or
+                # ``"unknown"``.  Normalise any of those to a concrete
+                # ``"unknown"`` and always record it, so a stale concrete
+                # state (e.g. ``clean``) is never left in place —
+                # consistent with the ``still_computing`` check above,
+                # which treats ``None``/``""``/``"unknown"`` alike.
                 if mergeable is not None:
                     pr_info.mergeable = mergeable
-                if mergeable_state not in (None, ""):
-                    pr_info.mergeable_state = mergeable_state
+                pr_info.mergeable_state = mergeable_state or "unknown"
                 self.log.debug(
                     "Mergeability for %s/%s#%s still computing after %.0fs; "
                     "proceeding with mergeable=%s state=%s",

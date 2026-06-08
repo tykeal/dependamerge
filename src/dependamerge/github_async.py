@@ -812,14 +812,20 @@ class GitHubAsync:
                     )
                     return True
 
-                # Enhanced error message: lead with GitHub's own
-                # explanation (the actionable part) and add PR-state
-                # context.
-                error_msg = f"Failed to merge PR #{number} in {owner}/{repo}."
+                # Enhanced error message.  Always keep the original
+                # error text — it carries the HTTP status line (e.g.
+                # "405 Method Not Allowed") that ``_merge_pr_with_retry``
+                # string-matches to classify retryable vs terminal
+                # failures; dropping it made every blocked/ruleset 405
+                # fall through to the generic retry path (3 attempts +
+                # sleeps).  Then *add* GitHub's response body (the
+                # actionable reason) when we captured it.
+                error_msg = (
+                    f"Failed to merge PR #{number} in {owner}/{repo}. "
+                    f"Error: {str(e)}."
+                )
                 if github_detail:
                     error_msg += f" GitHub: {github_detail}"
-                else:
-                    error_msg += f" Error: {str(e)}"
                 error_msg += (
                     f" (PR state: {state}, mergeable: {mergeable}, "
                     f"mergeable_state: {mergeable_state})"
@@ -853,7 +859,7 @@ class GitHubAsync:
                 if github_detail:
                     raise Exception(
                         f"Failed to merge PR #{number} in {owner}/{repo}. "
-                        f"GitHub: {github_detail}"
+                        f"Error: {str(e)}. GitHub: {github_detail}"
                     ) from e
                 raise e from inner_e
 

@@ -537,6 +537,11 @@ class TestMergeApiBodyCapture:
         assert "GitHub:" in msg
         assert "Required workflows" in msg
         assert "not satisfied" in msg
+        # The original status line MUST be preserved so
+        # _merge_pr_with_retry still classifies the 405 as terminal
+        # (and fails fast) instead of retrying it 3x.
+        assert "405" in msg
+        assert "Method Not Allowed" in msg
 
     @pytest.mark.asyncio
     async def test_merge_succeeded_despite_exception_returns_true(self):

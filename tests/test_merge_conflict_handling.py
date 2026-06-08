@@ -503,10 +503,16 @@ class TestConflictRoutingFromMergeSinglePr:
 
     @pytest.mark.asyncio
     async def test_dispatch_dirty_routes_to_handler(self) -> None:
-        """A PR that becomes dirty mid-batch is caught at dispatch."""
+        """A PR that becomes dirty mid-merge is caught after a failed merge.
+
+        The pre-dispatch peek still sees a clean PR (so the merge is
+        attempted); the merge then fails and the off-lock post-failure
+        refresh reveals the conflict and routes it to recovery.
+        """
         mgr, client = make_merge_manager(repo_scoped=True)
         mgr._post_approval_delay = 0.0
-        # Snapshot clean -> passes early checks; refresh reveals dirty.
+        # Snapshot clean -> passes early checks; the merge fails and the
+        # post-failure refresh reveals the conflict.
         client.get = AsyncMock(
             return_value={
                 "state": "open",
@@ -530,11 +536,19 @@ class TestConflictRoutingFromMergeSinglePr:
             patch.object(
                 mgr, "_approve_pr", new_callable=AsyncMock, return_value=False
             ),
+            # The pre-dispatch peek sees it still clean; the conflict
+            # only surfaces on the post-failure refresh.
+            patch.object(
+                mgr, "_is_pr_dirty_now", new_callable=AsyncMock, return_value=False
+            ),
             patch.object(
                 mgr, "_handle_merge_conflict", new_callable=AsyncMock
             ) as mock_handler,
             patch.object(
-                mgr, "_merge_pr_with_retry", new_callable=AsyncMock
+                mgr,
+                "_merge_pr_with_retry",
+                new_callable=AsyncMock,
+                return_value=False,
             ) as mock_merge,
         ):
             mock_handler.return_value = MergeResult(
@@ -542,6 +556,6 @@ class TestConflictRoutingFromMergeSinglePr:
             )
             await mgr._merge_single_pr(pr)
 
+        # The merge is attempted; the failure + refresh route to recovery.
+        mock_merge.assert_awaited_once()
         mock_handler.assert_awaited_once()
-        # The doomed merge call is skipped in favour of recovery.
-        mock_merge.assert_not_called()

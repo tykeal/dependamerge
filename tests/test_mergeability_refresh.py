@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from dependamerge.github2gerrit_detector import GitHub2GerritDetectionResult
-from dependamerge.merge_manager import MergeStatus
+from dependamerge.merge_manager import MergeResult, MergeStatus
 from dependamerge.models import PullRequestInfo
 from tests.conftest import make_merge_manager
 
@@ -154,6 +154,65 @@ class TestRefreshPrMergeability:
         client.get.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_timeout_normalizes_empty_state_to_unknown(self, monkeypatch) -> None:
+        """An empty ``mergeable_state`` at timeout is recorded as ``unknown``.
+
+        GitHub signals "still computing" as either ``"unknown"`` or an
+        empty string; both must overwrite a stale concrete snapshot so
+        downstream reporting never shows a misleading ``clean`` once the
+        recompute window times out.
+        """
+        monkeypatch.setattr(
+            "dependamerge.merge_manager.MERGEABILITY_REFRESH_TIMEOUT_SECONDS",
+            0.0,
+        )
+        mgr, client = make_merge_manager()
+        client.get = AsyncMock(
+            return_value={
+                "state": "open",
+                "mergeable": None,
+                "mergeable_state": "",
+            }
+        )
+        pr = _make_pr(mergeable=True, mergeable_state="clean")
+
+        await mgr._refresh_pr_mergeability(pr, "owner", "repo")
+
+        # The empty string is normalised so the stale ``clean`` snapshot
+        # is not left in place.
+        assert pr.mergeable_state == "unknown"
+        client.get.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_timeout_normalizes_null_state_to_unknown(self, monkeypatch) -> None:
+        """A null ``mergeable_state`` at timeout is recorded as ``unknown``.
+
+        ``mergeable_state is None`` is a still-computing signal too; if
+        GitHub returns it for the whole refresh window the stale
+        concrete snapshot must still be overwritten with an honest
+        ``unknown`` rather than left as a misleading ``clean``.
+        """
+        monkeypatch.setattr(
+            "dependamerge.merge_manager.MERGEABILITY_REFRESH_TIMEOUT_SECONDS",
+            0.0,
+        )
+        mgr, client = make_merge_manager()
+        client.get = AsyncMock(
+            return_value={
+                "state": "open",
+                "mergeable": None,
+                "mergeable_state": None,
+            }
+        )
+        pr = _make_pr(mergeable=True, mergeable_state="clean")
+
+        await mgr._refresh_pr_mergeability(pr, "owner", "repo")
+
+        # A null state at timeout is normalised, not dropped.
+        assert pr.mergeable_state == "unknown"
+        client.get.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_closed_state_short_circuits(self) -> None:
         """A closed PR is recorded and returns without polling."""
         mgr, client = make_merge_manager()
@@ -206,8 +265,124 @@ class TestRefreshPrMergeability:
         assert pr.mergeable_state == "clean"
 
 
-class TestDispatchRefreshSkipsConflict:
-    """``_merge_single_pr`` dispatch-time refresh + dirty-skip behaviour."""
+class TestIsPrDirtyNow:
+    """Direct unit tests for the pre-dispatch ``_is_pr_dirty_now`` peek."""
+
+    @pytest.mark.asyncio
+    async def test_concrete_dirty_returns_true_and_records_state(self) -> None:
+        """A concrete ``dirty`` returns True and records current state."""
+        mgr, client = make_merge_manager()
+        client.get = AsyncMock(
+            return_value={
+                "state": "open",
+                "mergeable": False,
+                "mergeable_state": "dirty",
+                "head": {"sha": "conflictsha"},
+            }
+        )
+        pr = _make_pr(mergeable=True, mergeable_state="clean")
+
+        assert await mgr._is_pr_dirty_now(pr, "owner", "repo") is True
+        assert pr.mergeable_state == "dirty"
+        assert pr.mergeable is False
+        assert pr.head_sha == "conflictsha"
+        client.get.assert_awaited_once_with("/repos/owner/repo/pulls/425")
+
+    @pytest.mark.asyncio
+    async def test_concrete_clean_returns_false_without_mutating(self) -> None:
+        """A concrete ``clean`` peek leaves the snapshot untouched."""
+        mgr, client = make_merge_manager()
+        client.get = AsyncMock(
+            return_value={
+                "state": "open",
+                "mergeable": True,
+                "mergeable_state": "clean",
+            }
+        )
+        pr = _make_pr(mergeable=True, mergeable_state="clean")
+
+        assert await mgr._is_pr_dirty_now(pr, "owner", "repo") is False
+        assert pr.mergeable_state == "clean"
+
+    @pytest.mark.asyncio
+    async def test_still_computing_returns_false_without_mutating(self) -> None:
+        """A transient ``unknown`` must not overwrite a concrete ``clean``.
+
+        The peek is a single GET with no recompute poll; when GitHub is
+        still computing it returns False and preserves the prior
+        snapshot so the transient-405-on-``clean`` retry path is kept.
+        """
+        mgr, client = make_merge_manager()
+        client.get = AsyncMock(
+            return_value={
+                "state": "open",
+                "mergeable": None,
+                "mergeable_state": "unknown",
+            }
+        )
+        pr = _make_pr(mergeable=True, mergeable_state="clean")
+
+        assert await mgr._is_pr_dirty_now(pr, "owner", "repo") is False
+        assert pr.mergeable_state == "clean"
+        assert pr.mergeable is True
+        client.get.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_closed_pr_returns_false(self) -> None:
+        """A closed PR is not a conflict; defer to the closed-PR path."""
+        mgr, client = make_merge_manager()
+        client.get = AsyncMock(
+            return_value={
+                "state": "closed",
+                "mergeable": None,
+                "mergeable_state": "dirty",
+            }
+        )
+        pr = _make_pr(mergeable=True, mergeable_state="clean")
+
+        assert await mgr._is_pr_dirty_now(pr, "owner", "repo") is False
+        assert pr.mergeable_state == "clean"
+
+    @pytest.mark.asyncio
+    async def test_api_error_returns_false_without_mutating(self) -> None:
+        """An errored peek degrades to False and preserves the snapshot."""
+        mgr, client = make_merge_manager()
+        client.get = AsyncMock(side_effect=RuntimeError("boom"))
+        pr = _make_pr(mergeable=True, mergeable_state="clean")
+
+        assert await mgr._is_pr_dirty_now(pr, "owner", "repo") is False
+        assert pr.mergeable_state == "clean"
+
+    @pytest.mark.asyncio
+    async def test_non_dict_payload_returns_false(self) -> None:
+        """A non-dict payload degrades to False rather than crashing."""
+        mgr, client = make_merge_manager()
+        client.get = AsyncMock(return_value=["unexpected"])
+        pr = _make_pr(mergeable=True, mergeable_state="clean")
+
+        assert await mgr._is_pr_dirty_now(pr, "owner", "repo") is False
+        assert pr.mergeable_state == "clean"
+
+    @pytest.mark.asyncio
+    async def test_no_client_returns_false(self) -> None:
+        """With no GitHub client the peek is a no-op returning False."""
+        mgr, _client = make_merge_manager()
+        mgr._github_client = None
+        pr = _make_pr(mergeable=True, mergeable_state="clean")
+
+        assert await mgr._is_pr_dirty_now(pr, "owner", "repo") is False
+        assert pr.mergeable_state == "clean"
+
+
+class TestDispatchMergeabilityRouting:
+    """``_merge_single_pr`` pre-dispatch peek + post-failure refresh.
+
+    A repo-scoped run peeks live merge state inside the dispatch lock
+    (a single GET) so a sibling-conflicted PR is routed to conflict
+    recovery *without* a doomed merge attempt; a PR that turns dirty
+    during the merge window is still caught by the off-lock
+    post-failure refresh.
+    """
 
     @staticmethod
     def _patches(mgr):
@@ -237,12 +412,17 @@ class TestDispatchRefreshSkipsConflict:
         )
 
     @pytest.mark.asyncio
-    async def test_fresh_conflict_skips_merge_and_reports_conflict(self) -> None:
-        """A conflict revealed at dispatch skips the doomed merge call."""
+    async def test_predispatch_dirty_routes_without_merge_attempt(self) -> None:
+        """A sibling conflict is caught pre-dispatch, skipping the merge.
+
+        The pre-dispatch peek reveals the ``dirty`` state, so we route
+        straight to conflict recovery without ever calling
+        ``_merge_pr_with_retry`` (which would 405 and churn its retry
+        loop against the stale ``clean`` snapshot).
+        """
         mgr, client = make_merge_manager(repo_scoped=True)
         mgr._post_approval_delay = 0.0
-        # Snapshot says clean (passes early eligibility); the live
-        # refresh at dispatch reveals the sibling-merge conflict.
+        # The pre-dispatch peek reveals the sibling-merge conflict.
         client.get = AsyncMock(
             return_value={
                 "state": "open",
@@ -260,27 +440,70 @@ class TestDispatchRefreshSkipsConflict:
             p3,
             p4,
             patch.object(
-                mgr, "_merge_pr_with_retry", new_callable=AsyncMock
+                mgr,
+                "_merge_pr_with_retry",
+                new_callable=AsyncMock,
+                return_value=False,
             ) as mock_merge,
         ):
             result = await mgr._merge_single_pr(pr)
 
+        # The merge is never attempted; the conflict is handled directly
+        # (renovate is non-dependabot, so it fails as a plain conflict).
+        mock_merge.assert_not_awaited()
         assert result.status == MergeStatus.FAILED
-        # The doomed merge API call must be skipped entirely.
-        mock_merge.assert_not_called()
+        assert result.error == "merge conflicts"
 
     @pytest.mark.asyncio
-    async def test_clean_after_refresh_proceeds_to_merge(self) -> None:
-        """When the refresh confirms ``clean`` the merge proceeds normally."""
-        mgr, client = make_merge_manager(repo_scoped=True)
+    async def test_during_window_dirty_routes_via_post_failure_refresh(self) -> None:
+        """A PR that turns dirty mid-merge is caught after the failure.
+
+        The pre-dispatch peek sees a still-clean PR (returns False), the
+        merge is attempted and fails, and only then does the off-lock
+        post-failure refresh reveal the fresh conflict and route it.
+        """
+        mgr, _client = make_merge_manager(repo_scoped=True)
         mgr._post_approval_delay = 0.0
-        client.get = AsyncMock(
-            return_value={
-                "state": "open",
-                "mergeable": True,
-                "mergeable_state": "clean",
-            }
-        )
+        pr = _make_pr(mergeable=True, mergeable_state="clean")
+
+        async def _reveal_dirty(pr_info, _owner, _repo):
+            pr_info.mergeable_state = "dirty"
+
+        p1, p2, p3, p4 = self._patches(mgr)
+        with (
+            p1,
+            p2,
+            p3,
+            p4,
+            patch.object(
+                mgr, "_is_pr_dirty_now", new_callable=AsyncMock, return_value=False
+            ) as mock_peek,
+            patch.object(
+                mgr,
+                "_merge_pr_with_retry",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as mock_merge,
+            patch.object(
+                mgr,
+                "_refresh_pr_mergeability",
+                new_callable=AsyncMock,
+                side_effect=_reveal_dirty,
+            ) as mock_refresh,
+        ):
+            result = await mgr._merge_single_pr(pr)
+
+        mock_peek.assert_awaited_once()
+        mock_merge.assert_awaited_once()
+        mock_refresh.assert_awaited_once()
+        assert result.status == MergeStatus.FAILED
+        assert result.error == "merge conflicts"
+
+    @pytest.mark.asyncio
+    async def test_successful_merge_peeks_but_skips_poll_refresh(self) -> None:
+        """A clean PR pays only the cheap peek, never the poll refresh."""
+        mgr, _client = make_merge_manager(repo_scoped=True)
+        mgr._post_approval_delay = 0.0
         pr = _make_pr(mergeable=True, mergeable_state="clean")
 
         p1, p2, p3, p4 = self._patches(mgr)
@@ -289,6 +512,12 @@ class TestDispatchRefreshSkipsConflict:
             p2,
             p3,
             p4,
+            patch.object(
+                mgr, "_is_pr_dirty_now", new_callable=AsyncMock, return_value=False
+            ) as mock_peek,
+            patch.object(
+                mgr, "_refresh_pr_mergeability", new_callable=AsyncMock
+            ) as mock_refresh,
             patch.object(
                 mgr,
                 "_merge_pr_with_retry",
@@ -300,11 +529,15 @@ class TestDispatchRefreshSkipsConflict:
 
         assert result.status == MergeStatus.MERGED
         mock_merge.assert_awaited_once()
+        # The bounded single-GET peek runs; the heavier poll refresh
+        # (reserved for the post-failure path) does not.
+        mock_peek.assert_awaited_once()
+        mock_refresh.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_org_scoped_run_does_not_refresh(self) -> None:
-        """Outside repo-scoped mode the dispatch-time refresh is skipped."""
-        mgr, client = make_merge_manager(repo_scoped=False)
+    async def test_org_scope_skips_peek_and_refresh(self) -> None:
+        """Outside repo scope neither the peek nor the refresh runs."""
+        mgr, _client = make_merge_manager(repo_scoped=False)
         mgr._post_approval_delay = 0.0
         pr = _make_pr(mergeable=True, mergeable_state="clean")
 
@@ -315,16 +548,29 @@ class TestDispatchRefreshSkipsConflict:
             p3,
             p4,
             patch.object(
+                mgr, "_is_pr_dirty_now", new_callable=AsyncMock, return_value=False
+            ) as mock_peek,
+            patch.object(
                 mgr, "_refresh_pr_mergeability", new_callable=AsyncMock
             ) as mock_refresh,
             patch.object(
                 mgr,
                 "_merge_pr_with_retry",
                 new_callable=AsyncMock,
-                return_value=True,
+                return_value=False,
             ),
+            patch.object(
+                mgr, "_is_pr_already_merged", new_callable=AsyncMock, return_value=False
+            ),
+            patch.object(
+                mgr, "_report_merge_failure", new_callable=AsyncMock
+            ) as mock_report,
         ):
-            result = await mgr._merge_single_pr(pr)
+            mock_report.return_value = MergeResult(
+                pr_info=pr, status=MergeStatus.FAILED
+            )
+            await mgr._merge_single_pr(pr)
 
-        assert result.status == MergeStatus.MERGED
+        # The repo_scoped gate means org runs never peek or refresh.
+        mock_peek.assert_not_called()
         mock_refresh.assert_not_called()

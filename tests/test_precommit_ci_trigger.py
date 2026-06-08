@@ -212,6 +212,40 @@ class TestStuckPendingRetrigger:
         assert result is False
         client.post_issue_comment.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_naive_timestamp_does_not_crash(self):
+        """A pending status with a tz-naive timestamp degrades, not crashes.
+
+        A timestamp lacking tz info parses to a naive datetime that
+        would raise ``TypeError`` when subtracted from the tz-aware
+        ``now``; the detector must fail closed (return ``False``)
+        rather than abort the merge run.
+        """
+        mgr, client = _make_manager()
+        pr = _make_pr_info()
+
+        client.get_required_status_checks = AsyncMock(
+            return_value=[{"context": "pre-commit.ci - pr"}]
+        )
+        client.get = AsyncMock(
+            return_value={
+                "statuses": [
+                    {
+                        "context": "pre-commit.ci - pr",
+                        "state": "pending",
+                        # No trailing "Z"/offset -> a naive datetime.
+                        "updated_at": "2026-06-08T16:00:00",
+                    }
+                ]
+            }
+        )
+        client.post_issue_comment = AsyncMock()
+
+        result = await mgr._trigger_stale_precommit_ci(pr)
+
+        assert result is False
+        client.post_issue_comment.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # 3. Preview mode -> no comment (guarded at call-site, not inside method,

@@ -356,6 +356,45 @@ class TestDetectStuckDcoCheckRuns:
         assert name is None
 
     @pytest.mark.asyncio
+    async def test_naive_pr_timestamp_does_not_crash(self) -> None:
+        """A tz-naive PR timestamp fails closed instead of crashing.
+
+        ``_parse_ts`` would otherwise return a naive datetime that
+        raises ``TypeError`` when subtracted from the tz-aware ``now``;
+        it must degrade to ``None`` so the detector returns
+        ``(False, None, 0.0)`` rather than aborting the merge run.
+        """
+        mgr, client = _make_manager()
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(seconds=STUCK_CHECK_THRESHOLD_SECONDS + 30)
+        pr = _make_pr_info()
+
+        client.get = AsyncMock(
+            side_effect=_build_get_responder(
+                pr_response={
+                    # No trailing "Z"/offset -> naive datetimes.
+                    "created_at": "2026-06-08T16:00:00",
+                    "updated_at": "2026-06-08T16:00:00",
+                },
+                check_runs_response={
+                    "check_runs": [
+                        {
+                            "name": "DCO",
+                            "status": "in_progress",
+                            "started_at": _iso(old),
+                        }
+                    ],
+                },
+                status_response={"statuses": []},
+            )
+        )
+
+        is_stuck, name, age = await mgr._detect_stuck_required_check(pr)
+        assert is_stuck is False
+        assert name is None
+        assert age == 0.0
+
+    @pytest.mark.asyncio
     async def test_dco_slash_dco_name_variant_matches(self) -> None:
         """The ``dco/dco`` status-context naming is matched."""
         mgr, client = _make_manager()
