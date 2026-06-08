@@ -1329,128 +1329,19 @@ class AsyncMergeManager:
                             level="debug",
                         )
 
-                # Drive the wait loop directly off a monotonic
-                # deadline so the total wait is bounded by
-                # ``merge_timeout`` even if a single iteration
-                # over-sleeps slightly.
-                wait_deadline = asyncio.get_running_loop().time() + self._merge_timeout
-                # Local alias so the type checker can narrow
-                # ``self._github_client`` across the await boundary.
-                wait_client = self._github_client
-                assert wait_client is not None
-                async with self._waiting_lock:
-                    self._waiting_prs[pr_key_for_wait] = wait_deadline
-                # Track whether the PR was closed during the wait
-                # and, if so, whether it was actually merged. The
-                # REST PR payload includes a ``merged`` boolean that
-                # distinguishes auto-merge success from
-                # closed-without-merge (the user closed the PR
-                # while we were waiting, dependabot superseded it,
-                # etc.).
-                closed_during_wait = False
-                merged_during_wait = False
-                try:
-                    while asyncio.get_running_loop().time() < wait_deadline:
-                        if pr_info.mergeable_state == "clean":
-                            break
-                        # Sleep no longer than the time remaining
-                        # so we don't overshoot ``wait_deadline``.
-                        # Clamp to a non-negative value: the loop's
-                        # ``while ... < wait_deadline`` check and the
-                        # ``time()`` call here are not atomic, so a
-                        # near-deadline crossing can produce a tiny
-                        # negative ``remaining`` which would raise
-                        # ``ValueError`` from ``asyncio.sleep``.
-                        remaining = max(
-                            0.0,
-                            wait_deadline - asyncio.get_running_loop().time(),
-                        )
-                        await asyncio.sleep(
-                            min(self._merge_recheck_interval, remaining)
-                        )
-                        try:
-                            refreshed_wait = await wait_client.get(
-                                f"/repos/{repo_owner}/{repo_name}/pulls/"
-                                f"{pr_info.number}"
-                            )
-                        except Exception as wait_exc:
-                            self.log.debug(
-                                "Failed to refresh PR state during auto-merge "
-                                "wait for %s/%s#%s: %s",
-                                repo_owner,
-                                repo_name,
-                                pr_info.number,
-                                wait_exc,
-                            )
-                            continue
-                        if isinstance(refreshed_wait, dict):
-                            # Only overwrite when the keys are present, so a
-                            # partial/empty API response does not blank out
-                            # the existing state. Additionally, preserve the
-                            # previous non-None ``mergeable`` value when the
-                            # refresh returns ``null`` — GitHub returns null
-                            # while still computing the value. The Step 6
-                            # skip gate accepts ``True`` and ``None`` (only
-                            # ``False`` falls through to the manual merge
-                            # attempt), but preserving the prior known
-                            # ``True`` keeps the post-wait state
-                            # informative for downstream logging and any
-                            # future tightening of that predicate.
-                            if "mergeable" in refreshed_wait:
-                                refreshed_mergeable = refreshed_wait.get("mergeable")
-                                if refreshed_mergeable is not None:
-                                    pr_info.mergeable = refreshed_mergeable
-                            if "mergeable_state" in refreshed_wait:
-                                # Preserve the previous non-None
-                                # ``mergeable_state`` for the same
-                                # reason as ``mergeable`` above. The
-                                # subsequent ``not in ("blocked",
-                                # "behind", "unstable")`` check would
-                                # otherwise break the wait loop early
-                                # on a transient ``null`` returned
-                                # while GitHub is still computing.
-                                refreshed_state = refreshed_wait.get("mergeable_state")
-                                if refreshed_state is not None:
-                                    pr_info.mergeable_state = refreshed_state
-                            # Capture the current head SHA so any
-                            # subsequent analyze_block_reason()
-                            # call queries the right commit. The
-                            # head can change while we wait
-                            # (rebase, dependabot force-push, etc.).
-                            refreshed_head = (refreshed_wait.get("head") or {}).get(
-                                "sha"
-                            )
-                            if refreshed_head:
-                                pr_info.head_sha = refreshed_head
-                            if refreshed_wait.get("state") == "closed":
-                                # PR was closed during the wait —
-                                # capture the ``merged`` boolean so
-                                # we can distinguish auto-merge
-                                # success from closed-without-merge.
-                                closed_during_wait = True
-                                merged_during_wait = bool(
-                                    refreshed_wait.get("merged", False)
-                                )
-                                pr_info.state = "closed"
-                                break
-                        # Continue waiting only while the PR is in a
-                        # state that auto-merge can still rescue. The
-                        # set must mirror the ``base_should_wait``
-                        # entry condition above (blocked / behind /
-                        # unstable); any other value means the PR has
-                        # either become mergeable, has been closed,
-                        # or has hit a state Step 5.5 cannot help
-                        # with, so we should exit the wait loop and
-                        # let downstream steps decide.
-                        if pr_info.mergeable_state not in (
-                            "blocked",
-                            "behind",
-                            "unstable",
-                        ):
-                            break
-                finally:
-                    async with self._waiting_lock:
-                        self._waiting_prs.pop(pr_key_for_wait, None)
+                # Wait (bounded by ``merge_timeout``) for required
+                # checks to complete and auto-merge to fire.  The
+                # continue-states mirror the ``base_should_wait`` entry
+                # condition above (blocked / behind / unstable).
+                (
+                    closed_during_wait,
+                    merged_during_wait,
+                ) = await self._wait_for_auto_merge(
+                    pr_info,
+                    repo_owner,
+                    repo_name,
+                    continue_states=("blocked", "behind", "unstable"),
+                )
 
                 # If the wait revealed the PR is already closed,
                 # short-circuit before attempting a manual merge.
@@ -3766,6 +3657,123 @@ class AsyncMergeManager:
                 return
 
             await asyncio.sleep(min(poll_interval, deadline - now))
+
+    async def _wait_for_auto_merge(
+        self,
+        pr_info: PullRequestInfo,
+        owner: str,
+        repo: str,
+        *,
+        continue_states: tuple[str, ...],
+        deadline: float | None = None,
+    ) -> tuple[bool, bool]:
+        """Poll a PR until it merges, closes, settles, or times out.
+
+        Registers ``owner/repo#N`` in ``_waiting_prs`` so the parallel
+        progress ticker can render an aggregate countdown, then polls
+        every ``_merge_recheck_interval`` seconds until one of:
+
+          * ``mergeable_state`` becomes ``clean`` (a mergeable PR;
+            auto-merge will fire / the caller can merge),
+          * the PR closes (capturing the ``merged`` flag so the caller
+            can tell auto-merge success from closed-without-merge),
+          * ``mergeable_state`` leaves ``continue_states`` (the caller
+            decides what the new state means), or
+          * the deadline passes.
+
+        The total wait is bounded by ``merge_timeout`` unless an
+        explicit ``deadline`` is supplied — used to share a single
+        budget across sequential waits (e.g. the rebase-then-checks
+        phases of conflict recovery).
+
+        Mutates ``pr_info`` in place (``mergeable``,
+        ``mergeable_state``, ``head_sha``, ``state``).  Returns
+        ``(closed_during_wait, merged_during_wait)``.
+        """
+        if self._github_client is None:
+            return False, False
+
+        pr_key = f"{owner}/{repo}#{pr_info.number}"
+        loop = asyncio.get_running_loop()
+        # Drive the wait off a monotonic deadline so the total is
+        # bounded even if a single iteration over-sleeps slightly.
+        if deadline is None:
+            deadline = loop.time() + self._merge_timeout
+        # Local alias so the type checker can narrow
+        # ``self._github_client`` across the await boundary.
+        wait_client = self._github_client
+
+        async with self._waiting_lock:
+            self._waiting_prs[pr_key] = deadline
+
+        # Track whether the PR was closed during the wait and, if so,
+        # whether it was actually merged.  The REST payload's
+        # ``merged`` boolean distinguishes auto-merge success from
+        # closed-without-merge (a human closed it, dependabot
+        # superseded it, etc.).
+        closed_during_wait = False
+        merged_during_wait = False
+        try:
+            while loop.time() < deadline:
+                if pr_info.mergeable_state == "clean":
+                    break
+                # Sleep no longer than the time remaining so we don't
+                # overshoot the deadline.  Clamp to non-negative: the
+                # ``while`` check and this ``time()`` call are not
+                # atomic, so a near-deadline crossing could otherwise
+                # pass ``asyncio.sleep`` a tiny negative value.
+                remaining = max(0.0, deadline - loop.time())
+                await asyncio.sleep(min(self._merge_recheck_interval, remaining))
+                try:
+                    refreshed_wait = await wait_client.get(
+                        f"/repos/{owner}/{repo}/pulls/{pr_info.number}"
+                    )
+                except Exception as wait_exc:
+                    self.log.debug(
+                        "Failed to refresh PR state during auto-merge "
+                        "wait for %s: %s",
+                        pr_key,
+                        wait_exc,
+                    )
+                    continue
+                if isinstance(refreshed_wait, dict):
+                    # Only overwrite when present, and preserve the
+                    # previous non-None value when GitHub returns null
+                    # (it does so while recomputing) so the
+                    # ``continue_states`` check below does not break the
+                    # loop early on a transient null.
+                    if "mergeable" in refreshed_wait:
+                        refreshed_mergeable = refreshed_wait.get("mergeable")
+                        if refreshed_mergeable is not None:
+                            pr_info.mergeable = refreshed_mergeable
+                    if "mergeable_state" in refreshed_wait:
+                        refreshed_state = refreshed_wait.get("mergeable_state")
+                        if refreshed_state is not None:
+                            pr_info.mergeable_state = refreshed_state
+                    # The head can change while we wait (rebase,
+                    # force-push); keep it current so any later
+                    # block-reason analysis queries the right commit.
+                    refreshed_head = (refreshed_wait.get("head") or {}).get("sha")
+                    if refreshed_head:
+                        pr_info.head_sha = refreshed_head
+                    if refreshed_wait.get("state") == "closed":
+                        closed_during_wait = True
+                        merged_during_wait = bool(
+                            refreshed_wait.get("merged", False)
+                        )
+                        pr_info.state = "closed"
+                        break
+                # Continue waiting only while the PR is in a state the
+                # caller still considers rescuable; any other value
+                # means it became mergeable, closed, or hit a terminal
+                # state, so exit and let the caller decide.
+                if pr_info.mergeable_state not in continue_states:
+                    break
+        finally:
+            async with self._waiting_lock:
+                self._waiting_prs.pop(pr_key, None)
+
+        return closed_during_wait, merged_during_wait
 
     def _get_failure_summary(self, pr_info: PullRequestInfo) -> str:
         """
