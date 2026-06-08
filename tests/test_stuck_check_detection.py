@@ -25,11 +25,15 @@ Covers:
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from dependamerge.merge_manager import STUCK_CHECK_THRESHOLD_SECONDS
+from dependamerge.merge_manager import (
+    STUCK_CHECK_THRESHOLD_SECONDS,
+    MergeResult,
+    MergeStatus,
+)
 from dependamerge.models import PullRequestInfo
 
 
@@ -464,3 +468,111 @@ class TestDetectStuckDcoRobustness:
         assert is_stuck is False
         assert name is None
         assert age == 0.0
+
+
+def _printed(console_mock) -> str:
+    """Join the positional text of every ``console.print`` call."""
+    return " ".join(
+        str(call.args[0]) for call in console_mock.print.call_args_list if call.args
+    )
+
+
+class TestReportMergeFailure:
+    """Non-dependabot stuck-check reporting in ``_report_merge_failure``."""
+
+    @pytest.mark.asyncio
+    async def test_stuck_check_reports_and_arms_auto_merge(self) -> None:
+        """A stuck check yields the ⚠️ line and arms auto-merge (non-dirty)."""
+        mgr, _client = _make_manager()
+        pr = _make_pr_info(author="someuser", mergeable_state="blocked")
+        result = MergeResult(pr_info=pr, status=MergeStatus.PENDING)
+        with (
+            patch.object(
+                mgr,
+                "_detect_stuck_required_check",
+                new_callable=AsyncMock,
+                return_value=(True, "DCO", 120.0),
+            ),
+            patch.object(
+                mgr,
+                "_enable_auto_merge_for_pr",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_enable,
+            patch.object(mgr, "_console") as mock_console,
+        ):
+            out = await mgr._report_merge_failure(pr, "o", "r", result, "blocked")
+
+        assert out.status == MergeStatus.FAILED
+        assert out.error == "stuck check: DCO"
+        mock_enable.assert_awaited_once()
+        printed = _printed(mock_console)
+        assert "⚠️ Stuck check" in printed
+        # The generic failure line is suppressed for stuck PRs.
+        assert "❌ Failed" not in printed
+
+    @pytest.mark.asyncio
+    async def test_stuck_check_when_dirty_does_not_arm_auto_merge(self) -> None:
+        """A dirty PR cannot take auto-merge, so it is not armed."""
+        mgr, _client = _make_manager()
+        pr = _make_pr_info(author="someuser", mergeable_state="dirty")
+        result = MergeResult(pr_info=pr, status=MergeStatus.PENDING)
+        with (
+            patch.object(
+                mgr,
+                "_detect_stuck_required_check",
+                new_callable=AsyncMock,
+                return_value=(True, "DCO", 120.0),
+            ),
+            patch.object(
+                mgr, "_enable_auto_merge_for_pr", new_callable=AsyncMock
+            ) as mock_enable,
+            patch.object(mgr, "_console"),
+        ):
+            out = await mgr._report_merge_failure(
+                pr, "o", "r", result, "merge conflicts"
+            )
+
+        assert out.status == MergeStatus.FAILED
+        mock_enable.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_stuck_check_emits_generic_failure(self) -> None:
+        mgr, _client = _make_manager()
+        pr = _make_pr_info(author="someuser")
+        result = MergeResult(pr_info=pr, status=MergeStatus.PENDING)
+        with (
+            patch.object(
+                mgr,
+                "_detect_stuck_required_check",
+                new_callable=AsyncMock,
+                return_value=(False, None, 0.0),
+            ),
+            patch.object(mgr, "_console") as mock_console,
+        ):
+            out = await mgr._report_merge_failure(
+                pr, "o", "r", result, "branch protection rules prevent merge"
+            )
+
+        assert out.status == MergeStatus.FAILED
+        assert out.error == "Failed to merge after all retry attempts"
+        printed = _printed(mock_console)
+        assert "❌ Failed" in printed
+        assert "branch protection" in printed
+
+    @pytest.mark.asyncio
+    async def test_dependabot_skips_stuck_detection(self) -> None:
+        """For dependabot the recreate path handles stuck checks, not here."""
+        mgr, _client = _make_manager()
+        pr = _make_pr_info(author="dependabot[bot]")
+        result = MergeResult(pr_info=pr, status=MergeStatus.PENDING)
+        with (
+            patch.object(
+                mgr, "_detect_stuck_required_check", new_callable=AsyncMock
+            ) as mock_detect,
+            patch.object(mgr, "_console"),
+        ):
+            out = await mgr._report_merge_failure(pr, "o", "r", result, "blocked")
+
+        assert out.status == MergeStatus.FAILED
+        mock_detect.assert_not_called()

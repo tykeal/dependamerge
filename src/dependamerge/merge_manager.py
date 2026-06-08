@@ -1768,12 +1768,12 @@ class AsyncMergeManager:
                                 "[recreated PR merge failed]"
                             )
                     else:
-                        result.status = MergeStatus.FAILED
-                        result.error = "Failed to merge after all retry attempts"
-                        if self.progress_tracker:
-                            self.progress_tracker.merge_failure()
-                        self._console.print(
-                            f"❌ Failed: {pr_info.html_url} [{failure_reason}]"
+                        await self._report_merge_failure(
+                            pr_info,
+                            repo_owner,
+                            repo_name,
+                            result,
+                            failure_reason,
                         )
 
         except GitHubPermissionError as e:
@@ -4077,6 +4077,71 @@ class AsyncMergeManager:
             f"⏳ Waiting: {pr_info.html_url} [auto-merge after rebase]",
             level="debug",
         )
+        return result
+
+    async def _report_merge_failure(
+        self,
+        pr_info: PullRequestInfo,
+        owner: str,
+        repo: str,
+        result: MergeResult,
+        failure_reason: str,
+    ) -> MergeResult:
+        """Report a failed merge, upgrading to a stuck-check cause if found.
+
+        Called when ``_merge_pr_with_retry`` failed and no dependabot
+        recreate produced a replacement PR.  For a non-dependabot PR
+        we check whether a required check is stuck (Option A): if so,
+        print ``⚠️ Stuck check`` and arm auto-merge (when the PR is
+        otherwise mergeable) so it lands once the check is
+        re-triggered, without a force-push that would break this org's
+        self-merge rule.  Otherwise emit the generic failure line.
+
+        Sets ``result`` to ``FAILED`` and returns it.
+        """
+        stuck_reported = False
+        if pr_info.author != "dependabot[bot]" and not self.preview_mode:
+            try:
+                (
+                    is_stuck,
+                    stuck_check,
+                    _stuck_age,
+                ) = await self._detect_stuck_required_check(pr_info)
+            except Exception as exc:
+                self.log.debug(
+                    "_detect_stuck_required_check failed for %s#%s: %s",
+                    pr_info.repository_full_name,
+                    pr_info.number,
+                    exc,
+                )
+                is_stuck = False
+                stuck_check = None
+            if is_stuck:
+                # markup=False: a check name may contain characters
+                # Rich would otherwise treat as markup.
+                self._console.print(
+                    f"⚠️ Stuck check: {pr_info.html_url} [{stuck_check}]",
+                    markup=False,
+                )
+                # Arm auto-merge when the PR is otherwise mergeable
+                # (not dirty) so it lands automatically once the stuck
+                # check is re-triggered, without a second review round.
+                if pr_info.mergeable_state != "dirty":
+                    await self._enable_auto_merge_for_pr(pr_info, owner, repo)
+                result.error = f"stuck check: {stuck_check}"
+                stuck_reported = True
+
+        result.status = MergeStatus.FAILED
+        if not stuck_reported:
+            result.error = "Failed to merge after all retry attempts"
+        if self.progress_tracker:
+            self.progress_tracker.merge_failure()
+        # The ``⚠️ Stuck check`` line above is the cause for stuck PRs;
+        # only emit the generic failure line otherwise.
+        if not stuck_reported:
+            self._console.print(
+                f"❌ Failed: {pr_info.html_url} [{failure_reason}]"
+            )
         return result
 
     def _get_failure_summary(self, pr_info: PullRequestInfo) -> str:
