@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -907,28 +908,49 @@ def _execute_confirmed_merge(
 
 
 def _format_failure_reason(reason: str) -> list[str]:
-    """Expand a failure reason into display lines.
+    """Expand a failure reason into consistent display lines.
 
-    A repository-ruleset "required workflows" violation is rendered as
-    a header plus a bulleted list of the offending workflows (the raw
-    GitHub message crams them into one long quoted, comma-separated
-    string).  Every other reason is returned unchanged as a single
-    line.
+    Failures are rendered in a consistent shape so the final summary is
+    actionable at a glance:
+
+      1. the failed PR URL (prepended by the caller),
+      2. a single **failure-type** line whose parts are joined with
+         `` / `` and carry no trailing colon, e.g.
+         ``Repository rule violations found / Required workflows failed``,
+      3. one bullet (``• ``) per individual failing condition.
+
+    Repository-ruleset violations arrive from GitHub as one long string
+    that crams the offending workflow / status-check names into a
+    quoted, comma-separated clause.  We split that into the type line
+    plus a bullet per name for both the ``Required workflows`` and
+    ``Required status check(s)`` variants.  Reasons we do not recognise
+    are returned unchanged as a single line.
     """
-    marker = "Required workflows "
-    if "Repository rule violations found" in reason and marker in reason:
-        after_marker = reason.split(marker, 1)[1]
-        if "'" in after_marker:
-            # ``'A, B, C' are not satisfied`` -> names, then verb.
-            _, _, after_first = after_marker.partition("'")
-            quoted, _, rest = after_first.partition("'")
-            workflows = [w.strip() for w in quoted.split(",") if w.strip()]
-            verb = "failed:" if "fail" in rest.lower() else "not satisfied:"
-            if workflows:
+    ruleset = "Repository rule violations found"
+    if ruleset in reason:
+        # Required workflows: ``Required workflows 'A, B' are not satisfied``
+        wf_marker = "Required workflows "
+        if wf_marker in reason:
+            after_marker = reason.split(wf_marker, 1)[1]
+            if "'" in after_marker:
+                # ``'A, B, C' are not satisfied`` -> names, then verb.
+                _, _, after_first = after_marker.partition("'")
+                quoted, _, rest = after_first.partition("'")
+                workflows = [w.strip() for w in quoted.split(",") if w.strip()]
+                verb = "failed" if "fail" in rest.lower() else "not satisfied"
+                if workflows:
+                    return [
+                        f"{ruleset} / Required workflows {verb}",
+                        *(f"• {name}" for name in workflows),
+                    ]
+        # Required status check(s): ``Required status check "X" is failing.``
+        if "Required status check" in reason:
+            checks = [c.strip() for c in re.findall(r'"([^"]+)"', reason) if c.strip()]
+            verb = "failed" if "fail" in reason.lower() else "not satisfied"
+            if checks:
                 return [
-                    "Repository rule violations found",
-                    f"Required workflows {verb}",
-                    *(f"• {name}" for name in workflows),
+                    f"{ruleset} / Required status checks {verb}",
+                    *(f"• {name}" for name in checks),
                 ]
     return [reason]
 

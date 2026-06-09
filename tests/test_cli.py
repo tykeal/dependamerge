@@ -758,8 +758,7 @@ class TestFormatFailureReason:
             "Audit GitHub Actions 📌' are not satisfied"
         )
         assert _format_failure_reason(reason) == [
-            "Repository rule violations found",
-            "Required workflows not satisfied:",
+            "Repository rule violations found / Required workflows not satisfied",
             "• Autolabeler",
             "• Semantic Pull Request 🛠️",
             "• Audit GitHub Actions 📌",
@@ -770,9 +769,43 @@ class TestFormatFailureReason:
             "Repository rule violations found Required workflows 'Autolabeler' failed"
         )
         assert _format_failure_reason(reason) == [
-            "Repository rule violations found",
-            "Required workflows failed:",
+            "Repository rule violations found / Required workflows failed",
             "• Autolabeler",
+        ]
+
+    def test_ruleset_status_check_failing_is_expanded(self):
+        # Single-line GitHub status-check violation -> type line + bullet,
+        # consistent with the Required workflows shape.
+        reason = (
+            "Repository rule violations found Required status check "
+            '"pre-commit.ci - pr" is failing.'
+        )
+        assert _format_failure_reason(reason) == [
+            "Repository rule violations found / Required status checks failed",
+            "• pre-commit.ci - pr",
+        ]
+
+    def test_ruleset_status_check_multiple_names(self):
+        reason = (
+            "Repository rule violations found Required status checks "
+            '"lint", "build" are failing.'
+        )
+        assert _format_failure_reason(reason) == [
+            "Repository rule violations found / Required status checks failed",
+            "• lint",
+            "• build",
+        ]
+
+    def test_ruleset_status_check_not_satisfied_variant(self):
+        # A pending/expected (non-failing) required check uses the
+        # "not satisfied" verb rather than "failed".
+        reason = (
+            "Repository rule violations found Required status check "
+            '"pre-commit.ci - pr" is expected.'
+        )
+        assert _format_failure_reason(reason) == [
+            "Repository rule violations found / Required status checks not satisfied",
+            "• pre-commit.ci - pr",
         ]
 
     def test_non_ruleset_message_left_alone(self):
