@@ -1290,10 +1290,28 @@ class AsyncMergeManager:
             # them.
             pr_key_for_wait = f"{repo_owner}/{repo_name}#{pr_info.number}"
             already_rebased = pr_key_for_wait in self._rebased_prs
+            # ``unstable`` means a non-required check is failing or
+            # pending but the PR is otherwise mergeable.  When GitHub
+            # also reports ``mergeable is True`` the green button is
+            # live and a direct merge succeeds *now*, so entering the
+            # auto-merge wait would be pure waste: the state never
+            # reaches ``clean`` (the non-required check stays red, e.g.
+            # an excluded Zizmor scan), so the loop burns the full
+            # ``merge_timeout``; and ``enablePullRequestAutoMerge``
+            # is rejected outright on an already-mergeable PR, so the
+            # wait isn't even backed by auto-merge.  Route those
+            # straight to the Step 6 direct merge.  We still wait on
+            # ``unstable`` when ``mergeable`` is not literally True
+            # (GitHub still computing the value, or a required check
+            # transiently failing) so a genuinely not-yet-ready PR is
+            # not merged prematurely.
+            state_is_waitable = pr_info.mergeable_state in ("blocked", "behind") or (
+                pr_info.mergeable_state == "unstable" and pr_info.mergeable is not True
+            )
             base_should_wait = (
                 not self.preview_mode
                 and self._github_client is not None
-                and pr_info.mergeable_state in ("blocked", "behind", "unstable")
+                and state_is_waitable
                 and self.force_level != "all"
                 and not already_rebased
             )

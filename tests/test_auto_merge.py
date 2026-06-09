@@ -1195,6 +1195,107 @@ class TestStep5_5UnstableRoutesToAutoMerge:
         mock_merge_retry.assert_not_called()
 
 
+class TestStep5_5UnstableMergeableMergesDirectly:
+    """``unstable`` + ``mergeable is True`` merges directly (no wait).
+
+    Regression guard for the slow/silent hang observed on
+    ``test-tags-calver#27`` / ``test-tags-semantic#27``: once a
+    non-required check (e.g. an excluded Zizmor scan) is the only
+    failing gate, GitHub reports ``mergeable_state == "unstable"`` *and*
+    ``mergeable is True`` — the green button is live.  Routing such a PR
+    into the Step 5.5 auto-merge wait was pure waste: the state never
+    reaches ``clean`` (the non-required check stays red), so the loop
+    burned the full ``merge_timeout``, and ``enablePullRequestAutoMerge``
+    is rejected on an already-mergeable PR anyway.  The PR must instead
+    flow straight to the Step 6 direct merge.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unstable_mergeable_true_merges_directly(self) -> None:
+        """unstable + mergeable=True → MERGED via direct merge, no wait."""
+        # A long timeout makes the test fail loudly (hang) if the PR is
+        # wrongly routed into the wait loop instead of merging directly.
+        mgr, client = make_merge_manager(preview_mode=False, merge_timeout=30.0)
+        pr = _DEFAULT_PR.model_copy(
+            update={
+                "mergeable_state": "unstable",
+                "mergeable": True,
+                "state": "open",
+            }
+        )
+
+        # If these are reached the fix has regressed: an already-mergeable
+        # unstable PR must neither enable auto-merge nor enter the wait.
+        client.enable_auto_merge = AsyncMock(return_value=True)
+        client.post_issue_comment = AsyncMock()
+        client.get = AsyncMock(
+            return_value={
+                "mergeable": True,
+                "mergeable_state": "unstable",
+                "state": "open",
+            }
+        )
+        client.get_required_status_checks = AsyncMock(return_value=[])
+        client.analyze_block_reason = AsyncMock(
+            return_value="a non-required check failed"
+        )
+
+        no_g2g = GitHub2GerritDetectionResult()
+        with (
+            patch.object(
+                mgr,
+                "_detect_github2gerrit",
+                new_callable=AsyncMock,
+                return_value=no_g2g,
+            ),
+            patch.object(
+                mgr,
+                "_get_merge_method_for_repo",
+                new_callable=AsyncMock,
+                return_value="merge",
+            ),
+            patch.object(
+                mgr,
+                "_trigger_stale_precommit_ci",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                mgr,
+                "_check_merge_requirements",
+                new_callable=AsyncMock,
+                return_value=(True, ""),
+            ),
+            patch.object(
+                mgr,
+                "_approve_pr",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                mgr,
+                "_merge_pr_with_retry",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_merge_retry,
+            patch.object(
+                mgr,
+                "_wait_for_auto_merge",
+                new_callable=AsyncMock,
+                return_value=(False, False),
+            ) as mock_wait,
+        ):
+            result = await mgr._merge_single_pr(pr)
+
+        # Direct merge ran and succeeded; the auto-merge wait was never
+        # entered and auto-merge was never enabled.
+        assert result.status == MergeStatus.MERGED
+        mock_merge_retry.assert_awaited_once()
+        mock_wait.assert_not_called()
+        client.enable_auto_merge.assert_not_awaited()
+        assert "owner/repo#42" not in mgr._auto_merge_enabled
+
+
 # ---------------------------------------------------------------------------
 # 20. ``dirty`` PRs are still blocked (genuine merge conflict invariant)
 # ---------------------------------------------------------------------------
