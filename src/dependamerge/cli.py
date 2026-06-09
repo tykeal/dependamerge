@@ -783,6 +783,34 @@ def _run_parallel_merge(
     return asyncio.run(_do_merge())
 
 
+def _restart_merge_progress_tracker(ctx: _MergeContext, total_prs: int) -> None:
+    """Stand up a fresh, started progress tracker for the merge phase.
+
+    The org-wide scan (``_scan_and_find_similar``) calls ``stop()`` on
+    the tracker it used, tearing down its Rich ``Live`` and leaving
+    ``ctx.progress_tracker`` in a stopped state.  Reusing that stopped
+    tracker for the real merge means the background wait-status ticker
+    pushes ``update_operation`` calls into a dead ``Live`` — silently
+    dropped by ``ProgressTracker._refresh_display`` — so the user sees
+    no countdown while PRs sit in the Step 5.5 auto-merge wait.
+
+    Mirror the repo-scoped path (``_handle_repo_merge`` /
+    ``_execute_repo_confirmed_merge``) by replacing the tracker with a
+    fresh one dedicated to the merge phase and starting it.  No-op when
+    progress display is disabled (``--no-progress``), where the plain
+    text ticker already provides feedback.
+    """
+    if not ctx.show_progress:
+        return
+    ctx.progress_tracker = MergeProgressTracker(
+        ctx.owner,
+        operation_label="Merging PRs",
+        operation_icon="🔀",
+    )
+    ctx.progress_tracker.set_total_prs(total_prs)
+    ctx.progress_tracker.start()
+
+
 def _handle_preview_confirmation(
     ctx: _MergeContext,
     merge_results: list[MergeResult],
@@ -847,7 +875,12 @@ def _execute_confirmed_merge(
     merged_count = len(mergeable_prs)
     console.print(f"\n🔨 Merging {merged_count} mergeable pull requests...")
 
-    real_results = _run_parallel_merge(ctx, mergeable_prs, preview=False)
+    _restart_merge_progress_tracker(ctx, merged_count)
+    try:
+        real_results = _run_parallel_merge(ctx, mergeable_prs, preview=False)
+    finally:
+        if ctx.show_progress and ctx.progress_tracker:
+            ctx.progress_tracker.stop()
 
     final_merged = sum(1 for r in real_results if r.status.value == "merged")
     final_failed = sum(1 for r in real_results if r.status.value == "failed")
@@ -917,9 +950,7 @@ def _print_failed_pr_details(
     for r in failed:
         url = getattr(r.pr_info, "html_url", "<unknown>")
         reason = r.error or "no reason reported"
-        body = "\n".join(
-            f"     {line}" for line in _format_failure_reason(reason)
-        )
+        body = "\n".join(f"     {line}" for line in _format_failure_reason(reason))
         # markup=False so bracketed reasons are not eaten by Rich.
         console.print(f"   • {url}\n{body}", markup=False)
 
@@ -1855,14 +1886,25 @@ def merge(
             *ctx.all_similar_prs,
             source_entry,
         ]
-        merge_results = _run_parallel_merge(
-            ctx,
-            all_prs_to_merge,
-            preview=not ctx.no_confirm,
-            # No similar-PR list was printed when none were found, so
-            # skip the blank line before the merge banner.
-            leading_blank=bool(ctx.all_similar_prs),
-        )
+        # For the real merge (``--no-confirm``) the scan has already
+        # stopped the progress tracker; stand up a fresh one so the
+        # background wait-status ticker has a live display to update
+        # while PRs sit in the Step 5.5 auto-merge wait.  Preview runs
+        # keep the stopped tracker (one line per PR, no wait loop).
+        if ctx.no_confirm:
+            _restart_merge_progress_tracker(ctx, len(all_prs_to_merge))
+        try:
+            merge_results = _run_parallel_merge(
+                ctx,
+                all_prs_to_merge,
+                preview=not ctx.no_confirm,
+                # No similar-PR list was printed when none were found, so
+                # skip the blank line before the merge banner.
+                leading_blank=bool(ctx.all_similar_prs),
+            )
+        finally:
+            if ctx.no_confirm and ctx.show_progress and ctx.progress_tracker:
+                ctx.progress_tracker.stop()
 
         # Process and display results
         if not merge_results:
