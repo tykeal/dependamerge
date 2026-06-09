@@ -805,7 +805,7 @@ def _restart_merge_progress_tracker(ctx: _MergeContext, total_prs: int) -> None:
     ctx.progress_tracker = MergeProgressTracker(
         ctx.owner,
         operation_label="Merging PRs",
-        operation_icon="🔀",
+        operation_icon="▶️",
     )
     ctx.progress_tracker.set_total_prs(total_prs)
     ctx.progress_tracker.start()
@@ -1146,7 +1146,7 @@ def _handle_repo_merge(
         ctx.progress_tracker = MergeProgressTracker(
             f"{ctx.owner}/{ctx.repo_name}",
             operation_label="Merging PRs",
-            operation_icon="🔀",
+            operation_icon="▶️",
         )
         ctx.progress_tracker.set_total_prs(len(all_prs_to_merge))
         ctx.progress_tracker.start()
@@ -1259,7 +1259,7 @@ def _execute_repo_confirmed_merge(
         ctx.progress_tracker = MergeProgressTracker(
             f"{ctx.owner}/{ctx.repo_name}",
             operation_label="Merging PRs",
-            operation_icon="🔀",
+            operation_icon="▶️",
         )
         ctx.progress_tracker.set_total_prs(len(mergeable_prs))
         ctx.progress_tracker.start()
