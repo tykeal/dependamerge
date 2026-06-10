@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -727,6 +728,7 @@ def _run_parallel_merge(
     preview: bool,
     concurrency: int = 10,
     leading_blank: bool = True,
+    repo_scoped: bool = False,
 ) -> list[MergeResult]:
     """Execute a parallel merge (preview or real) and return results.
 
@@ -747,6 +749,11 @@ def _run_parallel_merge(
             preceding similar-PR list.  Callers pass False when no
             list was printed (e.g. no similar PRs were found) so the
             output stays compact.
+        repo_scoped: When True, all PRs target a single repository, so
+            each worker refreshes its PR's live merge state just before
+            dispatching the merge (a sibling merge can make a PR
+            ``dirty`` / ``behind`` mid-batch).  Left False for org-wide
+            runs.  See ``AsyncMergeManager._refresh_pr_mergeability``.
     """
 
     async def _do_merge():
@@ -765,6 +772,7 @@ def _run_parallel_merge(
             no_netrc=ctx.no_netrc,
             netrc_file=ctx.netrc_file,
             rebase_local=ctx.rebase_local,
+            repo_scoped=repo_scoped,
         ) as merge_manager:
             if not preview:
                 prefix = "\n" if leading_blank else ""
@@ -774,6 +782,34 @@ def _run_parallel_merge(
             return await merge_manager.merge_prs_parallel(prs_to_merge)
 
     return asyncio.run(_do_merge())
+
+
+def _restart_merge_progress_tracker(ctx: _MergeContext, total_prs: int) -> None:
+    """Stand up a fresh, started progress tracker for the merge phase.
+
+    The org-wide scan (``_scan_and_find_similar``) calls ``stop()`` on
+    the tracker it used, tearing down its Rich ``Live`` and leaving
+    ``ctx.progress_tracker`` in a stopped state.  Reusing that stopped
+    tracker for the real merge means the background wait-status ticker
+    pushes ``update_operation`` calls into a dead ``Live`` — silently
+    dropped by ``ProgressTracker._refresh_display`` — so the user sees
+    no countdown while PRs sit in the Step 5.5 auto-merge wait.
+
+    Mirror the repo-scoped path (``_handle_repo_merge`` /
+    ``_execute_repo_confirmed_merge``) by replacing the tracker with a
+    fresh one dedicated to the merge phase and starting it.  No-op when
+    progress display is disabled (``--no-progress``), where the plain
+    text ticker already provides feedback.
+    """
+    if not ctx.show_progress:
+        return
+    ctx.progress_tracker = MergeProgressTracker(
+        ctx.owner,
+        operation_label="Merging PRs",
+        operation_icon="▶️",
+    )
+    ctx.progress_tracker.set_total_prs(total_prs)
+    ctx.progress_tracker.start()
 
 
 def _handle_preview_confirmation(
@@ -840,7 +876,12 @@ def _execute_confirmed_merge(
     merged_count = len(mergeable_prs)
     console.print(f"\n🔨 Merging {merged_count} mergeable pull requests...")
 
-    real_results = _run_parallel_merge(ctx, mergeable_prs, preview=False)
+    _restart_merge_progress_tracker(ctx, merged_count)
+    try:
+        real_results = _run_parallel_merge(ctx, mergeable_prs, preview=False)
+    finally:
+        if ctx.show_progress and ctx.progress_tracker:
+            ctx.progress_tracker.stop()
 
     final_merged = sum(1 for r in real_results if r.status.value == "merged")
     final_failed = sum(1 for r in real_results if r.status.value == "failed")
@@ -866,6 +907,54 @@ def _execute_confirmed_merge(
     _print_failed_pr_details(real_results)
 
 
+def _format_failure_reason(reason: str) -> list[str]:
+    """Expand a failure reason into consistent display lines.
+
+    Failures are rendered in a consistent shape so the final summary is
+    actionable at a glance:
+
+      1. the failed PR URL (prepended by the caller),
+      2. a single **failure-type** line whose parts are joined with
+         `` / `` and carry no trailing colon, e.g.
+         ``Repository rule violations found / Required workflows failed``,
+      3. one bullet (``• ``) per individual failing condition.
+
+    Repository-ruleset violations arrive from GitHub as one long string
+    that crams the offending workflow / status-check names into a
+    quoted, comma-separated clause.  We split that into the type line
+    plus a bullet per name for both the ``Required workflows`` and
+    ``Required status check(s)`` variants.  Reasons we do not recognise
+    are returned unchanged as a single line.
+    """
+    ruleset = "Repository rule violations found"
+    if ruleset in reason:
+        # Required workflows: ``Required workflows 'A, B' are not satisfied``
+        wf_marker = "Required workflows "
+        if wf_marker in reason:
+            after_marker = reason.split(wf_marker, 1)[1]
+            if "'" in after_marker:
+                # ``'A, B, C' are not satisfied`` -> names, then verb.
+                _, _, after_first = after_marker.partition("'")
+                quoted, _, rest = after_first.partition("'")
+                workflows = [w.strip() for w in quoted.split(",") if w.strip()]
+                verb = "failed" if "fail" in rest.lower() else "not satisfied"
+                if workflows:
+                    return [
+                        f"{ruleset} / Required workflows {verb}",
+                        *(f"• {name}" for name in workflows),
+                    ]
+        # Required status check(s): ``Required status check "X" is failing.``
+        if "Required status check" in reason:
+            checks = [c.strip() for c in re.findall(r'"([^"]+)"', reason) if c.strip()]
+            verb = "failed" if "fail" in reason.lower() else "not satisfied"
+            if checks:
+                return [
+                    f"{ruleset} / Required status checks {verb}",
+                    *(f"• {name}" for name in checks),
+                ]
+    return [reason]
+
+
 def _print_failed_pr_details(
     merge_results: list[MergeResult],
 ) -> None:
@@ -883,7 +972,9 @@ def _print_failed_pr_details(
     for r in failed:
         url = getattr(r.pr_info, "html_url", "<unknown>")
         reason = r.error or "no reason reported"
-        console.print(f"   • {url}\n     {reason}")
+        body = "\n".join(f"     {line}" for line in _format_failure_reason(reason))
+        # markup=False so bracketed reasons are not eaten by Rich.
+        console.print(f"   • {url}\n{body}", markup=False)
 
 
 def _display_merge_results(
@@ -1077,7 +1168,7 @@ def _handle_repo_merge(
         ctx.progress_tracker = MergeProgressTracker(
             f"{ctx.owner}/{ctx.repo_name}",
             operation_label="Merging PRs",
-            operation_icon="🔀",
+            operation_icon="▶️",
         )
         ctx.progress_tracker.set_total_prs(len(all_prs_to_merge))
         ctx.progress_tracker.start()
@@ -1100,6 +1191,10 @@ def _handle_repo_merge(
             # PRs in the batch.  Cap by PR count so we don't spawn
             # more workers than there is work.
             concurrency=min(5, len(all_prs_to_merge)) or 1,
+            # All PRs target the same repo, so a sibling merge can make
+            # a queued PR ``dirty`` / ``behind`` mid-batch; refresh
+            # live state before each merge dispatch.
+            repo_scoped=True,
         )
     finally:
         if ctx.show_progress and ctx.progress_tracker:
@@ -1186,7 +1281,7 @@ def _execute_repo_confirmed_merge(
         ctx.progress_tracker = MergeProgressTracker(
             f"{ctx.owner}/{ctx.repo_name}",
             operation_label="Merging PRs",
-            operation_icon="🔀",
+            operation_icon="▶️",
         )
         ctx.progress_tracker.set_total_prs(len(mergeable_prs))
         ctx.progress_tracker.start()
@@ -1199,6 +1294,9 @@ def _execute_repo_confirmed_merge(
             # Per-repo merge dispatch lock makes parallel workers
             # safe; cap by PR count.
             concurrency=min(5, len(mergeable_prs)) or 1,
+            # Single-repo batch — refresh live merge state before each
+            # dispatch (a sibling merge can introduce a conflict).
+            repo_scoped=True,
         )
     finally:
         if ctx.show_progress and ctx.progress_tracker:
@@ -1810,14 +1908,25 @@ def merge(
             *ctx.all_similar_prs,
             source_entry,
         ]
-        merge_results = _run_parallel_merge(
-            ctx,
-            all_prs_to_merge,
-            preview=not ctx.no_confirm,
-            # No similar-PR list was printed when none were found, so
-            # skip the blank line before the merge banner.
-            leading_blank=bool(ctx.all_similar_prs),
-        )
+        # For the real merge (``--no-confirm``) the scan has already
+        # stopped the progress tracker; stand up a fresh one so the
+        # background wait-status ticker has a live display to update
+        # while PRs sit in the Step 5.5 auto-merge wait.  Preview runs
+        # keep the stopped tracker (one line per PR, no wait loop).
+        if ctx.no_confirm:
+            _restart_merge_progress_tracker(ctx, len(all_prs_to_merge))
+        try:
+            merge_results = _run_parallel_merge(
+                ctx,
+                all_prs_to_merge,
+                preview=not ctx.no_confirm,
+                # No similar-PR list was printed when none were found, so
+                # skip the blank line before the merge banner.
+                leading_blank=bool(ctx.all_similar_prs),
+            )
+        finally:
+            if ctx.no_confirm and ctx.show_progress and ctx.progress_tracker:
+                ctx.progress_tracker.stop()
 
         # Process and display results
         if not merge_results:

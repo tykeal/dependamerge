@@ -7,7 +7,14 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from typer.testing import CliRunner
 
-from dependamerge.cli import _generate_override_sha, _validate_override_sha, app
+from dependamerge.cli import (
+    _format_failure_reason,
+    _generate_override_sha,
+    _MergeContext,
+    _restart_merge_progress_tracker,
+    _validate_override_sha,
+    app,
+)
 from dependamerge.models import PullRequestInfo
 
 
@@ -736,3 +743,146 @@ class TestCLI:
         assert result.exit_code == 0
         assert "not from a recognized automation tool" in result.stdout
         assert "--override" in result.stdout
+
+
+class TestFormatFailureReason:
+    """Tests for the failed-PR summary reason formatter."""
+
+    def test_plain_reason_is_unchanged(self):
+        assert _format_failure_reason("merge conflicts") == ["merge conflicts"]
+
+    def test_ruleset_not_satisfied_is_expanded(self):
+        reason = (
+            "Repository rule violations found Required workflows "
+            "'Autolabeler, Semantic Pull Request 🛠️, "
+            "Audit GitHub Actions 📌' are not satisfied"
+        )
+        assert _format_failure_reason(reason) == [
+            "Repository rule violations found / Required workflows not satisfied",
+            "• Autolabeler",
+            "• Semantic Pull Request 🛠️",
+            "• Audit GitHub Actions 📌",
+        ]
+
+    def test_ruleset_failed_variant_uses_failed_header(self):
+        reason = (
+            "Repository rule violations found Required workflows 'Autolabeler' failed"
+        )
+        assert _format_failure_reason(reason) == [
+            "Repository rule violations found / Required workflows failed",
+            "• Autolabeler",
+        ]
+
+    def test_ruleset_status_check_failing_is_expanded(self):
+        # Single-line GitHub status-check violation -> type line + bullet,
+        # consistent with the Required workflows shape.
+        reason = (
+            "Repository rule violations found Required status check "
+            '"pre-commit.ci - pr" is failing.'
+        )
+        assert _format_failure_reason(reason) == [
+            "Repository rule violations found / Required status checks failed",
+            "• pre-commit.ci - pr",
+        ]
+
+    def test_ruleset_status_check_multiple_names(self):
+        reason = (
+            "Repository rule violations found Required status checks "
+            '"lint", "build" are failing.'
+        )
+        assert _format_failure_reason(reason) == [
+            "Repository rule violations found / Required status checks failed",
+            "• lint",
+            "• build",
+        ]
+
+    def test_ruleset_status_check_not_satisfied_variant(self):
+        # A pending/expected (non-failing) required check uses the
+        # "not satisfied" verb rather than "failed".
+        reason = (
+            "Repository rule violations found Required status check "
+            '"pre-commit.ci - pr" is expected.'
+        )
+        assert _format_failure_reason(reason) == [
+            "Repository rule violations found / Required status checks not satisfied",
+            "• pre-commit.ci - pr",
+        ]
+
+    def test_non_ruleset_message_left_alone(self):
+        # Without the ruleset prefix, leave the reason unchanged.
+        reason = "Required workflows 'X' are not satisfied"
+        assert _format_failure_reason(reason) == [reason]
+
+
+def _make_merge_context(show_progress: bool) -> _MergeContext:
+    """Build a minimal ``_MergeContext`` for tracker-lifecycle tests."""
+    ctx = _MergeContext(
+        pr_url="https://github.com/owner/repo/pull/1",
+        no_confirm=True,
+        similarity_threshold=0.8,
+        merge_method="merge",
+        token="fake-token",
+        override=None,
+        no_fix=False,
+        merge_timeout=300.0,
+        show_progress=show_progress,
+        debug_matching=False,
+        dismiss_copilot=False,
+        force="none",
+        verbose=False,
+        no_netrc=False,
+        netrc_file=None,
+        netrc_optional=True,
+        github2gerrit_mode="ignore",
+    )
+    ctx.owner = "owner"
+    ctx.repo_name = "repo"
+    return ctx
+
+
+class TestRestartMergeProgressTracker:
+    """``_restart_merge_progress_tracker`` revives the merge-phase display.
+
+    The org-wide scan stops the tracker it used (tearing down its Rich
+    ``Live``).  Reusing that stopped tracker for the real merge means
+    the background wait-status ticker pushes updates into a dead
+    ``Live`` — silently dropped — so the user sees no countdown while
+    PRs sit in the Step 5.5 auto-merge wait.  This helper must stand up
+    a fresh, *started* tracker so the ticker has somewhere to render.
+    """
+
+    def test_replaces_stopped_tracker_with_started_one(self) -> None:
+        from dependamerge.progress_tracker import MergeProgressTracker
+
+        ctx = _make_merge_context(show_progress=True)
+        # Simulate the post-scan state: a tracker that has been stopped
+        # (its Live torn down -> ``live is None``).
+        stopped = MergeProgressTracker("owner")
+        stopped.start()
+        stopped.stop()
+        assert stopped.live is None
+        ctx.progress_tracker = stopped
+
+        _restart_merge_progress_tracker(ctx, total_prs=3)
+
+        # A brand-new tracker is installed and started.
+        assert ctx.progress_tracker is not stopped
+        assert ctx.progress_tracker is not None
+        assert ctx.progress_tracker.total_prs == 3
+        # When Rich is available the Live display is active again; when
+        # it is not (e.g. non-TTY CI), ``start()`` is a no-op and there
+        # is nothing to assert about ``live``.
+        if ctx.progress_tracker.rich_available:
+            assert ctx.progress_tracker.live is not None
+            # Avoid leaking an active Rich Live into other tests.
+            ctx.progress_tracker.stop()
+
+    def test_no_op_when_progress_disabled(self) -> None:
+        ctx = _make_merge_context(show_progress=False)
+        ctx.progress_tracker = None
+
+        _restart_merge_progress_tracker(ctx, total_prs=5)
+
+        # ``--no-progress`` keeps the tracker absent; the plain-text
+        # ticker provides feedback instead.
+        assert ctx.progress_tracker is None

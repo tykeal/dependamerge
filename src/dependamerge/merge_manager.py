@@ -53,6 +53,16 @@ from .progress_tracker import MergeProgressTracker
 DEFAULT_MERGE_TIMEOUT: float = 300.0  # seconds (5 minutes)
 DEFAULT_MERGE_RECHECK_INTERVAL: float = 10.0  # seconds between polls
 
+# After a sibling PR merges (or a concurrent dependamerge run lands a
+# change), GitHub recomputes a PR's mergeability asynchronously and
+# briefly reports ``mergeable=null`` / ``mergeable_state="unknown"`` —
+# typically for a few seconds.  Before dispatching a merge in a
+# repo-scoped batch we re-read the PR and, when GitHub is still
+# computing, poll up to this many seconds for a concrete value so the
+# merge decision is made against fresh state rather than the
+# (possibly stale) fetch-time snapshot.
+MERGEABILITY_REFRESH_TIMEOUT_SECONDS: float = 10.0
+
 # Required verification checks (DCO, lint, build, etc.) normally
 # start reporting within a few seconds.  When a *required* check has
 # been pending for longer than this on a PR that itself was created
@@ -60,6 +70,13 @@ DEFAULT_MERGE_RECHECK_INTERVAL: float = 10.0  # seconds between polls
 # treated as stuck.  Used by ``_detect_stuck_required_check`` to
 # decide whether to ask dependabot to recreate the PR.
 STUCK_CHECK_THRESHOLD_SECONDS: float = 60.0
+
+# pre-commit.ci normally reports back within a few minutes.  A
+# ``pre-commit.ci - pr`` status stuck in ``pending`` for longer than
+# this is treated as a hung run that needs a fresh ``pre-commit.ci
+# run`` trigger.  Kept deliberately generous so a slow-but-normal run
+# is never interrupted; used by ``_trigger_stale_precommit_ci``.
+PRECOMMIT_CI_STUCK_PENDING_SECONDS: float = 300.0
 
 
 class MergeStatus(Enum):
@@ -114,6 +131,7 @@ class AsyncMergeManager:
         no_netrc: bool = False,
         netrc_file: Path | None = None,
         rebase_local: bool = True,
+        repo_scoped: bool = False,
     ):
         self.token = token
         self.default_merge_method = merge_method
@@ -137,6 +155,15 @@ class AsyncMergeManager:
         # the legacy REST-only path (simpler but loses signature
         # verification on signed branches).
         self.rebase_local = rebase_local
+        # When True, the batch targets a single repository, so a merge
+        # by one worker can make a sibling PR ``dirty`` / ``behind``
+        # between the up-front fetch and this worker's dispatch.  In
+        # that mode we refresh each PR's live merge state immediately
+        # before dispatching the merge (see
+        # ``_refresh_pr_mergeability``).  Left False for org-wide runs,
+        # where PRs target different repositories and the snapshot is
+        # not invalidated by our own merges.
+        self._repo_scoped = repo_scoped
         self.log = logging.getLogger(__name__)
 
         # Centralised merge-operation timing
@@ -871,7 +898,8 @@ class AsyncMergeManager:
                 self.progress_tracker.merge_failure()
             self._console.print(
                 f"❌ Failed: {pr_info.html_url} "
-                "[token lacks permissions on this repository]"
+                "[token lacks permissions on this repository]",
+                markup=False,
             )
             result.duration = time.time() - start_time
             return result
@@ -923,7 +951,8 @@ class AsyncMergeManager:
                     # Attempt to submit the Gerrit change
                     self._console.print(
                         f"🔄 Submitting Gerrit change for {pr_info.html_url} "
-                        f"[{skip_msg}]"
+                        f"[{skip_msg}]",
+                        markup=False,
                     )
                     submitted = await self._submit_gerrit_change(
                         mapping, pr_info, repo_owner, repo_name
@@ -948,7 +977,8 @@ class AsyncMergeManager:
                         self.progress_tracker.merge_failure()
                     self._console.print(
                         f"❌ Failed: {pr_info.html_url} "
-                        f"[Gerrit submit failed for {skip_msg}]"
+                        f"[Gerrit submit failed for {skip_msg}]",
+                        markup=False,
                     )
                     return result
 
@@ -976,8 +1006,26 @@ class AsyncMergeManager:
                     return result
                 result.status = MergeStatus.FAILED
                 result.error = "PR is already closed"
-                self._console.print(f"🛑 Failed: {pr_info.html_url} [already closed]")
+                self._console.print(
+                    f"🛑 Failed: {pr_info.html_url} [already closed]", markup=False
+                )
                 return result
+
+            # A merge conflict (``dirty``) has no merge path of its
+            # own: route it to the conflict handler (dependabot →
+            # ``@dependabot rebase`` + wait; other authors → report
+            # and fail fast) rather than the generic not-mergeable
+            # skip below.  Skipped in preview (no side effects) and
+            # under ``force=all`` (which intentionally attempts the
+            # merge regardless of state).
+            if (
+                pr_info.mergeable_state == "dirty"
+                and not self.preview_mode
+                and self.force_level != "all"
+            ):
+                return await self._handle_merge_conflict(
+                    pr_info, repo_owner, repo_name, result
+                )
 
             if not self._is_pr_mergeable(pr_info):
                 # Get detailed status for a more informative skip message
@@ -1144,7 +1192,8 @@ class AsyncMergeManager:
                 result.status = MergeStatus.FAILED
                 result.error = "Copilot review processing incomplete - not approving to avoid pollution"
                 self._console.print(
-                    f"❌ Failed: {pr_info.html_url} [copilot processing incomplete]"
+                    f"❌ Failed: {pr_info.html_url} [copilot processing incomplete]",
+                    markup=False,
                 )
                 return result
 
@@ -1241,10 +1290,28 @@ class AsyncMergeManager:
             # them.
             pr_key_for_wait = f"{repo_owner}/{repo_name}#{pr_info.number}"
             already_rebased = pr_key_for_wait in self._rebased_prs
+            # ``unstable`` means a non-required check is failing or
+            # pending but the PR is otherwise mergeable.  When GitHub
+            # also reports ``mergeable is True`` the green button is
+            # live and a direct merge succeeds *now*, so entering the
+            # auto-merge wait would be pure waste: the state never
+            # reaches ``clean`` (the non-required check stays red, e.g.
+            # an excluded Zizmor scan), so the loop burns the full
+            # ``merge_timeout``; and ``enablePullRequestAutoMerge``
+            # is rejected outright on an already-mergeable PR, so the
+            # wait isn't even backed by auto-merge.  Route those
+            # straight to the Step 6 direct merge.  We still wait on
+            # ``unstable`` when ``mergeable`` is not literally True
+            # (GitHub still computing the value, or a required check
+            # transiently failing) so a genuinely not-yet-ready PR is
+            # not merged prematurely.
+            state_is_waitable = pr_info.mergeable_state in ("blocked", "behind") or (
+                pr_info.mergeable_state == "unstable" and pr_info.mergeable is not True
+            )
             base_should_wait = (
                 not self.preview_mode
                 and self._github_client is not None
-                and pr_info.mergeable_state in ("blocked", "behind", "unstable")
+                and state_is_waitable
                 and self.force_level != "all"
                 and not already_rebased
             )
@@ -1309,128 +1376,19 @@ class AsyncMergeManager:
                             level="debug",
                         )
 
-                # Drive the wait loop directly off a monotonic
-                # deadline so the total wait is bounded by
-                # ``merge_timeout`` even if a single iteration
-                # over-sleeps slightly.
-                wait_deadline = asyncio.get_running_loop().time() + self._merge_timeout
-                # Local alias so the type checker can narrow
-                # ``self._github_client`` across the await boundary.
-                wait_client = self._github_client
-                assert wait_client is not None
-                async with self._waiting_lock:
-                    self._waiting_prs[pr_key_for_wait] = wait_deadline
-                # Track whether the PR was closed during the wait
-                # and, if so, whether it was actually merged. The
-                # REST PR payload includes a ``merged`` boolean that
-                # distinguishes auto-merge success from
-                # closed-without-merge (the user closed the PR
-                # while we were waiting, dependabot superseded it,
-                # etc.).
-                closed_during_wait = False
-                merged_during_wait = False
-                try:
-                    while asyncio.get_running_loop().time() < wait_deadline:
-                        if pr_info.mergeable_state == "clean":
-                            break
-                        # Sleep no longer than the time remaining
-                        # so we don't overshoot ``wait_deadline``.
-                        # Clamp to a non-negative value: the loop's
-                        # ``while ... < wait_deadline`` check and the
-                        # ``time()`` call here are not atomic, so a
-                        # near-deadline crossing can produce a tiny
-                        # negative ``remaining`` which would raise
-                        # ``ValueError`` from ``asyncio.sleep``.
-                        remaining = max(
-                            0.0,
-                            wait_deadline - asyncio.get_running_loop().time(),
-                        )
-                        await asyncio.sleep(
-                            min(self._merge_recheck_interval, remaining)
-                        )
-                        try:
-                            refreshed_wait = await wait_client.get(
-                                f"/repos/{repo_owner}/{repo_name}/pulls/"
-                                f"{pr_info.number}"
-                            )
-                        except Exception as wait_exc:
-                            self.log.debug(
-                                "Failed to refresh PR state during auto-merge "
-                                "wait for %s/%s#%s: %s",
-                                repo_owner,
-                                repo_name,
-                                pr_info.number,
-                                wait_exc,
-                            )
-                            continue
-                        if isinstance(refreshed_wait, dict):
-                            # Only overwrite when the keys are present, so a
-                            # partial/empty API response does not blank out
-                            # the existing state. Additionally, preserve the
-                            # previous non-None ``mergeable`` value when the
-                            # refresh returns ``null`` — GitHub returns null
-                            # while still computing the value. The Step 6
-                            # skip gate accepts ``True`` and ``None`` (only
-                            # ``False`` falls through to the manual merge
-                            # attempt), but preserving the prior known
-                            # ``True`` keeps the post-wait state
-                            # informative for downstream logging and any
-                            # future tightening of that predicate.
-                            if "mergeable" in refreshed_wait:
-                                refreshed_mergeable = refreshed_wait.get("mergeable")
-                                if refreshed_mergeable is not None:
-                                    pr_info.mergeable = refreshed_mergeable
-                            if "mergeable_state" in refreshed_wait:
-                                # Preserve the previous non-None
-                                # ``mergeable_state`` for the same
-                                # reason as ``mergeable`` above. The
-                                # subsequent ``not in ("blocked",
-                                # "behind", "unstable")`` check would
-                                # otherwise break the wait loop early
-                                # on a transient ``null`` returned
-                                # while GitHub is still computing.
-                                refreshed_state = refreshed_wait.get("mergeable_state")
-                                if refreshed_state is not None:
-                                    pr_info.mergeable_state = refreshed_state
-                            # Capture the current head SHA so any
-                            # subsequent analyze_block_reason()
-                            # call queries the right commit. The
-                            # head can change while we wait
-                            # (rebase, dependabot force-push, etc.).
-                            refreshed_head = (refreshed_wait.get("head") or {}).get(
-                                "sha"
-                            )
-                            if refreshed_head:
-                                pr_info.head_sha = refreshed_head
-                            if refreshed_wait.get("state") == "closed":
-                                # PR was closed during the wait —
-                                # capture the ``merged`` boolean so
-                                # we can distinguish auto-merge
-                                # success from closed-without-merge.
-                                closed_during_wait = True
-                                merged_during_wait = bool(
-                                    refreshed_wait.get("merged", False)
-                                )
-                                pr_info.state = "closed"
-                                break
-                        # Continue waiting only while the PR is in a
-                        # state that auto-merge can still rescue. The
-                        # set must mirror the ``base_should_wait``
-                        # entry condition above (blocked / behind /
-                        # unstable); any other value means the PR has
-                        # either become mergeable, has been closed,
-                        # or has hit a state Step 5.5 cannot help
-                        # with, so we should exit the wait loop and
-                        # let downstream steps decide.
-                        if pr_info.mergeable_state not in (
-                            "blocked",
-                            "behind",
-                            "unstable",
-                        ):
-                            break
-                finally:
-                    async with self._waiting_lock:
-                        self._waiting_prs.pop(pr_key_for_wait, None)
+                # Wait (bounded by ``merge_timeout``) for required
+                # checks to complete and auto-merge to fire.  The
+                # continue-states mirror the ``base_should_wait`` entry
+                # condition above (blocked / behind / unstable).
+                (
+                    closed_during_wait,
+                    merged_during_wait,
+                ) = await self._wait_for_auto_merge(
+                    pr_info,
+                    repo_owner,
+                    repo_name,
+                    continue_states=("blocked", "behind", "unstable"),
+                )
 
                 # If the wait revealed the PR is already closed,
                 # short-circuit before attempting a manual merge.
@@ -1471,7 +1429,8 @@ class AsyncMergeManager:
                     result.status = MergeStatus.SKIPPED
                     result.error = "PR is behind base branch and --no-fix option is set"
                     self._console.print(
-                        f"⏭️ Skipped: {pr_info.html_url} [behind, rebase disabled]"
+                        f"⏭️ Skipped: {pr_info.html_url} [behind, rebase disabled]",
+                        markup=False,
                     )
                 elif pr_info.mergeable_state == "behind" and self.fix_out_of_date:
                     # For behind PRs with fix enabled, show warning with rebase info
@@ -1480,13 +1439,15 @@ class AsyncMergeManager:
                     if self.progress_tracker:
                         self.progress_tracker.merge_success()
                     self._console.print(
-                        f"⚠️  Rebase/merge: {pr_info.html_url} [behind base branch]"
+                        f"⚠️  Rebase/merge: {pr_info.html_url} [behind base branch]",
+                        markup=False,
                     )
                 elif pr_info.mergeable_state == "dirty":
                     result.status = MergeStatus.BLOCKED
                     result.error = "PR has merge conflicts"
                     self._console.print(
-                        f"🛑 Blocked: {pr_info.html_url} [merge conflicts]"
+                        f"🛑 Blocked: {pr_info.html_url} [merge conflicts]",
+                        markup=False,
                     )
                 elif (
                     pr_info.mergeable is False and pr_info.mergeable_state == "blocked"
@@ -1494,7 +1455,8 @@ class AsyncMergeManager:
                     result.status = MergeStatus.BLOCKED
                     result.error = "PR blocked by failing checks"
                     self._console.print(
-                        f"🛑 Blocked: {pr_info.html_url} [blocked by failing checks]"
+                        f"🛑 Blocked: {pr_info.html_url} [blocked by failing checks]",
+                        markup=False,
                     )
                 else:
                     # Simulate successful merge in preview mode
@@ -1605,10 +1567,53 @@ class AsyncMergeManager:
                     dispatch_lock = await self._get_merge_dispatch_lock(
                         repo_owner, repo_name
                     )
+                    dirty_before_dispatch = False
                     async with dispatch_lock:
-                        merged = await self._merge_pr_with_retry(
+                        # Re-read live merge state *before* dispatch — a
+                        # single GET, no recompute poll.  In a
+                        # repo-scoped batch an earlier sibling merge can
+                        # turn this PR ``dirty`` between the one-shot
+                        # fetch and dispatch (the classic shared
+                        # ``uv.lock`` conflict); routing it straight to
+                        # conflict recovery avoids dispatching a doomed
+                        # merge that 405s and then churns the retry loop
+                        # against the stale ``clean`` snapshot.  We keep
+                        # this to a single GET (not the polling
+                        # ``_refresh_pr_mergeability``) because the
+                        # dispatch lock is the one point serialised *and*
+                        # ordered after a sibling merge, so polling
+                        # GitHub's recompute window here would serialise
+                        # the whole repo batch.
+                        if self._repo_scoped:
+                            dirty_before_dispatch = await self._is_pr_dirty_now(
+                                pr_info, repo_owner, repo_name
+                            )
+                        if dirty_before_dispatch:
+                            merged = False
+                        else:
+                            merged = await self._merge_pr_with_retry(
+                                pr_info, repo_owner, repo_name
+                            )
+                    # Conflict recovery runs *outside* the dispatch lock
+                    # so the rebase wait never blocks sibling merges.
+                    if dirty_before_dispatch:
+                        return await self._handle_merge_conflict(
+                            pr_info, repo_owner, repo_name, result
+                        )
+                    # A PR can also turn ``dirty`` *during* our own merge
+                    # window (a sibling merged between the pre-dispatch
+                    # check and the merge call).  The post-failure
+                    # refresh — off the lock, with its recompute poll —
+                    # catches that so a freshly-dirty PR is never
+                    # reported as a generic merge failure.
+                    if not merged and self._repo_scoped:
+                        await self._refresh_pr_mergeability(
                             pr_info, repo_owner, repo_name
                         )
+                        if pr_info.mergeable_state == "dirty":
+                            return await self._handle_merge_conflict(
+                                pr_info, repo_owner, repo_name, result
+                            )
 
                 if merged is None:
                     # Auto-merge is active — PR will merge asynchronously.
@@ -1804,15 +1809,16 @@ class AsyncMergeManager:
                             )
                             self._console.print(
                                 f"❌ Failed: {recreated_pr.html_url} "
-                                "[recreated PR merge failed]"
+                                "[recreated PR merge failed]",
+                                markup=False,
                             )
                     else:
-                        result.status = MergeStatus.FAILED
-                        result.error = "Failed to merge after all retry attempts"
-                        if self.progress_tracker:
-                            self.progress_tracker.merge_failure()
-                        self._console.print(
-                            f"❌ Failed: {pr_info.html_url} [{failure_reason}]"
+                        await self._report_merge_failure(
+                            pr_info,
+                            repo_owner,
+                            repo_name,
+                            result,
+                            failure_reason,
                         )
 
         except GitHubPermissionError as e:
@@ -1837,7 +1843,8 @@ class AsyncMergeManager:
             # Extract operation-specific error message
             operation_desc = e.operation.replace("_", " ")
             self._console.print(
-                f"❌ Failed: {pr_info.html_url} [permission denied: {operation_desc}]"
+                f"❌ Failed: {pr_info.html_url} [permission denied: {operation_desc}]",
+                markup=False,
             )
 
             if not first_failure_for_repo:
@@ -2456,13 +2463,19 @@ class AsyncMergeManager:
         return True, "All merge requirements appear to be met"
 
     async def _trigger_stale_precommit_ci(self, pr_info: PullRequestInfo) -> bool:
-        """
-        Detect and retrigger a stuck pre-commit.ci run by posting a comment.
+        """Detect and retrigger a stuck pre-commit.ci run by posting a comment.
 
-        pre-commit.ci uses the commit status API and sometimes fails to report
-        any status at all, leaving the PR permanently blocked when
-        'pre-commit.ci - pr' is a required status check. Posting the comment
-        ``pre-commit.ci run`` triggers a fresh run.
+        pre-commit.ci uses the commit status API and sometimes gets
+        stuck — either never reporting a status at all, or leaving the
+        ``pre-commit.ci - pr`` context in ``pending`` indefinitely.
+        Either way the PR stays blocked when that context is a required
+        status check.  Posting ``pre-commit.ci run`` triggers a fresh
+        run.
+
+        A run is treated as stuck when the status is missing entirely,
+        or when it has been ``pending`` for longer than
+        :data:`PRECOMMIT_CI_STUCK_PENDING_SECONDS` (a slow-but-normal
+        run within that window is left alone).
 
         Args:
             pr_info: Pull request information
@@ -2490,16 +2503,17 @@ class AsyncMergeManager:
         except Exception:
             return False
 
-        # 2. Check whether the status has already been reported
+        # 2. Inspect the existing pre-commit.ci status.  Retrigger when
+        #    it is missing entirely or has been ``pending`` past the
+        #    stuck threshold; leave any other state (success / failure
+        #    / error, or a pending run still within its normal window).
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
         try:
             status_data = await self._github_client.get(
                 f"/repos/{repo_owner}/{repo_name}/commits/{pr_info.head_sha}/status"
             )
-            if isinstance(status_data, dict):
-                for s in status_data.get("statuses", []):
-                    if isinstance(s, dict) and s.get("context") == precommit_context:
-                        # Status exists (success, pending, failure, etc.) — not stale
-                        return False
         except Exception as e:
             self.log.debug(
                 "Failed to fetch commit status for pre-commit.ci check on %s#%s "
@@ -2511,9 +2525,55 @@ class AsyncMergeManager:
             )
             return False
 
-        # 3. Status is missing entirely — check for an existing trigger comment
-        # before posting a duplicate (avoids spam if dependamerge runs repeatedly
-        # while the status is still missing).
+        precommit_status: dict[str, Any] | None = None
+        if isinstance(status_data, dict):
+            for s in status_data.get("statuses", []):
+                if isinstance(s, dict) and s.get("context") == precommit_context:
+                    precommit_status = s
+                    break
+
+        if precommit_status is not None:
+            state = precommit_status.get("state")
+            if state != "pending":
+                # A reported, non-pending result (success / failure /
+                # error) is not stale — nothing to retrigger.
+                return False
+            # Pending: only stuck once it has been pending longer than
+            # the threshold.  Use ``updated_at`` (when pre-commit.ci
+            # set the pending status), falling back to ``created_at``.
+            raw_ts = precommit_status.get("updated_at") or precommit_status.get(
+                "created_at"
+            )
+            pending_age: float | None = None
+            if isinstance(raw_ts, str) and raw_ts:
+                try:
+                    ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                    pending_age = (now - ts).total_seconds()
+                except (ValueError, TypeError):
+                    # ``ValueError``: unparsable timestamp.
+                    # ``TypeError``: a timestamp lacking tz info parses
+                    # to a naive datetime, which cannot be subtracted
+                    # from the tz-aware ``now``.  Either way, degrade to
+                    # ``None`` (fail closed) rather than abort the run.
+                    pending_age = None
+            if (
+                pending_age is None
+                or pending_age < PRECOMMIT_CI_STUCK_PENDING_SECONDS
+            ):
+                # Still within the normal window (or no timestamp to
+                # judge by) — leave the run to finish.
+                return False
+            self.log.info(
+                "pre-commit.ci on %s#%s pending for %.0fs; treating as stuck.",
+                pr_info.repository_full_name,
+                pr_info.number,
+                pending_age,
+            )
+
+        # 3. The run is stale (missing, or stuck pending) — check for
+        # an existing trigger comment before posting a duplicate
+        # (avoids spam if dependamerge runs repeatedly while the
+        # status is still not progressing).
         try:
             comments = await self._github_client.get(
                 f"/repos/{repo_owner}/{repo_name}/issues/{pr_info.number}/comments?per_page=100"
@@ -2538,8 +2598,7 @@ class AsyncMergeManager:
         log_and_print(
             self.log,
             self._console,
-            f"⏳ Triggering pre-commit.ci re-run: {pr_info.html_url} "
-            "[status never reported]",
+            f"🔄 Re-triggering pre-commit.ci: {pr_info.html_url}",
             level="info",
         )
 
@@ -2667,9 +2726,17 @@ class AsyncMergeManager:
                 return None
             try:
                 # GitHub returns RFC 3339 with a trailing ``Z``.
-                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+                ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
             except ValueError:
                 return None
+            # A timestamp without tz info parses to a naive datetime,
+            # which raises ``TypeError`` when subtracted from the
+            # tz-aware ``now`` below.  Treat it as unparsable (fail
+            # closed) so the detector degrades gracefully instead of
+            # aborting the merge run.
+            if ts.tzinfo is None:
+                return None
+            return ts
 
         def _is_dco_name(name: str) -> bool:
             """Return True when ``name`` looks like a DCO check.
@@ -3615,6 +3682,699 @@ class AsyncMergeManager:
             return False
         return pr_data.get("state") == "closed" and bool(pr_data.get("merged"))
 
+    async def _is_pr_dirty_now(
+        self, pr_info: PullRequestInfo, owner: str, repo: str
+    ) -> bool:
+        """Best-effort single GET: ``True`` only if the PR is *concretely* dirty.
+
+        Called inside the per-repo dispatch lock, immediately before the
+        merge is dispatched, to catch a PR that an earlier sibling merge
+        in the same repo-scoped batch has turned ``dirty`` (the classic
+        shared-``uv.lock`` conflict) since the one-shot fetch snapshot.
+        Routing such a PR straight to conflict recovery avoids
+        dispatching a doomed merge that 405s and then churns
+        :meth:`_merge_pr_with_retry`'s retry loop against the stale
+        ``clean`` snapshot (which misreads the 405 as a transient error
+        on a mergeable PR and sleeps under the dispatch lock before
+        re-fetching).
+
+        Deliberately a *single* GET with no recompute poll — unlike
+        :meth:`_refresh_pr_mergeability`, which polls GitHub's
+        "still computing" window and therefore runs only *after* a
+        failed merge, off the lock.  The dispatch lock is the one point
+        serialised *and* ordered after a sibling merge, so polling here
+        would serialise the whole repo batch.  We therefore act only on
+        a *concrete* ``dirty``; a still-computing, closed, non-dirty, or
+        errored result returns ``False`` so the merge attempt proceeds
+        and the off-lock post-failure refresh settles anything that
+        turns out to be a fresh conflict.
+
+        Mutates ``pr_info`` (``mergeable``, ``mergeable_state``,
+        ``head_sha``) only when it confirms a concrete ``dirty``, so the
+        conflict handler and failure summary report accurate state.  The
+        snapshot is otherwise left untouched — in particular a transient
+        ``unknown`` never overwrites a concrete ``clean``, preserving the
+        transient-405-on-``clean`` retry path in
+        :meth:`_merge_pr_with_retry`.
+        """
+        if not self._github_client:
+            return False
+        try:
+            data = await self._github_client.get(
+                f"/repos/{owner}/{repo}/pulls/{pr_info.number}"
+            )
+        except Exception as exc:
+            self.log.debug(
+                "Pre-dispatch dirty check failed for %s/%s#%s: %s",
+                owner,
+                repo,
+                pr_info.number,
+                exc,
+            )
+            return False
+        if not isinstance(data, dict):
+            return False
+        # A closed PR is handled by the caller's closed-PR path, not as
+        # a conflict.
+        if data.get("state") == "closed":
+            return False
+        if data.get("mergeable_state") != "dirty":
+            return False
+        # Concrete conflict: record it so ``_handle_merge_conflict`` and
+        # the failure summary act on accurate, current state.
+        pr_info.mergeable = data.get("mergeable")
+        pr_info.mergeable_state = "dirty"
+        head_sha = (data.get("head") or {}).get("sha")
+        if head_sha:
+            pr_info.head_sha = head_sha
+        return True
+
+    async def _refresh_pr_mergeability(
+        self, pr_info: PullRequestInfo, owner: str, repo: str
+    ) -> None:
+        """Refresh ``pr_info`` with the PR's current live merge state.
+
+        The batch of PRs is fetched once up front, so a worker may act
+        on a snapshot taken seconds-to-minutes earlier.  In a
+        repo-scoped run this is routinely wrong: merging one PR can
+        immediately make a sibling PR ``dirty`` (the classic
+        ``uv.lock`` / workflow-pin conflict) or ``behind``.  A
+        concurrent ``dependamerge`` run elsewhere in the org can do the
+        same.
+
+        This method is the **post-failure** half of the conflict-
+        detection pair, called from ``_merge_single_pr`` *after* a
+        repo-scoped merge attempt returns falsy and always **outside**
+        the per-repo dispatch lock.  It catches the case where a PR
+        turned ``dirty`` *during* our own merge window (a sibling
+        merged between the pre-dispatch check and the merge call) so a
+        freshly-conflicted PR is routed to conflict recovery rather
+        than reported as a generic merge failure.  The complementary
+        **pre-dispatch** check is the single-GET ``_is_pr_dirty_now``,
+        which runs *inside* the dispatch lock; the polling done here
+        deliberately stays off that lock so GitHub's recompute window
+        never serialises the whole repo batch.
+
+        GitHub recomputes ``mergeable`` / ``mergeable_state``
+        asynchronously after the base branch moves, reporting
+        ``mergeable=None`` and ``mergeable_state="unknown"`` (or an
+        empty string) in the gap — usually for a few seconds.  When we
+        catch the PR in that window we poll up to
+        :data:`MERGEABILITY_REFRESH_TIMEOUT_SECONDS` for a concrete
+        value so the merge decision is made against real data.
+
+        Mutates ``pr_info`` in place (``state``, ``mergeable``,
+        ``mergeable_state``, ``head_sha``).  Best-effort: any API error
+        leaves the existing snapshot untouched so the caller's
+        downstream logic still runs.
+        """
+        if not self._github_client:
+            return
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + MERGEABILITY_REFRESH_TIMEOUT_SECONDS
+        # Poll cadence for the "still computing" window.  Kept short
+        # (GitHub usually settles in ~5s) but never longer than the
+        # configured recheck interval.
+        poll_interval = min(2.0, self._merge_recheck_interval)
+
+        while True:
+            try:
+                data = await self._github_client.get(
+                    f"/repos/{owner}/{repo}/pulls/{pr_info.number}"
+                )
+            except Exception as exc:
+                self.log.debug(
+                    "Mergeability refresh failed for %s/%s#%s: %s",
+                    owner,
+                    repo,
+                    pr_info.number,
+                    exc,
+                )
+                return
+
+            if not isinstance(data, dict):
+                return
+
+            state = data.get("state")
+            if isinstance(state, str) and state:
+                pr_info.state = state
+            head_sha = (data.get("head") or {}).get("sha")
+            if head_sha:
+                pr_info.head_sha = head_sha
+
+            mergeable = data.get("mergeable")
+            mergeable_state = data.get("mergeable_state")
+
+            # A closed PR will never resolve to a concrete mergeable
+            # value; record what we have and let the caller's
+            # closed-PR handling take over.
+            if state == "closed":
+                pr_info.mergeable = mergeable
+                pr_info.mergeable_state = mergeable_state
+                return
+
+            # GitHub signals "still computing" with a null ``mergeable``
+            # and an ``unknown``/empty ``mergeable_state``.  Keep
+            # polling until it settles or the deadline passes.
+            still_computing = mergeable is None or mergeable_state in (
+                None,
+                "",
+                "unknown",
+            )
+            if not still_computing:
+                pr_info.mergeable = mergeable
+                pr_info.mergeable_state = mergeable_state
+                return
+
+            now = loop.time()
+            if now >= deadline:
+                # Timed out waiting for GitHub to settle.  Record the
+                # latest values we did get (even if still computing) so
+                # downstream logic sees GitHub's current best answer
+                # rather than the older snapshot.  Reaching here means we
+                # are still in the recompute window, where GitHub signals
+                # "still computing" with ``mergeable=None`` and a
+                # ``mergeable_state`` of ``None``, ``""`` or
+                # ``"unknown"``.  Normalise any of those to a concrete
+                # ``"unknown"`` and always record it, so a stale concrete
+                # state (e.g. ``clean``) is never left in place —
+                # consistent with the ``still_computing`` check above,
+                # which treats ``None``/``""``/``"unknown"`` alike.
+                if mergeable is not None:
+                    pr_info.mergeable = mergeable
+                pr_info.mergeable_state = mergeable_state or "unknown"
+                self.log.debug(
+                    "Mergeability for %s/%s#%s still computing after %.0fs; "
+                    "proceeding with mergeable=%s state=%s",
+                    owner,
+                    repo,
+                    pr_info.number,
+                    MERGEABILITY_REFRESH_TIMEOUT_SECONDS,
+                    pr_info.mergeable,
+                    pr_info.mergeable_state,
+                )
+                return
+
+            await asyncio.sleep(min(poll_interval, deadline - now))
+
+    async def _wait_for_auto_merge(
+        self,
+        pr_info: PullRequestInfo,
+        owner: str,
+        repo: str,
+        *,
+        continue_states: tuple[str, ...],
+        deadline: float | None = None,
+        stop_on_clean: bool = True,
+    ) -> tuple[bool, bool]:
+        """Poll a PR until it merges, closes, settles, or times out.
+
+        Registers ``owner/repo#N`` in ``_waiting_prs`` so the parallel
+        progress ticker can render an aggregate countdown, then polls
+        every ``_merge_recheck_interval`` seconds until one of:
+
+          * ``mergeable_state`` becomes ``clean`` (only when
+            ``stop_on_clean`` is True — the default; callers that have
+            enabled auto-merge and want to observe the PR actually
+            close set it False and include ``"clean"`` in
+            ``continue_states`` instead),
+          * the PR closes (capturing the ``merged`` flag so the caller
+            can tell auto-merge success from closed-without-merge),
+          * ``mergeable_state`` leaves ``continue_states`` (the caller
+            decides what the new state means), or
+          * the deadline passes.
+
+        The total wait is bounded by ``merge_timeout`` unless an
+        explicit ``deadline`` is supplied — used to share a single
+        budget across sequential waits (e.g. the rebase-then-checks
+        phases of conflict recovery).
+
+        Mutates ``pr_info`` in place (``mergeable``,
+        ``mergeable_state``, ``head_sha``, ``state``).  Returns
+        ``(closed_during_wait, merged_during_wait)``.
+        """
+        if self._github_client is None:
+            return False, False
+
+        pr_key = f"{owner}/{repo}#{pr_info.number}"
+        loop = asyncio.get_running_loop()
+        # Drive the wait off a monotonic deadline so the total is
+        # bounded even if a single iteration over-sleeps slightly.
+        if deadline is None:
+            deadline = loop.time() + self._merge_timeout
+        # Local alias so the type checker can narrow
+        # ``self._github_client`` across the await boundary.
+        wait_client = self._github_client
+
+        async with self._waiting_lock:
+            self._waiting_prs[pr_key] = deadline
+
+        # Track whether the PR was closed during the wait and, if so,
+        # whether it was actually merged.  The REST payload's
+        # ``merged`` boolean distinguishes auto-merge success from
+        # closed-without-merge (a human closed it, dependabot
+        # superseded it, etc.).
+        closed_during_wait = False
+        merged_during_wait = False
+        try:
+            while loop.time() < deadline:
+                if stop_on_clean and pr_info.mergeable_state == "clean":
+                    break
+                # Sleep no longer than the time remaining so we don't
+                # overshoot the deadline.  Clamp to non-negative: the
+                # ``while`` check and this ``time()`` call are not
+                # atomic, so a near-deadline crossing could otherwise
+                # pass ``asyncio.sleep`` a tiny negative value.
+                remaining = max(0.0, deadline - loop.time())
+                await asyncio.sleep(min(self._merge_recheck_interval, remaining))
+                try:
+                    refreshed_wait = await wait_client.get(
+                        f"/repos/{owner}/{repo}/pulls/{pr_info.number}"
+                    )
+                except Exception as wait_exc:
+                    self.log.debug(
+                        "Failed to refresh PR state during auto-merge "
+                        "wait for %s: %s",
+                        pr_key,
+                        wait_exc,
+                    )
+                    continue
+                if isinstance(refreshed_wait, dict):
+                    # Only overwrite when present, and preserve the
+                    # previous non-None value when GitHub returns null
+                    # (it does so while recomputing) so the
+                    # ``continue_states`` check below does not break the
+                    # loop early on a transient null.
+                    if "mergeable" in refreshed_wait:
+                        refreshed_mergeable = refreshed_wait.get("mergeable")
+                        if refreshed_mergeable is not None:
+                            pr_info.mergeable = refreshed_mergeable
+                    if "mergeable_state" in refreshed_wait:
+                        refreshed_state = refreshed_wait.get("mergeable_state")
+                        # Preserve the previous concrete state while
+                        # GitHub is still recomputing mergeability: it
+                        # returns ``null`` / ``""`` / ``"unknown"``
+                        # transiently, and overwriting with those would
+                        # push the state out of ``continue_states`` and
+                        # break the wait loop early (e.g. a ``blocked``
+                        # PR briefly going ``unknown`` would exit and
+                        # trigger a premature manual merge).
+                        if refreshed_state not in (None, "", "unknown"):
+                            pr_info.mergeable_state = refreshed_state
+                    # The head can change while we wait (rebase,
+                    # force-push); keep it current so any later
+                    # block-reason analysis queries the right commit.
+                    refreshed_head = (refreshed_wait.get("head") or {}).get("sha")
+                    if refreshed_head:
+                        pr_info.head_sha = refreshed_head
+                    if refreshed_wait.get("state") == "closed":
+                        closed_during_wait = True
+                        merged_during_wait = bool(
+                            refreshed_wait.get("merged", False)
+                        )
+                        pr_info.state = "closed"
+                        break
+                # A PR that becomes immediately mergeable while still
+                # ``unstable`` (only a non-required check is red) will
+                # never reach ``clean`` and never leave ``unstable``,
+                # so keeping it in ``continue_states`` would spin the
+                # wait to the deadline — the exact slow hang the
+                # Step 5.5 routing fix removes for PRs that *start*
+                # mergeable.  Break out as soon as GitHub reports
+                # ``unstable`` + ``mergeable is True`` so the caller can
+                # dispatch (auto-merge, already armed before this wait,
+                # will land it; failing that the caller merges directly).
+                if pr_info.mergeable_state == "unstable" and pr_info.mergeable is True:
+                    break
+                # Continue waiting only while the PR is in a state the
+                # caller still considers rescuable; any other value
+                # means it became mergeable, closed, or hit a terminal
+                # state, so exit and let the caller decide.
+                if pr_info.mergeable_state not in continue_states:
+                    break
+        finally:
+            async with self._waiting_lock:
+                self._waiting_prs.pop(pr_key, None)
+
+        return closed_during_wait, merged_during_wait
+
+    async def _request_dependabot_rebase(
+        self, pr_info: PullRequestInfo, owner: str, repo: str
+    ) -> bool:
+        """Post ``@dependabot rebase`` on a conflicted dependabot PR.
+
+        Dependabot responds by rebasing the PR branch onto the latest
+        base, regenerating any lockfiles and re-signing the commit —
+        the reliable way to clear a ``uv.lock`` / dependency conflict
+        that a plain ``git rebase`` cannot resolve.
+
+        Guards against duplicate comments: when a ``@dependabot
+        rebase`` is already present the request is treated as
+        in-flight and ``True`` is returned (the caller proceeds to
+        wait).  Returns ``False`` only when the comment could not be
+        posted.
+        """
+        if self._github_client is None:
+            return False
+
+        # Duplicate guard — don't stack rebase requests if one is
+        # already pending from a previous run / trigger.
+        try:
+            comments = await self._github_client.get(
+                f"/repos/{owner}/{repo}/issues/{pr_info.number}/comments"
+                f"?per_page=100&direction=desc"
+            )
+            if isinstance(comments, list):
+                for c in comments:
+                    if not isinstance(c, dict):
+                        continue
+                    body = c.get("body")
+                    if isinstance(body, str) and "@dependabot rebase" in body:
+                        self.log.info(
+                            "Existing @dependabot rebase comment on %s#%s; "
+                            "treating rebase as already requested.",
+                            pr_info.repository_full_name,
+                            pr_info.number,
+                        )
+                        return True
+        except Exception as exc:
+            # If we can't list comments, fall through and post anyway:
+            # a duplicate rebase request is harmless (dependabot just
+            # rebases again) and is better than skipping recovery.
+            self.log.debug(
+                "Could not list comments for %s#%s before rebase request: %s",
+                pr_info.repository_full_name,
+                pr_info.number,
+                exc,
+            )
+
+        try:
+            await self._github_client.post_issue_comment(
+                owner, repo, pr_info.number, "@dependabot rebase"
+            )
+            return True
+        except Exception as exc:
+            self.log.warning(
+                "Failed to post @dependabot rebase on %s#%s: %s",
+                pr_info.repository_full_name,
+                pr_info.number,
+                exc,
+            )
+            return False
+
+    def _finish_conflict_close(
+        self, pr_info: PullRequestInfo, result: MergeResult, merged: bool
+    ) -> MergeResult:
+        """Finalise a conflict-recovery result when the PR closed mid-wait.
+
+        ``merged`` distinguishes auto-merge success (the rebase landed
+        and GitHub merged the PR) from closed-without-merge (a human
+        closed it, dependabot superseded it, etc.).
+        """
+        if merged:
+            result.status = MergeStatus.MERGED
+            if self.progress_tracker:
+                self.progress_tracker.merge_success()
+            log_and_print(
+                self.log,
+                self._console,
+                f"✅ Merged (auto-merge): {pr_info.html_url}",
+                level="debug",
+            )
+        else:
+            result.status = MergeStatus.FAILED
+            result.error = "PR closed without merging during conflict rebase"
+            if self.progress_tracker:
+                self.progress_tracker.merge_failure()
+            self._console.print(
+                f"🛑 Closed without merging: {pr_info.html_url}"
+            )
+        return result
+
+    async def _handle_merge_conflict(
+        self,
+        pr_info: PullRequestInfo,
+        owner: str,
+        repo: str,
+        result: MergeResult,
+    ) -> MergeResult:
+        """Recover from (or report) a PR with a real merge conflict.
+
+        A ``dirty`` PR has no merge path of its own.  For a dependabot
+        PR we ask dependabot to rebase — which regenerates lockfiles
+        and re-signs the commit — then wait (bounded by
+        ``merge_timeout``) for the rebase and required checks to land,
+        approving the *rebased* commit and enabling auto-merge so
+        GitHub completes the merge.  For any other author there is no
+        automated way to resolve a content conflict, so we report it
+        and fail fast (no wait).
+
+        Must be called *outside* the per-repo dispatch lock: the wait
+        can run for the full ``merge_timeout`` and must not block
+        sibling merges.  Sets ``result`` and returns it.
+        """
+        # Non-dependabot authors: no comment macro regenerates a
+        # conflicted lockfile, and a blind force-push would only break
+        # the approval chain (this org forbids self-merge of pushed
+        # commits).  Report the conflict and fail fast.
+        if pr_info.author != "dependabot[bot]":
+            log_and_print(
+                self.log,
+                self._console,
+                f"🔀 Merge conflict: {pr_info.html_url}",
+                level="info",
+            )
+            result.status = MergeStatus.FAILED
+            result.error = "merge conflicts"
+            if self.progress_tracker:
+                self.progress_tracker.merge_failure()
+            return result
+
+        # Dependabot: request a rebase (regenerates the lockfile +
+        # signs the commit).
+        log_and_print(
+            self.log,
+            self._console,
+            f"🔄 Requesting dependabot rebase: {pr_info.html_url}",
+            level="info",
+        )
+        if not await self._request_dependabot_rebase(pr_info, owner, repo):
+            log_and_print(
+                self.log,
+                self._console,
+                f"🔀 Merge conflict: {pr_info.html_url}",
+                level="info",
+            )
+            result.status = MergeStatus.FAILED
+            result.error = "merge conflicts"
+            if self.progress_tracker:
+                self.progress_tracker.merge_failure()
+            return result
+
+        # Share a single ``merge_timeout`` budget across both wait
+        # phases (waiting for the rebase, then for checks).
+        deadline = asyncio.get_running_loop().time() + self._merge_timeout
+
+        # Phase 1: wait for dependabot's rebase to clear the conflict.
+        # Keep waiting while still ``dirty`` or while GitHub recomputes
+        # mergeability (a transient null is preserved as the prior
+        # ``dirty`` by ``_wait_for_auto_merge``).
+        closed, merged = await self._wait_for_auto_merge(
+            pr_info,
+            owner,
+            repo,
+            continue_states=("dirty", "unknown", ""),
+            deadline=deadline,
+        )
+        if closed:
+            return self._finish_conflict_close(pr_info, result, merged)
+        if pr_info.mergeable_state == "dirty":
+            # Timed out still conflicting — the rebase did not happen
+            # or could not resolve the conflict.
+            log_and_print(
+                self.log,
+                self._console,
+                f"🔀 Merge conflict: {pr_info.html_url}",
+                level="info",
+            )
+            result.status = MergeStatus.FAILED
+            result.error = "merge conflicts"
+            if self.progress_tracker:
+                self.progress_tracker.merge_failure()
+            return result
+
+        # Conflict cleared.  Approve the rebased commit *now* (not
+        # before — approving the pre-rebase head would just be
+        # dismissed by dependabot's force-push, producing the
+        # duplicate approvals we want to avoid) and try to enable
+        # auto-merge.  Handle an approval failure (permission / API
+        # error) here rather than letting it bubble to the generic
+        # catch-all, which would lose the conflict-recovery context.
+        try:
+            await self._approve_pr(owner, repo, pr_info.number)
+        except Exception as exc:
+            self.log.warning(
+                "Failed to approve %s/%s#%s after rebase: %s",
+                owner,
+                repo,
+                pr_info.number,
+                exc,
+            )
+            result.status = MergeStatus.FAILED
+            result.error = f"rebase cleared the conflict but approval failed: {exc}"
+            if self.progress_tracker:
+                self.progress_tracker.merge_failure()
+            self._console.print(f"❌ Failed: {pr_info.html_url}", markup=False)
+            return result
+        auto_ok = await self._enable_auto_merge_for_pr(pr_info, owner, repo)
+        if auto_ok:
+            log_and_print(
+                self.log,
+                self._console,
+                f"🤖 Auto-merge: {pr_info.html_url}",
+                level="debug",
+            )
+
+        # Phase 2: wait (sharing the deadline) for required checks to
+        # land.  When auto-merge is armed we wait *through* ``clean``
+        # (``stop_on_clean=False``) so we can observe GitHub actually
+        # close the PR and report MERGED.  When auto-merge could NOT be
+        # enabled, waiting through ``clean`` would just spin until the
+        # deadline (nothing would merge the PR), so we stop on ``clean``
+        # and merge it ourselves below.
+        if auto_ok:
+            continue_states: tuple[str, ...] = (
+                "clean",
+                "blocked",
+                "behind",
+                "unstable",
+                "unknown",
+                "",
+            )
+        else:
+            continue_states = ("blocked", "behind", "unstable", "unknown", "")
+        closed, merged = await self._wait_for_auto_merge(
+            pr_info,
+            owner,
+            repo,
+            continue_states=continue_states,
+            deadline=deadline,
+            stop_on_clean=not auto_ok,
+        )
+        if closed:
+            return self._finish_conflict_close(pr_info, result, merged)
+
+        if auto_ok:
+            # Auto-merge is armed: GitHub will complete the merge once
+            # the required checks pass (often after our run ends).
+            result.status = MergeStatus.AUTO_MERGE_PENDING
+            log_and_print(
+                self.log,
+                self._console,
+                f"⏳ Waiting: {pr_info.html_url} [auto-merge after rebase]",
+                level="debug",
+            )
+            return result
+
+        # Auto-merge could not be enabled.  If the rebase left the PR
+        # mergeable, merge it directly now; otherwise it will not land
+        # on its own — report the failure rather than a misleading
+        # ``AUTO_MERGE_PENDING`` that would never resolve.
+        if pr_info.mergeable_state == "clean":
+            dispatch_lock = await self._get_merge_dispatch_lock(owner, repo)
+            async with dispatch_lock:
+                merged = await self._merge_pr_with_retry(pr_info, owner, repo)
+            if merged:
+                result.status = MergeStatus.MERGED
+                if self.progress_tracker:
+                    self.progress_tracker.merge_success()
+                log_and_print(
+                    self.log,
+                    self._console,
+                    f"✅ Merged: {pr_info.html_url}",
+                    level="debug",
+                )
+                return result
+
+        result.status = MergeStatus.FAILED
+        result.error = (
+            "rebase cleared the conflict but the PR could not be merged "
+            "(auto-merge unavailable)"
+        )
+        if self.progress_tracker:
+            self.progress_tracker.merge_failure()
+        self._console.print(f"❌ Failed: {pr_info.html_url}", markup=False)
+        return result
+
+    async def _report_merge_failure(
+        self,
+        pr_info: PullRequestInfo,
+        owner: str,
+        repo: str,
+        result: MergeResult,
+        failure_reason: str,
+    ) -> MergeResult:
+        """Report a failed merge, upgrading to a stuck-check cause if found.
+
+        Called when ``_merge_pr_with_retry`` failed and no dependabot
+        recreate produced a replacement PR.  For a non-dependabot PR
+        we check whether a required check is stuck (Option A): if so,
+        print ``⚠️ Stuck check`` and arm auto-merge (when the PR is
+        otherwise mergeable) so it lands once the check is
+        re-triggered, without a force-push that would break this org's
+        self-merge rule.  Otherwise emit the generic failure line.
+
+        Sets ``result`` to ``FAILED`` and returns it.
+        """
+        stuck_reported = False
+        if pr_info.author != "dependabot[bot]" and not self.preview_mode:
+            try:
+                (
+                    is_stuck,
+                    stuck_check,
+                    _stuck_age,
+                ) = await self._detect_stuck_required_check(pr_info)
+            except Exception as exc:
+                self.log.debug(
+                    "_detect_stuck_required_check failed for %s#%s: %s",
+                    pr_info.repository_full_name,
+                    pr_info.number,
+                    exc,
+                )
+                is_stuck = False
+                stuck_check = None
+            if is_stuck:
+                # markup=False: a check name may contain characters
+                # Rich would otherwise treat as markup.
+                self._console.print(
+                    f"⚠️ Stuck check: {pr_info.html_url} [{stuck_check}]",
+                    markup=False,
+                )
+                # Arm auto-merge when the PR is otherwise mergeable
+                # (not dirty) so it lands automatically once the stuck
+                # check is re-triggered, without a second review round.
+                if pr_info.mergeable_state != "dirty":
+                    await self._enable_auto_merge_for_pr(pr_info, owner, repo)
+                result.error = f"stuck check: {stuck_check}"
+                stuck_reported = True
+
+        result.status = MergeStatus.FAILED
+        if not stuck_reported:
+            # Use the (now informative) failure reason as the result
+            # error too, so the end-of-run summary surfaces the real
+            # cause rather than a generic "all retry attempts" line.
+            result.error = failure_reason or "Failed to merge after all retry attempts"
+        if self.progress_tracker:
+            self.progress_tracker.merge_failure()
+        # Keep the live line terse: the full (often long) reason is
+        # shown in the end-of-run summary via ``result.error``, so
+        # repeating it inline only duplicates it.  The ``⚠️ Stuck
+        # check`` line above already carries the cause for stuck PRs.
+        if not stuck_reported:
+            self._console.print(f"❌ Failed: {pr_info.html_url}", markup=False)
+        return result
+
     def _get_failure_summary(self, pr_info: PullRequestInfo) -> str:
         """
         Generate a detailed failure summary based on PR state.
@@ -3634,6 +4394,19 @@ class AsyncMergeManager:
         if last_exception:
             error_msg = str(last_exception)
             self.log.debug(f"Last exception for {pr_key}: {error_msg[:200]}")
+            # The merge layer (github_async.merge_pull_request) embeds
+            # GitHub's own explanation after a "GitHub: " marker — the
+            # ruleset violation, "Required workflows ... are not
+            # satisfied", required-check names, etc.  This is the
+            # actionable cause, so surface it ahead of any generic
+            # state-based inference.  We trim the PR-state context we
+            # appended after it so the reason stays concise.
+            marker = "GitHub: "
+            if marker in error_msg:
+                detail = error_msg.split(marker, 1)[1]
+                detail = detail.split(" (PR state:", 1)[0].strip()
+                if detail:
+                    return detail[:300]
             # Check for workflow scope error - be very specific to avoid false positives
             # Only match the exact error message pattern we raise in github_async.py
             if "Missing 'workflow' scope" in error_msg:

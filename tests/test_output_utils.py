@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 from unittest.mock import MagicMock, patch
 
@@ -24,8 +25,9 @@ class TestLogAndPrint:
         log_and_print(logger, console, "Test message", level="info")
 
         # Unstyled output now goes through console.print so it
-        # coordinates with any active Rich Live display.
-        console.print.assert_called_once_with("Test message")
+        # coordinates with any active Rich Live display.  markup=False
+        # keeps bracketed reasons from being eaten by Rich.
+        console.print.assert_called_once_with("Test message", markup=False)
 
     def test_log_and_print_with_style(self):
         """Test logging and printing with Rich style."""
@@ -34,8 +36,10 @@ class TestLogAndPrint:
 
         log_and_print(logger, console, "Styled message", style="bold red", level="info")
 
-        # Verify console.print was called with style
-        console.print.assert_called_once_with("Styled message", style="bold red")
+        # Verify console.print was called with style (markup disabled)
+        console.print.assert_called_once_with(
+            "Styled message", style="bold red", markup=False
+        )
 
     def test_log_and_print_debug_level(self):
         """Test logging at DEBUG level."""
@@ -86,7 +90,7 @@ class TestLogAndPrint:
 
         log_and_print(logger, console, "✅ Success message", level="info")
 
-        console.print.assert_called_once_with("✅ Success message")
+        console.print.assert_called_once_with("✅ Success message", markup=False)
 
     def test_log_and_print_message_with_url(self):
         """Test handling of messages with URLs."""
@@ -96,7 +100,7 @@ class TestLogAndPrint:
 
         log_and_print(logger, console, message, level="info")
 
-        console.print.assert_called_once_with(message)
+        console.print.assert_called_once_with(message, markup=False)
 
     def test_log_and_print_multiline_message(self):
         """Test handling of multiline messages."""
@@ -106,7 +110,7 @@ class TestLogAndPrint:
 
         log_and_print(logger, console, message, level="info")
 
-        console.print.assert_called_once_with(message)
+        console.print.assert_called_once_with(message, markup=False)
 
     def test_log_and_print_empty_message(self):
         """Test handling of empty message."""
@@ -115,7 +119,7 @@ class TestLogAndPrint:
 
         log_and_print(logger, console, "", level="info")
 
-        console.print.assert_called_once_with("")
+        console.print.assert_called_once_with("", markup=False)
 
     def test_log_and_print_default_level(self):
         """Test that default log level is INFO when not specified."""
@@ -135,4 +139,29 @@ class TestLogAndPrint:
 
         log_and_print(logger, console, "Message", style=None, level="info")
 
-        console.print.assert_called_once_with("Message")
+        console.print.assert_called_once_with("Message", markup=False)
+
+
+class TestLogAndPrintMarkupDisabled:
+    """Bracketed reasons must survive (Rich markup must be disabled).
+
+    Regression test: with markup enabled (Rich's default), a reason
+    such as ``[branch protection rules prevent merge]`` is parsed as a
+    style tag and silently dropped, so the user sees no reason at all.
+    """
+
+    def test_bracketed_reason_is_rendered_literally(self):
+        logger = logging.getLogger("test_markup")
+        buffer = io.StringIO()
+        console = Console(file=buffer, force_terminal=False, width=200)
+
+        log_and_print(
+            logger,
+            console,
+            "❌ Failed: https://x/pull/1 [branch protection rules prevent merge]",
+            level="info",
+        )
+
+        out = buffer.getvalue()
+        # The whole bracketed reason must appear verbatim.
+        assert "[branch protection rules prevent merge]" in out

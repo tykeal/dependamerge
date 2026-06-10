@@ -40,7 +40,6 @@ from .git_ops import (
     clone,
     commit_amend_no_edit,
     create_secure_tempdir,
-    fetch,
     fetch_branch,
     list_conflicted_files,
     push_force_with_lease,

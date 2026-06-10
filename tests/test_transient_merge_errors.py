@@ -484,3 +484,117 @@ class TestPostApprovalDelayConfig:
                 merge_method="merge",
             )
             assert mgr._post_approval_delay == 3.0
+
+
+def _make_405_with_body(message: str) -> httpx.HTTPStatusError:
+    """Build a 405 ``HTTPStatusError`` carrying a JSON ``message`` body."""
+    request = httpx.Request("PUT", "https://api.github.com/repos/o/r/pulls/1/merge")
+    response = httpx.Response(
+        status_code=405, request=request, json={"message": message}
+    )
+    return httpx.HTTPStatusError(
+        "Client error '405 Method Not Allowed' for url "
+        "'https://api.github.com/repos/o/r/pulls/1/merge'",
+        request=request,
+        response=response,
+    )
+
+
+class TestMergeApiBodyCapture:
+    """``merge_pull_request`` must surface GitHub's response body.
+
+    GitHub puts the real reason (ruleset violations, "Required
+    workflows ... not satisfied") in the response *body*; the
+    ``HTTPStatusError`` text only carries the status line.  A bare
+    ``raise`` previously discarded the body — these tests lock in that
+    the body now reaches the raised error.
+    """
+
+    @pytest.mark.asyncio
+    async def test_merge_error_surfaces_response_body(self):
+        from dependamerge.github_async import GitHubAsync
+
+        api = GitHubAsync(token="t")
+        body_msg = (
+            "Repository rule violations found\n\n"
+            "Required workflows 'Autolabeler, Semantic Pull Request' "
+            "are not satisfied"
+        )
+        api.put = AsyncMock(side_effect=_make_405_with_body(body_msg))
+        api.get = AsyncMock(
+            return_value={
+                "state": "open",
+                "mergeable": True,
+                "mergeable_state": "blocked",
+                "merged": False,
+            }
+        )
+
+        with pytest.raises(Exception) as excinfo:
+            await api.merge_pull_request("o", "r", 1, "merge")
+
+        msg = str(excinfo.value)
+        assert "GitHub:" in msg
+        assert "Required workflows" in msg
+        assert "not satisfied" in msg
+        # The original status line MUST be preserved so
+        # _merge_pr_with_retry still classifies the 405 as terminal
+        # (and fails fast) instead of retrying it 3x.
+        assert "405" in msg
+        assert "Method Not Allowed" in msg
+
+    @pytest.mark.asyncio
+    async def test_merge_succeeded_despite_exception_returns_true(self):
+        """The race-recovery path (was dead code) must work again."""
+        from dependamerge.github_async import GitHubAsync
+
+        api = GitHubAsync(token="t")
+        api.put = AsyncMock(side_effect=_make_405_with_body("transient"))
+        # Re-fetch shows the PR actually merged despite the exception.
+        api.get = AsyncMock(return_value={"state": "closed", "merged": True})
+
+        result = await api.merge_pull_request("o", "r", 1, "merge")
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_surfaces_body_when_state_refetch_fails(self):
+        """If the PR-state re-fetch fails, still surface GitHub's body."""
+        from dependamerge.github_async import GitHubAsync
+
+        api = GitHubAsync(token="t")
+        api.put = AsyncMock(
+            side_effect=_make_405_with_body(
+                "Required workflows 'Autolabeler' are not satisfied"
+            )
+        )
+        # The follow-up PR-state GET also fails.
+        api.get = AsyncMock(side_effect=RuntimeError("re-fetch failed"))
+
+        with pytest.raises(Exception) as excinfo:
+            await api.merge_pull_request("o", "r", 1, "merge")
+
+        msg = str(excinfo.value)
+        assert "GitHub:" in msg
+        assert "Required workflows" in msg
+
+
+class TestFailureSummarySurfacesGitHubDetail:
+    """``_get_failure_summary`` surfaces the GitHub-supplied reason."""
+
+    def test_github_detail_extracted_from_exception(self):
+        mgr, _client = make_merge_manager(merge_method="merge")
+        pr = _make_pr_info(mergeable_state="blocked", mergeable=True)
+        exc = Exception(
+            "Failed to merge PR #39 in org/repo. GitHub: Required "
+            "workflows 'Autolabeler' are not satisfied (PR state: open, "
+            "mergeable: True, mergeable_state: blocked) "
+            "[blocked by branch protection / required checks]"
+        )
+        mgr._last_merge_exception["org/repo#39"] = exc
+
+        summary = mgr._get_failure_summary(pr)
+
+        # The actionable GitHub message is returned, trimmed of the
+        # appended PR-state context.
+        assert summary == "Required workflows 'Autolabeler' are not satisfied"

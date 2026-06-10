@@ -15,6 +15,7 @@ Covers:
 - Ruleset branch filtering (_ruleset_applies_to_branch)
 """
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -129,6 +130,113 @@ class TestStatusAlreadyReported:
         client.get = AsyncMock(
             return_value={
                 "statuses": [{"context": "pre-commit.ci - pr", "state": state}]
+            }
+        )
+        client.post_issue_comment = AsyncMock()
+
+        result = await mgr._trigger_stale_precommit_ci(pr)
+
+        assert result is False
+        client.post_issue_comment.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 2b. Status pending past the stuck threshold -> retrigger
+# ---------------------------------------------------------------------------
+class TestStuckPendingRetrigger:
+    """A pre-commit.ci status stuck in ``pending`` is retriggered."""
+
+    @staticmethod
+    def _iso(seconds_ago: float) -> str:
+        ts = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+        return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @pytest.mark.asyncio
+    async def test_retriggers_when_pending_past_threshold(self):
+        """Pending longer than the stuck threshold posts a fresh trigger."""
+        mgr, client = _make_manager()
+        pr = _make_pr_info()
+
+        client.get_required_status_checks = AsyncMock(
+            return_value=[{"context": "pre-commit.ci - pr"}]
+        )
+        stuck = {
+            "statuses": [
+                {
+                    "context": "pre-commit.ci - pr",
+                    "state": "pending",
+                    "updated_at": self._iso(600),
+                }
+            ]
+        }
+        success = {"statuses": [{"context": "pre-commit.ci - pr", "state": "success"}]}
+        client.get.side_effect = [
+            stuck,  # step 2: status check (stuck pending)
+            [],  # step 3: duplicate-comment check
+            success,  # first poll iteration
+        ]
+        client.post_issue_comment = AsyncMock()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await mgr._trigger_stale_precommit_ci(pr)
+
+        assert result is True
+        client.post_issue_comment.assert_called_once_with(
+            "owner", "repo", 42, "pre-commit.ci run"
+        )
+
+    @pytest.mark.asyncio
+    async def test_leaves_recent_pending_run_alone(self):
+        """A pending run still within its normal window is not retriggered."""
+        mgr, client = _make_manager()
+        pr = _make_pr_info()
+
+        client.get_required_status_checks = AsyncMock(
+            return_value=[{"context": "pre-commit.ci - pr"}]
+        )
+        client.get = AsyncMock(
+            return_value={
+                "statuses": [
+                    {
+                        "context": "pre-commit.ci - pr",
+                        "state": "pending",
+                        "updated_at": self._iso(30),
+                    }
+                ]
+            }
+        )
+        client.post_issue_comment = AsyncMock()
+
+        result = await mgr._trigger_stale_precommit_ci(pr)
+
+        assert result is False
+        client.post_issue_comment.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_naive_timestamp_does_not_crash(self):
+        """A pending status with a tz-naive timestamp degrades, not crashes.
+
+        A timestamp lacking tz info parses to a naive datetime that
+        would raise ``TypeError`` when subtracted from the tz-aware
+        ``now``; the detector must fail closed (return ``False``)
+        rather than abort the merge run.
+        """
+        mgr, client = _make_manager()
+        pr = _make_pr_info()
+
+        client.get_required_status_checks = AsyncMock(
+            return_value=[{"context": "pre-commit.ci - pr"}]
+        )
+        client.get = AsyncMock(
+            return_value={
+                "statuses": [
+                    {
+                        "context": "pre-commit.ci - pr",
+                        "state": "pending",
+                        # No trailing "Z"/offset -> a naive datetime.
+                        "updated_at": "2026-06-08T16:00:00",
+                    }
+                ]
             }
         )
         client.post_issue_comment = AsyncMock()

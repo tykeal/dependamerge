@@ -754,15 +754,41 @@ class GitHubAsync:
             self.log.debug(
                 f"Merge API error for PR #{number} in {owner}/{repo}: {error_type}: {error_msg}"
             )
-            raise
-            # Try to extract response body if available (for HTTPStatusError)
-            if hasattr(e, "response") and hasattr(e.response, "text"):
+
+            # Extract the response body.  GitHub puts the *actual*
+            # reason here — ruleset violations, "Required workflows ...
+            # are not satisfied", required-check names, etc.  The
+            # ``HTTPStatusError`` text only carries the status line
+            # (e.g. "405 Method Not Allowed"), so without this the real
+            # cause is silently lost.  Whitespace/newlines are
+            # collapsed so the reason fits on a single status line.
+            github_detail = ""
+            response = getattr(e, "response", None)
+            if response is not None:
                 try:
-                    response_text = e.response.text
-                    self.log.debug(f"GitHub API response body: {response_text}")
+                    body = response.json()
+                    if isinstance(body, dict) and isinstance(
+                        body.get("message"), str
+                    ):
+                        github_detail = " ".join(body["message"].split())
                 except Exception:
-                    pass
-            # Get PR details to check if the merge actually succeeded despite the exception
+                    github_detail = ""
+                if not github_detail:
+                    try:
+                        raw = getattr(response, "text", "") or ""
+                        github_detail = " ".join(raw.split())[:500]
+                    except Exception:
+                        github_detail = ""
+            if github_detail:
+                self.log.debug(
+                    f"GitHub merge API response body for #{number}: {github_detail}"
+                )
+
+            # Re-check PR state: the merge may have actually succeeded
+            # despite the exception (a race where the API call lands
+            # but we still see an error from rate-limiting, network, or
+            # JSON parsing), and the state adds context to the error we
+            # raise.
             try:
                 pr_data_response = await self.get(
                     f"/repos/{owner}/{repo}/pulls/{number}"
@@ -786,36 +812,56 @@ class GitHubAsync:
                     )
                     return True
 
-                # Enhanced error message with PR state context
+                # Enhanced error message.  Always keep the original
+                # error text — it carries the HTTP status line (e.g.
+                # "405 Method Not Allowed") that ``_merge_pr_with_retry``
+                # string-matches to classify retryable vs terminal
+                # failures; dropping it made every blocked/ruleset 405
+                # fall through to the generic retry path (3 attempts +
+                # sleeps).  Then *add* GitHub's response body (the
+                # actionable reason) when we captured it.
                 error_msg = (
                     f"Failed to merge PR #{number} in {owner}/{repo}. "
-                    f"PR state: {state}, mergeable: {mergeable}, mergeable_state: {mergeable_state}. "
-                    f"Error: {str(e)}"
+                    f"Error: {str(e)}."
+                )
+                if github_detail:
+                    error_msg += f" GitHub: {github_detail}"
+                error_msg += (
+                    f" (PR state: {state}, mergeable: {mergeable}, "
+                    f"mergeable_state: {mergeable_state})"
                 )
 
-                # Check for common issues that cause 405 errors
+                # Note common state-based causes for 405-style errors.
                 if mergeable_state == "blocked":
-                    error_msg += " (Likely blocked by branch protection rules or required status checks)"
+                    error_msg += " [blocked by branch protection / required checks]"
                 elif mergeable_state == "behind":
-                    error_msg += " (PR branch is behind base branch)"
+                    error_msg += " [PR branch is behind base branch]"
                 elif mergeable_state == "dirty":
-                    error_msg += " (PR has merge conflicts)"
+                    error_msg += " [PR has merge conflicts]"
                 elif draft:
-                    error_msg += " (Cannot merge draft PR)"
+                    error_msg += " [cannot merge draft PR]"
                 elif state == "closed" and not merged:
-                    error_msg += " (PR was closed without merging)"
+                    error_msg += " [PR was closed without merging]"
                 elif state != "open":
-                    error_msg += f" (PR is not open, state: {state})"
+                    error_msg += f" [PR is not open, state: {state}]"
 
                 raise Exception(error_msg) from e
             except Exception as inner_e:
-                # If we can't get PR details, just re-raise the original error
-                if isinstance(inner_e, Exception) and "Failed to merge PR" in str(
-                    inner_e
-                ):
+                # The enhanced-error path raised successfully (the
+                # message starts with "Failed to merge PR") — propagate
+                # it unchanged.
+                if "Failed to merge PR" in str(inner_e):
                     raise inner_e from e
-                else:
-                    raise e from inner_e
+                # Otherwise the PR-state re-fetch itself failed.  Still
+                # surface GitHub's response body (the actionable reason)
+                # when we captured it, rather than dropping back to the
+                # bare status-line ``HTTPStatusError``.
+                if github_detail:
+                    raise Exception(
+                        f"Failed to merge PR #{number} in {owner}/{repo}. "
+                        f"Error: {str(e)}. GitHub: {github_detail}"
+                    ) from e
+                raise e from inner_e
 
 
     async def enable_auto_merge(
