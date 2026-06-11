@@ -103,6 +103,14 @@ dev = [
   "types-requests>=2.32.4.20260107",
 ]
 
+[tool.uv]
+# Supply-chain cooldown: refuse to resolve anything published in the
+# last 7 days, giving the community time to catch a compromised release
+# before it can be locked. Rolling window, re-evaluated on every
+# `uv lock` (no manual date bump). The relative-duration form requires
+# uv >= 0.9.17.
+exclude-newer = "7 days"
+
 [tool.pytest.ini_options]
 testpaths = [
   "tests/",
