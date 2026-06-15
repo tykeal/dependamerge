@@ -597,16 +597,20 @@ def _chmod_tree_safe(
                 try:
                     os.chmod(fp, file_mode)
                 except Exception:
+                    # Best-effort: skip files we cannot chmod; the
+                    # later rmtree retry handles stubborn paths.
                     pass
             for name in dirs:
                 dp = Path(root) / name
                 try:
                     os.chmod(dp, dir_mode)
                 except Exception:
+                    # Best-effort: skip dirs we cannot chmod.
                     pass
         try:
             os.chmod(p, dir_mode)
         except Exception:
+            # Best-effort: ignore failure to chmod the tree root.
             pass
     except Exception:
         # Ignore any errors; deletion attempts will proceed anyway

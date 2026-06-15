@@ -147,6 +147,7 @@ class GitHubService:
                     f"Tuning: prs={DEFAULT_PRS_PAGE_SIZE} files={DEFAULT_FILES_PAGE_SIZE} comments={DEFAULT_COMMENTS_PAGE_SIZE} contexts={DEFAULT_CONTEXTS_PAGE_SIZE}"
                 )
             except Exception:
+                # Progress display is best-effort; ignore UI errors.
                 pass
 
     async def _on_rate_limit_cleared(self) -> None:
@@ -160,6 +161,7 @@ class GitHubService:
                 f"Tuning: prs={DEFAULT_PRS_PAGE_SIZE} files={DEFAULT_FILES_PAGE_SIZE} comments={DEFAULT_COMMENTS_PAGE_SIZE} contexts={DEFAULT_CONTEXTS_PAGE_SIZE}"
             )
         except Exception:
+            # Progress display is best-effort; ignore UI errors.
             pass
 
     async def _on_metrics(self, concurrency: int, rps: float) -> None:
@@ -442,6 +444,7 @@ class GitHubService:
             try:
                 self._progress.analyze_pr(pr.get("number", 0), repo_full_name)
             except Exception:
+                # Progress display is best-effort; ignore UI errors.
                 pass
 
         reasons: list[UnmergeableReason] = []
@@ -753,6 +756,9 @@ class GitHubService:
                         try:
                             self._progress.found_similar_pr()  # type: ignore[attr-defined]
                         except Exception:
+                            # No-op when the tracker lacks this method or
+                            # the display update fails; counting is
+                            # cosmetic only.
                             pass
 
             results.extend(matching_prs_in_repo)

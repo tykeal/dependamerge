@@ -239,6 +239,7 @@ class FixOrchestrator:
                     try:
                         op("Fetching PR details for fix candidates...")
                     except Exception:
+                        # Progress display is best-effort; ignore UI errors.
                         pass
 
             contexts = asyncio.run(self.fetch_pr_details(selections))
@@ -262,6 +263,7 @@ class FixOrchestrator:
                         try:
                             op("Preparing workspaces (clone/fetch repos)...")
                         except Exception:
+                            # Progress display is best-effort; ignore UI errors.
                             pass
                 prepared += self._prepare_workspaces_parallel(
                     to_prepare, base_dir, options
@@ -293,6 +295,7 @@ class FixOrchestrator:
                         try:
                             suspend_fn()
                         except Exception:
+                            # Progress display is best-effort; ignore UI errors.
                             pass
                 self._log(
                     f"Starting interactive rebase for {ctx.base_repo_full_name}#{ctx.pr_number} in {workspace}"
@@ -314,6 +317,8 @@ class FixOrchestrator:
                     try:
                         rebase_abort(cwd=workspace)
                     except Exception:
+                        # Cleanup abort is best-effort; the failure is
+                        # already recorded below regardless.
                         pass
                     results.append(
                         FixResult(
@@ -343,6 +348,7 @@ class FixOrchestrator:
                             try:
                                 resume_fn()
                             except Exception:
+                                # Progress display is best-effort; ignore UI errors.
                                 pass
 
             return results

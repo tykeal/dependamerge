@@ -38,9 +38,29 @@ from typing import Any
 
 # Re-export .gitreview symbols so existing callers don't need to change
 # their imports.  The canonical implementation lives in gitreview.py.
-from .gitreview import GitReviewInfo as GitReviewInfo
-from .gitreview import fetch_gitreview_from_github as fetch_gitreview_from_github
-from .gitreview import parse_gitreview_text as parse_gitreview_text
+from .gitreview import (
+    GitReviewInfo,
+    fetch_gitreview_from_github,
+    parse_gitreview_text,
+)
+
+__all__ = [
+    # Re-exported .gitreview symbols (backward-compatible API).
+    "GitReviewInfo",
+    "fetch_gitreview_from_github",
+    "parse_gitreview_text",
+    # Public API defined in this module.
+    "GITHUB2GERRIT_BOT_AUTHORS",
+    "GitHub2GerritMode",
+    "GitHub2GerritMapping",
+    "GitHub2GerritDetectionResult",
+    "detect_github2gerrit_comments",
+    "detect_github2gerrit_from_graphql_comments",
+    "has_github2gerrit_comments",
+    "build_gerrit_change_url_from_mapping",
+    "build_gerrit_submission_comment",
+    "build_gerrit_skip_message",
+]
 
 log = logging.getLogger("dependamerge.github2gerrit_detector")
 
@@ -287,7 +307,7 @@ def build_gerrit_submission_comment(
         lines.extend(
             [
                 "The corresponding Gerrit change has been reviewed (+2) "
-                "and submitted ✅",
+                + "and submitted ✅",
                 "",
                 f"Gerrit change URL: {gerrit_url}",
                 "",
@@ -297,7 +317,7 @@ def build_gerrit_submission_comment(
         lines.extend(
             [
                 "The corresponding Gerrit change has been reviewed (+2) "
-                "and submitted ✅",
+                + "and submitted ✅",
                 "",
             ]
         )
@@ -305,11 +325,11 @@ def build_gerrit_submission_comment(
     lines.extend(
         [
             "The changes from this PR are now part of the main codebase "
-            "in Gerrit.",
+            + "in Gerrit.",
             "",
             "---",
             "*This is an automated action performed by dependamerge "
-            "(GitHub2Gerrit awareness).*",
+            + "(GitHub2Gerrit awareness).*",
         ]
     )
 

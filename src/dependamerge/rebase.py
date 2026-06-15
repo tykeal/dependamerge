@@ -462,6 +462,8 @@ async def local_rebase_pr(
             try:
                 rebase_abort(cwd=workspace, logger=log.debug)
             except Exception:
+                # Cleanup abort is best-effort; ignore so the original
+                # rebase failure still drives the retry below.
                 pass
 
             try:
@@ -504,6 +506,8 @@ async def local_rebase_pr(
                 try:
                     rebase_abort(cwd=workspace, logger=log.debug)
                 except Exception:
+                    # Cleanup abort is best-effort; ignore and return
+                    # failure to the caller regardless.
                     pass
                 return False
             log.debug(
