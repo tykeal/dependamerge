@@ -476,7 +476,7 @@ class TestDetectStuckDcoRobustness:
         assert age == 0.0
 
     @pytest.mark.asyncio
-    async def test_unparseable_timestamps_return_safe_default(self) -> None:
+    async def test_unparsable_timestamps_return_safe_default(self) -> None:
         mgr, client = _make_manager()
         pr = _make_pr_info()
 
