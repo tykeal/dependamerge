@@ -107,6 +107,8 @@ class ProgressTracker:
             try:
                 self.live.stop()
             except Exception:
+                # Best-effort teardown: ignore errors from Rich when
+                # the terminal no longer accepts control sequences.
                 pass
         else:
             # Non-Rich fallback: emit a final newline so the shell
@@ -123,6 +125,8 @@ class ProgressTracker:
             try:
                 self.live.stop()
             except Exception:
+                # Best-effort suspend: ignore Rich teardown errors so an
+                # interactive prompt can still take over the terminal.
                 pass
             self.paused = True
 
@@ -549,27 +553,13 @@ class DummyProgressTracker(ProgressTracker):
     """A no-op progress tracker for when progress display is disabled."""
 
     def __init__(self) -> None:
-        # Don't call super().__init__() to avoid Rich initialization
-        self.organization = ""
-        self.start_time = datetime.now()
+        # Initialize the base tracker, then neutralize Rich so this
+        # stand-in performs no terminal output.
+        super().__init__("", show_pr_stats=False)
         self.console = None
-        self.total_repositories = 0
-        self.completed_repositories = 0
-        self.current_repository = ""
-        self.total_prs_analyzed = 0
-        self.unmergeable_prs_found = 0
-        self.current_operation = ""
-        self.errors_count = 0
-        self.show_pr_stats = False
-        self.rate_limited = False
-        self.rate_limit_reset_time = None
-        self.live = None
         self.rich_available = False
-        self.paused = False
-        self.metrics_concurrency = None
-        self.metrics_rps = None
-        self._last_display = ""
-        # MergeProgressTracker fields
+        self.current_operation = ""
+        # MergeProgressTracker fields (Dummy stands in for either tracker)
         self.similar_prs_found = 0
         self.prs_merged = 0
         self.prs_failed = 0

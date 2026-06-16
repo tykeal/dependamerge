@@ -312,6 +312,8 @@ class GitHubAsync:
                 try:
                     response_text = str(getattr(response, "text", "")).lower()
                 except AttributeError:
+                    # Response object exposes no readable body; fall
+                    # back to the empty default and keep classifying.
                     pass
 
             error_lower = error_str.lower()
@@ -500,19 +502,26 @@ class GitHubAsync:
 
             # Primary rate limit exhausted
             if remaining == 0 or _is_primary_rate_limited(body_text):
-                # Check for Retry-After header on 429 responses
+                # Honor a Retry-After header if present (primary rate
+                # limits may be reported as 403 or 429).  Parse it up
+                # front so that an unparsable value (e.g. an HTTP-date)
+                # falls back to the reset/backoff handling below rather
+                # than triggering an immediate retry.
                 retry_after = r.headers.get("Retry-After")
+                retry_after_delay: float | None = None
                 if retry_after:
                     try:
-                        delay = float(retry_after)
-                        self._last_retry_after = delay
-                        self.log.warning(
-                            "Primary rate limit with Retry-After: %ss", delay
-                        )
-                        await asyncio.sleep(max(0.0, delay))
-                        self._apply_retry_after_throttling(delay)
-                    except Exception:
-                        pass
+                        retry_after_delay = float(retry_after)
+                    except (TypeError, ValueError):
+                        retry_after_delay = None
+                if retry_after_delay is not None:
+                    self._last_retry_after = retry_after_delay
+                    self.log.warning(
+                        "Primary rate limit with Retry-After: %ss",
+                        retry_after_delay,
+                    )
+                    await asyncio.sleep(max(0.0, retry_after_delay))
+                    self._apply_retry_after_throttling(retry_after_delay)
                 elif reset_epoch:
                     self.log.warning(
                         "Primary rate limit exhausted. Waiting until reset: %s",
@@ -535,16 +544,22 @@ class GitHubAsync:
             # Check for Retry-After on 429 or 503 responses
             retry_after = r.headers.get("Retry-After")
             if retry_after:
+                retry_after_delay = None
                 try:
-                    delay = float(retry_after)
-                    self._last_retry_after = delay
+                    retry_after_delay = float(retry_after)
+                except (TypeError, ValueError):
+                    # Retry-After was not a numeric delay; fall through
+                    # to the standard retry handling.
+                    retry_after_delay = None
+                if retry_after_delay is not None:
+                    self._last_retry_after = retry_after_delay
                     self.log.debug(
-                        "HTTP %s with Retry-After: %ss", r.status_code, delay
+                        "HTTP %s with Retry-After: %ss",
+                        r.status_code,
+                        retry_after_delay,
                     )
-                    await asyncio.sleep(max(0.0, delay))
-                    self._apply_retry_after_throttling(delay)
-                except Exception:
-                    pass
+                    await asyncio.sleep(max(0.0, retry_after_delay))
+                    self._apply_retry_after_throttling(retry_after_delay)
 
             self._track_error("transient_error")
             self.log.debug("Retryable HTTP status %s received", r.status_code)
@@ -1321,6 +1336,8 @@ class GitHubAsync:
                                 seen_contexts.add(ctx)
                                 required_checks.append(check)
             except Exception:
+                # Branch protection may be absent or inaccessible with
+                # the current token; treat as no required checks.
                 pass
 
         return required_checks
@@ -1401,7 +1418,6 @@ class GitHubAsync:
                 self.log.debug(
                     f"Could not check detailed collaborator permissions: {e}"
                 )
-                pass
 
             # If we have push permissions but not admin
             if permissions.get("push"):
@@ -1655,6 +1671,8 @@ class GitHubAsync:
                         else:
                             human_changes_requested = True
         except Exception:
+            # Review data is best-effort; on API error leave the
+            # approval/changes flags at their safe defaults.
             pass
 
         # Check for unresolved review comments
@@ -1672,6 +1690,8 @@ class GitHubAsync:
                         if "dismissed" not in body and "resolved" not in body:
                             unresolved_copilot_comments += 1
         except Exception:
+            # Review comments are best-effort; ignore fetch errors and
+            # leave the Copilot comment count unchanged.
             pass
 
         # Check runs and status contexts - look for failing (check this first as it's most specific)
@@ -1701,6 +1721,8 @@ class GitHubAsync:
                     if conclusion in ["failure", "cancelled", "timed_out"]:
                         failing_checks.append(name)
         except Exception:
+            # Check-runs API may be unavailable; proceed with whatever
+            # checks were collected so far.
             pass
 
         try:
@@ -1724,6 +1746,8 @@ class GitHubAsync:
                         if context not in failing_checks:
                             failing_checks.append(context)
         except Exception:
+            # Status API may be unavailable; proceed with whatever
+            # status contexts were collected so far.
             pass
 
         # Detect missing/pending required status checks (e.g. stale pre-commit.ci)

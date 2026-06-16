@@ -118,7 +118,6 @@ def main(
     """
     # The actual handling is done via the version_callback.
     # This callback exists only to expose --version at the top level.
-    pass
 
 
 console = Console(markup=False)

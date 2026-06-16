@@ -505,6 +505,8 @@ class AsyncMergeManager:
                 try:
                     self.progress_tracker.update_operation("")
                 except Exception:
+                    # Defensive: a failing tracker must never take down
+                    # the shutdown path.
                     pass
             raise
 
@@ -535,6 +537,8 @@ class AsyncMergeManager:
                                 f"[{int(remaining)}s remaining]"
                             )
                         except Exception:
+                            # Console output is best-effort; ignore
+                            # write errors on unusual terminals.
                             pass
                         last_emit = now
                 else:
@@ -2141,6 +2145,7 @@ class AsyncMergeManager:
         try:
             self._console.print(f"⚠️ Unable to add pull request comment: {html_url}")
         except Exception:
+            # Console output is best-effort; ignore write errors.
             pass
         return False
 
@@ -4463,7 +4468,6 @@ class AsyncMergeManager:
             except Exception as e:
                 self.log.debug(f"Failed to get detailed block reason: {e}")
                 # Fallback to generic message
-                pass
 
             # Fallback logic when detailed analysis fails
             if pr_info.mergeable is True:
