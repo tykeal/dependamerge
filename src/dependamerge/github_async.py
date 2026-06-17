@@ -180,13 +180,30 @@ class GitHubAsync:
     - Helpers for GraphQL and REST endpoints used by dependamerge
     """
 
+    # Default ceiling for concurrent in-flight requests. Used both as the
+    # constructor default and as the upper bound when adaptive tuning ramps
+    # concurrency back up after a period of throttling.
+    _DEFAULT_MAX_CONCURRENCY = 20
+
+    # Heuristic used by ``_get_recent_error_rate`` to estimate how many
+    # requests accompanied each observed error within the error window.
+    # We do not track total request counts, only errors, so we assume each
+    # error corresponds to roughly this many requests. With the current
+    # value of 10 the estimate is errors / (errors * 10), so any window
+    # containing at least one error yields an error_rate of ~0.1. A smaller
+    # number raises that estimate and reacts to errors more aggressively,
+    # while a larger number lowers it and tolerates more errors before
+    # throttling. Tune this if observed throttling behaviour is too eager
+    # or too lax.
+    _ESTIMATED_REQUESTS_PER_ERROR = 10
+
     def __init__(
         self,
         token: str | None = None,
         *,
         api_url: str = GITHUB_API,
         graphql_url: str = GITHUB_GQL,
-        max_concurrency: int = 20,
+        max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
         requests_per_second: float = 8.0,
         timeout: float = 20.0,
         user_agent: str = "dependamerge/async-client",
@@ -221,6 +238,11 @@ class GitHubAsync:
         self.api_url = api_url.rstrip("/")
         self.graphql_url = graphql_url
         self._max_concurrency = max_concurrency
+        # Remember the caller-configured ceiling so adaptive tuning ramps
+        # concurrency back up to *this* value (not the class default) after
+        # a period of throttling, mirroring how ``_base_rps`` bounds the RPS
+        # ramp-up.
+        self._base_max_concurrency = max_concurrency
         self.semaphore = asyncio.Semaphore(self._max_concurrency)
         self._base_rps = requests_per_second
         self._current_rps = requests_per_second
@@ -603,8 +625,10 @@ class GitHubAsync:
                         )
             else:
                 # Gradually increase limits when healthy, up to configured base values
-                if self._max_concurrency < 20:
-                    self._max_concurrency = min(20, self._max_concurrency + 1)
+                if self._max_concurrency < self._base_max_concurrency:
+                    self._max_concurrency = min(
+                        self._base_max_concurrency, self._max_concurrency + 1
+                    )
                     self.semaphore = asyncio.Semaphore(self._max_concurrency)
                 if self._current_rps < self._base_rps:
                     self._current_rps = min(self._base_rps, self._current_rps + 1.0)
@@ -772,30 +796,7 @@ class GitHubAsync:
                 f"Merge API error for PR #{number} in {owner}/{repo}: {error_type}: {error_msg}"
             )
 
-            # Extract the response body.  GitHub puts the *actual*
-            # reason here — ruleset violations, "Required workflows ...
-            # are not satisfied", required-check names, etc.  The
-            # ``HTTPStatusError`` text only carries the status line
-            # (e.g. "405 Method Not Allowed"), so without this the real
-            # cause is silently lost.  Whitespace/newlines are
-            # collapsed so the reason fits on a single status line.
-            github_detail = ""
-            response = getattr(e, "response", None)
-            if response is not None:
-                try:
-                    body = response.json()
-                    if isinstance(body, dict) and isinstance(
-                        body.get("message"), str
-                    ):
-                        github_detail = " ".join(body["message"].split())
-                except Exception:
-                    github_detail = ""
-                if not github_detail:
-                    try:
-                        raw = getattr(response, "text", "") or ""
-                        github_detail = " ".join(raw.split())[:500]
-                    except Exception:
-                        github_detail = ""
+            github_detail = self._extract_github_error_detail(e)
             if github_detail:
                 self.log.debug(
                     f"GitHub merge API response body for #{number}: {github_detail}"
@@ -806,80 +807,130 @@ class GitHubAsync:
             # but we still see an error from rate-limiting, network, or
             # JSON parsing), and the state adds context to the error we
             # raise.
-            try:
-                pr_data_response = await self.get(
-                    f"/repos/{owner}/{repo}/pulls/{number}"
+            return await self._validate_merge_result(
+                owner, repo, number, e, github_detail
+            )
+
+    @staticmethod
+    def _extract_github_error_detail(error: Exception) -> str:
+        """Extract GitHub's response-body message from a failed request.
+
+        GitHub puts the *actual* reason here — ruleset violations,
+        "Required workflows ... are not satisfied", required-check names,
+        etc.  The ``HTTPStatusError`` text only carries the status line
+        (e.g. "405 Method Not Allowed"), so without this the real cause is
+        silently lost.  Whitespace/newlines are collapsed so the reason
+        fits on a single status line.
+
+        Returns an empty string when no detail could be extracted.
+        """
+        response = getattr(error, "response", None)
+        if response is None:
+            return ""
+        try:
+            body = response.json()
+            if isinstance(body, dict) and isinstance(body.get("message"), str):
+                return " ".join(body["message"].split())
+        except Exception:
+            pass
+        try:
+            raw = getattr(response, "text", "") or ""
+            return " ".join(raw.split())[:500]
+        except Exception:
+            return ""
+
+    async def _validate_merge_result(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        error: Exception,
+        github_detail: str,
+    ) -> bool:
+        """Re-check PR state after a merge attempt raised an exception.
+
+        The merge may have actually succeeded despite the exception (a race
+        where the API call lands but we still see an error from
+        rate-limiting, network, or JSON parsing).  When the PR is confirmed
+        merged, return ``True``.  Otherwise raise an enhanced exception that
+        preserves the original error text (its HTTP status line is
+        string-matched by ``_merge_pr_with_retry`` to classify retryable vs
+        terminal failures) and adds GitHub's actionable response body plus
+        PR-state context.
+        """
+        try:
+            pr_data_response = await self.get(f"/repos/{owner}/{repo}/pulls/{number}")
+            # PR data should always be a dict, not a list
+            pr_data = pr_data_response if isinstance(pr_data_response, dict) else {}
+
+            # Extract relevant state information
+            mergeable = pr_data.get("mergeable")
+            mergeable_state = pr_data.get("mergeable_state")
+            state = pr_data.get("state")
+            merged = pr_data.get("merged", False)
+            draft = pr_data.get("draft", False)
+
+            # Check if the merge actually succeeded despite the exception.
+            # This handles race conditions where the API succeeds but we get
+            # an exception due to rate limiting, network issues, JSON
+            # parsing, etc.
+            if state == "closed" and merged:
+                self.log.info(
+                    f"PR #{number} in {owner}/{repo} was successfully merged despite exception: {error}"
                 )
-                # PR data should always be a dict, not a list
-                pr_data = pr_data_response if isinstance(pr_data_response, dict) else {}
+                return True
 
-                # Extract relevant state information
-                mergeable = pr_data.get("mergeable")
-                mergeable_state = pr_data.get("mergeable_state")
-                state = pr_data.get("state")
-                merged = pr_data.get("merged", False)
-                draft = pr_data.get("draft", False)
+            # Enhanced error message.  Always keep the original error text —
+            # it carries the HTTP status line (e.g. "405 Method Not
+            # Allowed") that ``_merge_pr_with_retry`` string-matches to
+            # classify retryable vs terminal failures; dropping it made
+            # every blocked/ruleset 405 fall through to the generic retry
+            # path (3 attempts + sleeps).  Then *add* GitHub's response body
+            # (the actionable reason) when we captured it.
+            error_msg = (
+                f"Failed to merge PR #{number} in {owner}/{repo}. Error: {str(error)}."
+            )
+            if github_detail:
+                error_msg += f" GitHub: {github_detail}"
+            error_msg += (
+                f" (PR state: {state}, mergeable: {mergeable}, "
+                f"mergeable_state: {mergeable_state})"
+            )
 
-                # Check if the merge actually succeeded despite the exception
-                # This handles race conditions where the API succeeds but we get an exception
-                # due to rate limiting, network issues, JSON parsing, etc.
-                if state == "closed" and merged:
-                    self.log.info(
-                        f"PR #{number} in {owner}/{repo} was successfully merged despite exception: {e}"
-                    )
-                    return True
+            # Note common state-based causes for 405-style errors.
+            if mergeable_state == "blocked":
+                error_msg += " [blocked by branch protection / required checks]"
+            elif mergeable_state == "behind":
+                error_msg += " [PR branch is behind base branch]"
+            elif mergeable_state == "dirty":
+                error_msg += " [PR has merge conflicts]"
+            elif draft:
+                error_msg += " [cannot merge draft PR]"
+            elif state == "closed" and not merged:
+                error_msg += " [PR was closed without merging]"
+            elif state != "open":
+                error_msg += f" [PR is not open, state: {state}]"
 
-                # Enhanced error message.  Always keep the original
-                # error text — it carries the HTTP status line (e.g.
-                # "405 Method Not Allowed") that ``_merge_pr_with_retry``
-                # string-matches to classify retryable vs terminal
-                # failures; dropping it made every blocked/ruleset 405
-                # fall through to the generic retry path (3 attempts +
-                # sleeps).  Then *add* GitHub's response body (the
-                # actionable reason) when we captured it.
-                error_msg = (
+            raise Exception(error_msg) from error
+        except Exception as inner_e:
+            # The enhanced-error path raised successfully (the message
+            # starts with "Failed to merge PR") — propagate it unchanged.
+            # A bare ``raise`` preserves ``inner_e`` together with its
+            # existing ``__cause__`` (set to ``error`` above) and original
+            # traceback, whereas ``raise inner_e from error`` would rewrite
+            # the chaining.
+            if "Failed to merge PR" in str(inner_e):
+                raise
+            # Otherwise the PR-state re-fetch itself failed.  Still surface
+            # GitHub's response body (the actionable reason) when we
+            # captured it, rather than dropping back to the bare
+            # status-line ``HTTPStatusError``.
+            if github_detail:
+                raise Exception(
                     f"Failed to merge PR #{number} in {owner}/{repo}. "
-                    f"Error: {str(e)}."
-                )
-                if github_detail:
-                    error_msg += f" GitHub: {github_detail}"
-                error_msg += (
-                    f" (PR state: {state}, mergeable: {mergeable}, "
-                    f"mergeable_state: {mergeable_state})"
-                )
-
-                # Note common state-based causes for 405-style errors.
-                if mergeable_state == "blocked":
-                    error_msg += " [blocked by branch protection / required checks]"
-                elif mergeable_state == "behind":
-                    error_msg += " [PR branch is behind base branch]"
-                elif mergeable_state == "dirty":
-                    error_msg += " [PR has merge conflicts]"
-                elif draft:
-                    error_msg += " [cannot merge draft PR]"
-                elif state == "closed" and not merged:
-                    error_msg += " [PR was closed without merging]"
-                elif state != "open":
-                    error_msg += f" [PR is not open, state: {state}]"
-
-                raise Exception(error_msg) from e
-            except Exception as inner_e:
-                # The enhanced-error path raised successfully (the
-                # message starts with "Failed to merge PR") — propagate
-                # it unchanged.
-                if "Failed to merge PR" in str(inner_e):
-                    raise inner_e from e
-                # Otherwise the PR-state re-fetch itself failed.  Still
-                # surface GitHub's response body (the actionable reason)
-                # when we captured it, rather than dropping back to the
-                # bare status-line ``HTTPStatusError``.
-                if github_detail:
-                    raise Exception(
-                        f"Failed to merge PR #{number} in {owner}/{repo}. "
-                        f"Error: {str(e)}. GitHub: {github_detail}"
-                    ) from e
-                raise e from inner_e
-
+                    f"Error: {str(error)}. GitHub: {github_detail}"
+                ) from error
+            raise error from inner_e
 
     async def enable_auto_merge(
         self, pull_request_node_id: str, merge_method: str = "MERGE"
@@ -1022,12 +1073,17 @@ class GitHubAsync:
             per_page=100,
         ):
             if not isinstance(commits, list):
-                # Unexpected response shape — assume OK to avoid
-                # false positives. The API returned 200 OK but in
-                # an unexpected shape, which is distinct from a
-                # network/HTTP error and arguably means the page
-                # is empty.
-                return True, []
+                # Unexpected response shape: the API returned 200 OK but
+                # not the documented list of commits. We cannot determine
+                # signature status from this, so we must not pretend every
+                # commit is verified (the old fail-open ``(True, [])``
+                # default collided with the signature-preservation gate in
+                # ``rebase.py``). Surface the uncertainty to the caller.
+                raise RuntimeError(
+                    "Unexpected response shape from "
+                    f"/repos/{owner}/{repo}/pulls/{number}/commits: "
+                    f"expected a list, got {type(commits).__name__}"
+                )
 
             for commit_data in commits:
                 if not isinstance(commit_data, dict):
@@ -1085,8 +1141,7 @@ class GitHubAsync:
             # 404 → not enabled; other errors → continue checking rulesets
             if "404" not in str(e):
                 self.log.debug(
-                    "Error checking classic signature requirement for "
-                    "%s/%s:%s: %s",
+                    "Error checking classic signature requirement for %s/%s:%s: %s",
                     owner,
                     repo,
                     branch,
@@ -1149,9 +1204,7 @@ class GitHubAsync:
                     continue
                 # Check if this ruleset applies to our branch
                 conditions = detail.get("conditions", {})
-                if isinstance(
-                    conditions, dict
-                ) and not self._ruleset_applies_to_branch(
+                if isinstance(conditions, dict) and not self._ruleset_applies_to_branch(
                     conditions, branch, default_branch
                 ):
                     continue
@@ -1174,8 +1227,7 @@ class GitHubAsync:
                             return True
         except Exception as e:
             self.log.debug(
-                "Error checking rulesets for signature requirement on "
-                "%s/%s:%s: %s",
+                "Error checking rulesets for signature requirement on %s/%s:%s: %s",
                 owner,
                 repo,
                 branch,
@@ -1207,8 +1259,6 @@ class GitHubAsync:
         If the conditions dict is empty or missing ``ref_name`` the
         ruleset is assumed to apply (conservative).
         """
-        import fnmatch
-
         ref_name = conditions.get("ref_name", {})
         if not isinstance(ref_name, dict):
             return True  # No conditions — assume applies
@@ -1218,27 +1268,49 @@ class GitHubAsync:
 
         full_ref = f"refs/heads/{branch}"
 
-        def _matches(pattern: str) -> bool:
-            if pattern == "~ALL":
-                return True
-            if pattern == "~DEFAULT_BRANCH":
-                if default_branch is None:
-                    # Unknown default branch — conservatively assume match
-                    return True
-                return branch == default_branch
-            # Normalise bare branch names to full refs
-            pat = pattern if pattern.startswith("refs/") else f"refs/heads/{pattern}"
-            return fnmatch.fnmatchcase(full_ref, pat)
-
         # Must match at least one include pattern (if any are specified)
-        if include and not any(_matches(p) for p in include if isinstance(p, str)):
+        if include and not any(
+            GitHubAsync._ref_pattern_matches(p, branch, full_ref, default_branch)
+            for p in include
+            if isinstance(p, str)
+        ):
             return False
 
         # Must not match any exclude pattern
-        if any(_matches(p) for p in exclude if isinstance(p, str)):
+        if any(
+            GitHubAsync._ref_pattern_matches(p, branch, full_ref, default_branch)
+            for p in exclude
+            if isinstance(p, str)
+        ):
             return False
 
         return True
+
+    @staticmethod
+    def _ref_pattern_matches(
+        pattern: str,
+        branch: str,
+        full_ref: str,
+        default_branch: str | None,
+    ) -> bool:
+        """Check whether a single ruleset ref pattern matches *branch*.
+
+        Defined as a static helper method (rather than a closure inside
+        ``_ruleset_applies_to_branch``) so it is not re-created on every
+        call and can be reused across the include/exclude comprehensions.
+        """
+        import fnmatch
+
+        if pattern == "~ALL":
+            return True
+        if pattern == "~DEFAULT_BRANCH":
+            if default_branch is None:
+                # Unknown default branch — conservatively assume match
+                return True
+            return branch == default_branch
+        # Normalise bare branch names to full refs
+        pat = pattern if pattern.startswith("refs/") else f"refs/heads/{pattern}"
+        return fnmatch.fnmatchcase(full_ref, pat)
 
     async def get_required_status_checks(
         self, owner: str, repo: str, branch: str
@@ -1268,9 +1340,7 @@ class GitHubAsync:
 
         # Try rulesets first (org-level and repo-level)
         try:
-            rulesets = await self.get(
-                f"/repos/{owner}/{repo}/rulesets?per_page=100"
-            )
+            rulesets = await self.get(f"/repos/{owner}/{repo}/rulesets?per_page=100")
             if isinstance(rulesets, list):
                 for ruleset in rulesets:
                     if not isinstance(ruleset, dict):
@@ -1303,12 +1373,8 @@ class GitHubAsync:
                                 continue
                             if rule.get("type") == "required_status_checks":
                                 params = rule.get("parameters", {})
-                                for check in params.get(
-                                    "required_status_checks", []
-                                ):
-                                    if isinstance(check, dict) and check.get(
-                                        "context"
-                                    ):
+                                for check in params.get("required_status_checks", []):
+                                    if isinstance(check, dict) and check.get("context"):
                                         ctx = check["context"]
                                         if ctx not in seen_contexts:
                                             seen_contexts.add(ctx)
@@ -1500,7 +1566,11 @@ class GitHubAsync:
 
             try:
                 # Perform a lightweight check for each operation
-                if operation in ("approve", "merge", "close", "update_branch") and owner and repo:
+                if (
+                    operation in ("approve", "merge", "close", "update_branch")
+                    and owner
+                    and repo
+                ):
                     # Use the collaborator permission endpoint to verify
                     # the token has write access to this specific repo.
                     #
@@ -1562,13 +1632,9 @@ class GitHubAsync:
                     # success.
                     default_branch = "main"
                     try:
-                        repo_data = await self.get(
-                            f"/repos/{owner}/{repo}"
-                        )
+                        repo_data = await self.get(f"/repos/{owner}/{repo}")
                         if isinstance(repo_data, dict):
-                            default_branch = repo_data.get(
-                                "default_branch", "main"
-                            )
+                            default_branch = repo_data.get("default_branch", "main")
                     except Exception:
                         # Repo metadata fetch failed — token may lack
                         # access.  Let the error propagate to the outer
@@ -1792,14 +1858,18 @@ class GitHubAsync:
 
         if missing_required_checks:
             if len(missing_required_checks) == 1:
-                return f"Blocked by missing required status: {missing_required_checks[0]}"
+                return (
+                    f"Blocked by missing required status: {missing_required_checks[0]}"
+                )
             else:
                 names = ", ".join(missing_required_checks)
                 return f"Blocked by {len(missing_required_checks)} missing required statuses: {names}"
 
         if pending_required_checks:
             if len(pending_required_checks) == 1:
-                return f"Blocked by pending required check: {pending_required_checks[0]}"
+                return (
+                    f"Blocked by pending required check: {pending_required_checks[0]}"
+                )
             else:
                 names = ", ".join(pending_required_checks)
                 return f"Blocked by {len(pending_required_checks)} pending required checks: {names}"
@@ -1879,9 +1949,13 @@ class GitHubAsync:
         cutoff = current_time - self._error_window
         recent_errors = [e for t, e in self._error_history if t > cutoff]
 
-        # Estimate request rate (very rough heuristic)
-        # Assume we made approximately len(history) * 10 requests in the window
-        estimated_requests = max(len(recent_errors) * 10, 1)
+        # Estimate request rate (very rough heuristic): we only track
+        # errors, not total requests, so assume each error accompanied
+        # ``_ESTIMATED_REQUESTS_PER_ERROR`` requests in the window. See the
+        # constant's definition for the rationale and tuning guidance.
+        estimated_requests = max(
+            len(recent_errors) * self._ESTIMATED_REQUESTS_PER_ERROR, 1
+        )
         return len(recent_errors) / estimated_requests
 
     def _apply_retry_after_throttling(self, retry_after_seconds: float) -> None:
