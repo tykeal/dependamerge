@@ -163,10 +163,11 @@ async def _maybe_await(
     cb: Callable[..., None | Awaitable[None]] | None, *args, **kwargs
 ) -> None:
     if cb is None:
-        return
+        return None
     result = cb(*args, **kwargs)
-    if asyncio.iscoroutine(result):
-        return await cast("Awaitable[None]", result)
+    if not asyncio.iscoroutine(result):
+        return None
+    return await cast("Awaitable[None]", result)
 
 
 class GitHubAsync:
