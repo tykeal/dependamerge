@@ -1149,7 +1149,6 @@ def _handle_repo_merge(
                 console.print("ℹ️  Excluding human PRs from merge.")
                 # Remove human PRs from the working set
                 repo_prs = automation_prs
-                human_prs = []
                 if not repo_prs:
                     console.print("❌ No automation PRs remain to merge.")
                     return

@@ -1352,7 +1352,6 @@ class AsyncMergeManager:
                     # also calls ``analyze_block_reason``) and either
                     # defer to auto-merge or surface a manual-merge
                     # error promptly.
-                    pre_block_reason = None
                     should_wait = False
 
                 if should_wait and pre_block_reason is not None:
@@ -4335,11 +4334,7 @@ class AsyncMergeManager:
         stuck_reported = False
         if pr_info.author != "dependabot[bot]" and not self.preview_mode:
             try:
-                (
-                    is_stuck,
-                    stuck_check,
-                    _stuck_age,
-                ) = await self._detect_stuck_required_check(pr_info)
+                detection = await self._detect_stuck_required_check(pr_info)
             except Exception as exc:
                 self.log.debug(
                     "_detect_stuck_required_check failed for %s#%s: %s",
@@ -4347,9 +4342,9 @@ class AsyncMergeManager:
                     pr_info.number,
                     exc,
                 )
-                is_stuck = False
-                stuck_check = None
-            if is_stuck:
+                detection = None
+            if detection is not None and detection[0]:
+                stuck_check = detection[1]
                 # markup=False: a check name may contain characters
                 # Rich would otherwise treat as markup.
                 self._console.print(

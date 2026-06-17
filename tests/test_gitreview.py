@@ -6,7 +6,7 @@ Covers:
 - GitReviewInfo data model
 - parse_gitreview() — pure text parser
 - parse_gitreview_text() — backward-compatible alias
-- derive_base_path() / _derive_gerrit_base_path() — static known-host lookup
+- derive_base_path() — static known-host lookup
 - fetch_gitreview_from_github() — async GitHub API fetcher
 - Backward-compatible re-exports from github2gerrit_detector
 """
@@ -22,7 +22,6 @@ import pytest
 from dependamerge.gitreview import (
     DEFAULT_GERRIT_PORT,
     GitReviewInfo,
-    _derive_gerrit_base_path,
     derive_base_path,
     fetch_gitreview_from_github,
     parse_gitreview,
@@ -132,10 +131,6 @@ class TestDeriveBasePath:
 
     def test_empty_host(self) -> None:
         assert derive_base_path("") is None
-
-    def test_private_alias(self) -> None:
-        """_derive_gerrit_base_path is an alias for derive_base_path."""
-        assert _derive_gerrit_base_path is derive_base_path
 
 
 # -----------------------------------------------------------------------
