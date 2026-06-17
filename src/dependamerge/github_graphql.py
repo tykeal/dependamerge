@@ -20,6 +20,8 @@ __all__ = [
     "REPO_OPEN_PRS_PAGE",
     "ENABLE_AUTO_MERGE",
     "GET_BRANCH_PROTECTION",
+    "GET_PR_REVIEW_THREADS",
+    "RESOLVE_REVIEW_THREAD",
 ]
 
 # Lightweight query to list repositories without PR nodes for accurate counting.
@@ -230,21 +232,6 @@ query($owner: String!, $name: String!, $prsCursor: String, $prsPageSize: Int!, $
 }
 """
 
-# GraphQL mutations for managing review comments and reviews
-DISMISS_REVIEW_COMMENT = """
-mutation DismissReviewComment($commentId: ID!) {
-  dismissPullRequestReviewComment(input: {
-    pullRequestReviewCommentId: $commentId
-  }) {
-    pullRequestReviewComment {
-      id
-      state
-      author { login }
-    }
-  }
-}
-"""
-
 # GraphQL mutation to resolve a review thread
 RESOLVE_REVIEW_THREAD = """
 mutation ResolveReviewThread($threadId: ID!) {
@@ -289,21 +276,6 @@ query GetPullRequestReviewThreads($owner: String!, $name: String!, $number: Int!
           }
         }
       }
-    }
-  }
-}
-"""
-
-DISMISS_PULL_REQUEST_REVIEW = """
-mutation DismissPullRequestReview($reviewId: ID!, $message: String!) {
-  dismissPullRequestReview(input: {
-    pullRequestReviewId: $reviewId
-    message: $message
-  }) {
-    pullRequestReview {
-      id
-      state
-      author { login }
     }
   }
 }
