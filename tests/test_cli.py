@@ -118,6 +118,7 @@ class TestCLI:
                 return mock_pr
             elif pr_number == 5:
                 return similar_pr
+            return None
 
         mock_client.get_pull_request_info.side_effect = get_pr_info_side_effect
         mock_client.get_pr_status_details.return_value = "Ready to merge"
