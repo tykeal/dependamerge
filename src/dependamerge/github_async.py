@@ -11,6 +11,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import (
     Any,
+    cast,
 )
 from urllib.parse import quote
 
@@ -165,7 +166,7 @@ async def _maybe_await(
         return
     result = cb(*args, **kwargs)
     if asyncio.iscoroutine(result):
-        await result
+        return await cast("Awaitable[None]", result)
 
 
 class GitHubAsync:
