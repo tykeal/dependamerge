@@ -109,6 +109,9 @@ async def _drive_demo(manager: AsyncMergeManager) -> None:
         try:
             await ticker_task
         except asyncio.CancelledError:
+            # Expected: we just cancelled the ticker, so awaiting it
+            # re-raises the cancellation. Swallow it to allow a clean
+            # teardown of the demo.
             pass
 
 
@@ -151,6 +154,9 @@ async def _amain(plain: bool) -> int:
         try:
             tracker.stop()
         except Exception:
+            # Best-effort teardown: the demo is exiting regardless, so a
+            # failure to stop the progress tracker must not mask the
+            # outcome or raise from the ``finally`` block.
             pass
 
     print("[demo] finished")
