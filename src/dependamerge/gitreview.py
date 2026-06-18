@@ -147,6 +147,20 @@ def parse_gitreview(text: str) -> GitReviewInfo | None:
     * The ``[gerrit]`` section header itself is **not** required —
       the parser matches the key lines directly.
 
+    Inline comments are **not** supported. The ``.gitreview`` format
+    (as consumed by ``git-review``) is not a commented INI dialect, so
+    ``#`` and ``;`` are ordinary characters. Consequently:
+
+    * ``host=`` and ``project=`` capture the entire remainder of the
+      line as the value, so any trailing ``# comment`` becomes part of
+      the value (e.g. ``host=h # primary`` yields ``"h # primary"``).
+    * ``port=`` matches digits only, so a line carrying a trailing
+      comment fails to match and the parser falls back to
+      :data:`DEFAULT_GERRIT_PORT` rather than raising.
+
+    This mirrors ``git-review``'s own behaviour and is deliberately
+    distinct from the netrc parser, which *does* strip inline comments.
+
     Args:
         text: Raw text content of a ``.gitreview`` file.
 
