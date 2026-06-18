@@ -171,11 +171,17 @@ class TestCheckPrCommitSignatures:
 
     @pytest.mark.asyncio
     async def test_unexpected_response_shape(self):
-        """Non-list response should be treated as all verified."""
+        """Non-list response should raise rather than feign verification.
+
+        Returning ``(True, [])`` for an unexpected shape was misleading:
+        it claimed every commit was verified when the actual state was
+        unknown. The method now raises so callers can decide how to
+        handle the uncertainty explicitly.
+        """
         api = AsyncMock(spec=GitHubAsync)
         api.get_paginated = lambda *a, **kw: _async_gen({"unexpected": "dict"})
-        result = await GitHubAsync.check_pr_commit_signatures(api, "owner", "repo", 42)
-        assert result == (True, [])
+        with pytest.raises(RuntimeError, match="Unexpected response shape"):
+            await GitHubAsync.check_pr_commit_signatures(api, "owner", "repo", 42)
 
 
 # ---------------------------------------------------------------------------

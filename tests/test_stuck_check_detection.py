@@ -209,6 +209,8 @@ class TestDetectStuckDcoCheckRuns:
         is_stuck, name, age = await mgr._detect_stuck_required_check(pr)
         assert is_stuck is False
         assert name is None
+        # Non-stuck outcomes always report a zero age (no candidate check).
+        assert age == 0.0
 
     @pytest.mark.asyncio
     async def test_stuck_non_dco_non_required_check_is_ignored(self) -> None:
@@ -241,6 +243,8 @@ class TestDetectStuckDcoCheckRuns:
         is_stuck, name, age = await mgr._detect_stuck_required_check(pr)
         assert is_stuck is False
         assert name is None
+        # Non-stuck outcomes always report a zero age (no candidate check).
+        assert age == 0.0
 
     @pytest.mark.asyncio
     async def test_detects_stuck_required_non_dco_check(self) -> None:
@@ -354,6 +358,8 @@ class TestDetectStuckDcoCheckRuns:
         is_stuck, name, age = await mgr._detect_stuck_required_check(pr)
         assert is_stuck is False
         assert name is None
+        # Non-stuck outcomes always report a zero age (floor blocks detection).
+        assert age == 0.0
 
     @pytest.mark.asyncio
     async def test_naive_pr_timestamp_does_not_crash(self) -> None:

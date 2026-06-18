@@ -100,6 +100,11 @@ class MergeResult:
     pr_info: PullRequestInfo
     status: MergeStatus
     error: str | None = None
+    # Non-fatal note attached to a *successful* (or otherwise non-error)
+    # outcome — e.g. a preview MERGED result for a PR that is behind its
+    # base branch and would be rebased first. Kept separate from ``error``
+    # so a MERGED status never carries a contradictory error message.
+    warning: str | None = None
     attempts: int = 0
     duration: float = 0.0
 
@@ -1438,7 +1443,9 @@ class AsyncMergeManager:
                 elif pr_info.mergeable_state == "behind" and self.fix_out_of_date:
                     # For behind PRs with fix enabled, show warning with rebase info
                     result.status = MergeStatus.MERGED  # Would succeed after rebase
-                    result.error = "behind base branch"
+                    # Use ``warning`` (not ``error``) so the MERGED result
+                    # does not carry a contradictory error message.
+                    result.warning = "behind base branch"
                     if self.progress_tracker:
                         self.progress_tracker.merge_success()
                     self._console.print(

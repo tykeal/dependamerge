@@ -181,15 +181,13 @@ class FixOrchestrator:
 
         base = data.get("base") or {}
         head = data.get("head") or {}
-        base_repo = (base.get("repo") or {}) or {}
-        head_repo = (head.get("repo") or {}) or {}
+        base_repo = base.get("repo") or {}
+        head_repo = head.get("repo") or {}
 
-        base_branch = (base.get("ref") or "") or ""
-        head_branch = (head.get("ref") or "") or ""
-        base_full = (
-            base_repo.get("full_name") or f"{owner}/{repo}"
-        ) or f"{owner}/{repo}"
-        head_full = (head_repo.get("full_name") or base_full) or base_full
+        base_branch = base.get("ref") or ""
+        head_branch = head.get("ref") or ""
+        base_full = base_repo.get("full_name") or f"{owner}/{repo}"
+        head_full = head_repo.get("full_name") or base_full
         base_clone = base_repo.get("clone_url") or f"https://github.com/{base_full}.git"
         head_clone = head_repo.get("clone_url") or base_clone
         is_fork = bool(head_repo.get("fork")) if head_repo else False

@@ -512,10 +512,29 @@ class TestEdgeCases:
         assert info.is_valid is False
 
     def test_parse_captures_inline_comments_as_value(self) -> None:
-        """INI-style comments after values are NOT standard for .gitreview.
-        The parser should capture the full line after '=' and strip it,
-        so an inline comment becomes part of the value."""
+        """Inline comments are NOT supported for ``.gitreview``.
+
+        The parser captures the full line after ``=`` (minus surrounding
+        whitespace), so a trailing ``# comment`` becomes part of the
+        value. This is intentional — see ``parse_gitreview``'s docstring
+        for the rationale (``.gitreview`` is not a commented INI dialect).
+        """
         text = "[gerrit]\nhost=gerrit.example.org # primary\nport=29418\n"
         info = parse_gitreview(text)
         assert info is not None
         assert info.host == "gerrit.example.org # primary"
+
+    def test_inline_comment_on_port_falls_back_to_default(self) -> None:
+        """A trailing comment makes the consequence of no comment support
+        visible: because ``port=`` matches digits only, a commented port
+        line fails to match and the parser falls back to the default port
+        rather than raising. This is the same lack of comment support as
+        ``test_parse_captures_inline_comments_as_value``, surfaced on a
+        field whose stricter pattern rejects the malformed value.
+        """
+        text = "[gerrit]\nhost=gerrit.example.org\nport=29418 # primary\n"
+        info = parse_gitreview(text)
+        assert info is not None
+        assert info.host == "gerrit.example.org"
+        # The commented port line does not match ``\\d+$`` and is ignored.
+        assert info.port == DEFAULT_GERRIT_PORT
