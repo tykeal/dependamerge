@@ -266,6 +266,13 @@ class GitHubAsync:
         # Cache for the authenticated user's login (never changes during a session)
         self._authenticated_user_login: str | None = None
 
+        # Cache for the token's OAuth scopes.  ``_token_scopes_fetched``
+        # distinguishes "not looked up yet" from "looked up, but this token
+        # type does not expose scopes" (fine-grained PAT / app token, which
+        # leaves ``_token_scopes`` as ``None``).
+        self._token_scopes: set[str] | None = None
+        self._token_scopes_fetched: bool = False
+
         mounts = None
         if proxies:
             mounts = {}
@@ -783,6 +790,46 @@ class GitHubAsync:
             # Check for permission errors first (includes workflow scope check)
             perm_error = self._parse_permission_error(e, "merge", owner, repo)
             if perm_error:
+                # GitHub returns the "refusing to allow ... workflow" 403
+                # only when the *classic* token lacks the ``workflow``
+                # scope.  Before repeating that guidance, confirm the scope
+                # really is absent: if the token already carries it (or is a
+                # fine-grained/app token we cannot introspect and which
+                # therefore would not produce this classic-PAT message), the
+                # true cause is something else — typically a repository
+                # ruleset that restricts workflow-file updates, or an
+                # un-authorized SSO session.  Telling the user to add a scope
+                # they already hold would be an inaccurate diagnosis.
+                if perm_error.operation == "merge_workflow":
+                    has_workflow = await self.check_workflow_scope()
+                    if has_workflow is True:
+                        perm_error = PermissionError(
+                            operation="merge_workflow_restricted",
+                            message=(
+                                f"GitHub refused to merge PR in {owner}/{repo} "
+                                "even though the token already has the "
+                                "'workflow' scope. The workflow-file update is "
+                                "being blocked by something other than token "
+                                "scope"
+                            ),
+                            token_type_guidance={
+                                "classic": (
+                                    "Check for a repository ruleset that "
+                                    "restricts updates to .github/workflows/** "
+                                    "and confirm the token is SSO-authorized "
+                                    "for this organization"
+                                ),
+                                "fine_grained": (
+                                    "Check for a repository ruleset that "
+                                    "restricts updates to .github/workflows/**"
+                                ),
+                                "fix": (
+                                    "Review the repository's rulesets and "
+                                    "organization SSO authorization for this "
+                                    "token"
+                                ),
+                            },
+                        )
                 # Log the detailed error for debugging
                 self.log.debug(
                     f"Permission error merging PR #{number} in {owner}/{repo}: {perm_error}"
@@ -1526,6 +1573,65 @@ class GitHubAsync:
                 raise perm_error from e
             raise
 
+    async def get_token_scopes(self) -> set[str] | None:
+        """Return the OAuth scopes granted to a classic personal access token.
+
+        Classic PATs advertise their granted scopes in the
+        ``X-OAuth-Scopes`` response header on every authenticated request.
+        Fine-grained PATs and GitHub App installation tokens do **not** send
+        this header — their permission model is per-resource and cannot be
+        introspected this way.
+
+        Returns:
+            A ``set`` of scope strings for a classic PAT (possibly empty if
+            the token was created with no scopes selected), or ``None`` when
+            the token type does not expose scopes (fine-grained PAT / app
+            token) or the lookup could not be performed.  Callers MUST treat
+            ``None`` as "undeterminable", never as "no scopes granted".
+        """
+        if self._token_scopes_fetched:
+            return self._token_scopes
+
+        raw: str | None
+        try:
+            # Any authenticated REST endpoint echoes the header.
+            # ``/rate_limit`` is the cheapest and is itself exempt from the
+            # primary rate limit, so it never consumes quota.
+            r = await self._request("GET", f"{self.api_url}/rate_limit")
+            raw = r.headers.get("X-OAuth-Scopes")
+        except Exception as e:
+            self.log.debug("Could not determine token scopes: %s", e)
+            raw = None
+
+        if raw is None:
+            # Header absent → fine-grained / app token (or the probe
+            # failed).  Either way the scope set is undeterminable.
+            self._token_scopes = None
+        else:
+            # Header present (possibly empty for a scope-less classic PAT).
+            self._token_scopes = {s.strip() for s in raw.split(",") if s.strip()}
+        self._token_scopes_fetched = True
+        return self._token_scopes
+
+    async def check_workflow_scope(self) -> bool | None:
+        """Determine whether the token may update GitHub Actions workflows.
+
+        Merging a PR that touches ``.github/workflows/**`` requires the
+        classic ``workflow`` scope (or, for fine-grained PATs, the
+        ``Workflows: Read and write`` permission).
+
+        Returns:
+            ``True``  — classic PAT that carries the ``workflow`` scope.
+            ``False`` — classic PAT that is missing the ``workflow`` scope.
+            ``None``  — the token type cannot be introspected (fine-grained
+            PAT / app token).  The requirement cannot be verified up-front;
+            callers should defer to merge-time error handling.
+        """
+        scopes = await self.get_token_scopes()
+        if scopes is None:
+            return None
+        return "workflow" in scopes
+
     async def check_token_permissions(
         self, operations: list[str], owner: str = "", repo: str = ""
     ) -> dict[str, dict[str, Any]]:
@@ -1662,6 +1768,35 @@ class GitHubAsync:
                     if owner:
                         await self.get(f"/orgs/{owner}/repos?per_page=1")
                     result["has_permission"] = True
+
+                elif operation == "merge_workflow":
+                    # Verify the token may merge PRs that modify GitHub
+                    # Actions workflow files.  This is only checkable for
+                    # classic PATs, which advertise their scopes via the
+                    # ``X-OAuth-Scopes`` header.  Fine-grained PATs and app
+                    # tokens do not expose scopes, so the check returns
+                    # ``None`` and we pass it through here — the requirement
+                    # cannot be verified up-front for those token types and
+                    # is instead surfaced (with accurate guidance) by the
+                    # merge-time handler if it actually bites.
+                    has_workflow = await self.check_workflow_scope()
+                    if has_workflow is False:
+                        perms = OPERATION_PERMISSIONS.get("merge_workflow", {})
+                        result["error"] = (
+                            "Token is missing the 'workflow' scope, which is "
+                            "required to merge pull requests that modify "
+                            "GitHub Actions workflow files "
+                            "(.github/workflows/**)"
+                        )
+                        result["guidance"] = {
+                            "classic": perms.get("classic"),
+                            "fine_grained": perms.get("fine_grained"),
+                            "fix": "Run: gh auth refresh -h github.com -s workflow",
+                        }
+                    else:
+                        # ``True`` (scope present) or ``None``
+                        # (undeterminable token type) — do not block.
+                        result["has_permission"] = True
 
                 else:
                     result["error"] = f"Unknown operation: {operation}"
@@ -1821,6 +1956,10 @@ class GitHubAsync:
         # Detect missing/pending required status checks (e.g. stale pre-commit.ci)
         missing_required_checks: list[str] = []
         pending_required_checks: list[str] = []
+        # Default base branch; the block below refines it from the PR data
+        # and the fallback at the end of this method reuses it to classify
+        # what kind of rule is guarding the branch.
+        base_branch = "main"
         try:
             # Determine the base branch for this PR
             pr_data = await self.get(f"/repos/{owner}/{repo}/pulls/{number}")
@@ -1891,7 +2030,82 @@ class GitHubAsync:
         if not approved:
             return "Blocked by branch protection (requires approval)"
 
-        return "Blocked by branch protection"
+        # No self-describing blocker was found: checks pass, the PR is
+        # approved, and no changes are requested — yet GitHub still reports
+        # the PR as blocked.  Rather than *asserting* "branch protection"
+        # (which is invisible to this code path when the repository uses
+        # rulesets), determine what kind of rule actually guards the branch
+        # and keep the wording non-committal: we know the branch is guarded,
+        # not that a specific condition is failing.
+        kind = await self._detect_branch_protection_kind(owner, repo, base_branch)
+        if kind == "ruleset":
+            return (
+                "Blocked by repository ruleset "
+                "(no specific failing condition detected)"
+            )
+        if kind == "protection":
+            return (
+                "Blocked by branch protection "
+                "(no specific failing condition detected)"
+            )
+        return (
+            "Blocked for an undetermined reason "
+            "(GitHub reports the PR as blocked but no failing checks, "
+            "required reviews, or visible protection rules were found; "
+            "the repository may use rulesets this token cannot read)"
+        )
+
+    async def _detect_branch_protection_kind(
+        self, owner: str, repo: str, branch: str
+    ) -> str:
+        """Best-effort classification of what guards a branch.
+
+        Used by :meth:`analyze_block_reason` to describe an otherwise
+        unexplained ``BLOCKED`` state accurately instead of asserting
+        "branch protection".
+
+        Returns:
+            ``"ruleset"``    — one or more repository rulesets apply to the
+            branch (reported in preference to classic protection because
+            rulesets are invisible to the GraphQL ``branchProtectionRule``
+            field and are what most current repositories use).
+            ``"protection"`` — a classic branch protection rule applies.
+            ``"none"``       — neither could be found (the branch appears
+            unguarded, or the token cannot read the configuration).
+        """
+        # Repository rulesets (newer API): the effective-rules endpoint
+        # returns every rule that applies to the branch from any active
+        # ruleset.  A non-empty list means a ruleset guards the branch.
+        try:
+            rules = await self.get(
+                f"/repos/{owner}/{repo}/rules/branches/{branch}"
+            )
+            if isinstance(rules, list) and rules:
+                return "ruleset"
+        except Exception as e:
+            self.log.debug(
+                "Could not read branch rules for %s/%s:%s: %s",
+                owner,
+                repo,
+                branch,
+                e,
+            )
+
+        # Classic branch protection: 200 = protected, 404 = no rule.
+        try:
+            await self.get(f"/repos/{owner}/{repo}/branches/{branch}/protection")
+            return "protection"
+        except Exception as e:
+            if "404" not in str(e):
+                self.log.debug(
+                    "Could not read branch protection for %s/%s:%s: %s",
+                    owner,
+                    repo,
+                    branch,
+                    e,
+                )
+
+        return "none"
 
     # -----------------------
     # Optional REST pagination

@@ -487,6 +487,27 @@ def _fetch_and_validate_source_pr(ctx: _MergeContext) -> None:
     )
 
 
+def _source_pr_modifies_workflows(ctx: _MergeContext) -> bool:
+    """Return True when the source PR changes GitHub Actions workflow files.
+
+    Merging such a PR through the REST API requires the classic
+    ``workflow`` token scope (or the fine-grained ``Workflows: Read and
+    write`` permission), which is a *separate* gate from plain repository
+    write access.  Detecting this up-front lets the pre-flight check verify
+    the scope instead of failing only at merge time.
+    """
+    source_pr = ctx.source_pr
+    if source_pr is None:
+        return False
+    for change in source_pr.files_changed:
+        path = getattr(change, "filename", "") or ""
+        if path.startswith(".github/workflows/") and path.endswith(
+            (".yml", ".yaml")
+        ):
+            return True
+    return False
+
+
 def _check_merge_permissions(ctx: _MergeContext) -> None:
     """Pre-flight token permission check.
 
@@ -499,6 +520,11 @@ def _check_merge_permissions(ctx: _MergeContext) -> None:
             operations = ["approve", "merge", "branch_protection"]
             if not ctx.no_fix:
                 operations.append("update_branch")
+            # Only assert the workflow scope when the source PR actually
+            # touches workflow files.  The check is a no-op (passes) for
+            # fine-grained / app tokens whose scopes cannot be introspected.
+            if _source_pr_modifies_workflows(ctx):
+                operations.append("merge_workflow")
             return await client.check_token_permissions(
                 operations, ctx.owner, ctx.repo_name
             )

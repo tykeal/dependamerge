@@ -1718,7 +1718,17 @@ class AsyncMergeManager:
                     #      (which posts ``pre-commit.ci run``).
                     recreated_pr = None
                     if pr_info.author == "dependabot[bot]" and not self.preview_mode:
-                        should_recreate = "branch protection" in failure_reason.lower()
+                        reason_lower = failure_reason.lower()
+                        # Branch protection *and* repository rulesets can
+                        # both block a dependabot PR for reasons recreation
+                        # resolves (most commonly an unsigned-commit /
+                        # required-signature rule).  Treat them alike so the
+                        # recreate path is not silently skipped on repos that
+                        # have migrated from classic protection to rulesets.
+                        should_recreate = (
+                            "branch protection" in reason_lower
+                            or "ruleset" in reason_lower
+                        )
                         if not should_recreate:
                             try:
                                 (
@@ -4414,12 +4424,30 @@ class AsyncMergeManager:
                 detail = detail.split(" (PR state:", 1)[0].strip()
                 if detail:
                     return detail[:300]
-            # Check for workflow scope error - be very specific to avoid false positives
-            # Only match the exact error message pattern we raise in github_async.py
-            if "Missing 'workflow' scope" in error_msg:
+            # Workflow-scope failures surface in several phrasings: the
+            # PermissionError messages we raise ("Missing 'workflow' scope",
+            # "Missing workflow permissions") and GitHub's own response body
+            # ("refusing to allow ... without `workflow` scope").  Match all
+            # of them, but require the word "workflow" so unrelated 403s do
+            # not get mislabelled as a scope problem.
+            error_lower = error_msg.lower()
+            if "workflow" in error_lower and (
+                "missing 'workflow' scope" in error_lower
+                or "missing workflow permissions" in error_lower
+                or "refusing to allow" in error_lower
+            ):
                 return "missing 'workflow' token scope"
+            # The token already had the 'workflow' scope but GitHub still
+            # refused the workflow-file update — a ruleset or SSO problem,
+            # not a scope problem.  Report it as such rather than telling the
+            # user to add a scope they already hold.
+            elif "blocked by something other than token scope" in error_lower:
+                return (
+                    "workflow update blocked by repository ruleset or SSO "
+                    "(token already has 'workflow' scope)"
+                )
             # Check for other permission errors
-            elif "403" in error_msg and "forbidden" in error_msg.lower():
+            elif "403" in error_msg and "forbidden" in error_lower:
                 return "insufficient permissions"
             # Surface transient HTTP errors (502, 405 etc.) accurately instead
             # of falling through to infer a reason from mergeable_state, which
@@ -4463,6 +4491,10 @@ class AsyncMergeManager:
                     return "human reviewer requested changes"
                 elif "Copilot" in detailed_reason:
                     return detailed_reason.replace("Blocked by ", "").lower()
+                elif "ruleset" in detailed_reason.lower():
+                    return "repository ruleset prevents merge"
+                elif "undetermined reason" in detailed_reason.lower():
+                    return "blocked for an undetermined reason"
                 elif "branch protection" in detailed_reason.lower():
                     return "branch protection rules prevent merge"
                 else:
