@@ -2,7 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
-# Runs on a new pull request, performs build and runs tests
+# Runs on a tag push: builds, tests and promotes the release, then
+# publishes to Test PyPI and PyPI.
+#
+# PyPI publishing runs HERE, not in the reusable workflow. PyPI trusted
+# publishing matches the OIDC job_workflow_ref claim against this
+# repository, so the publish jobs must live in this caller. The reusable
+# `release` job builds, tests, audits, attaches artefacts and promotes the
+# draft release; the `test-pypi` and `pypi` jobs below then publish the
+# run-scoped build artefact it produced, using the `tag` output it exposes.
 name: 'Python Build/Test/Release'
 
 # yamllint disable-line rule:truthy
@@ -18,15 +26,88 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  # Harden-runner egress allow-list shared by the publish jobs (matches the
+  # default used inside the reusable workflow).
+  # yamllint disable-line rule:line-length
+  HARDEN_RUNNER_ALLOWLIST: 'lfreleng-actions//.github/harden-runner/lfreleng-actions/allow_list.txt@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+
 jobs:
   release:
+    name: 'Build/Test/Release'
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
-    # Pinned to python-workflows v0.1.0 release commit
+      contents: write       # Create the GitHub release / attach assets
+      id-token: write       # OIDC for build provenance attestations
+      attestations: write   # Build provenance attestations
+    # Pinned to python-workflows v0.1.1 release commit
     # yamllint disable-line rule:line-length
-    uses: lfreleng-actions/python-workflows/.github/workflows/build-test-release.yaml@518ac92728ff987d1f0edab163b1e328fd7258d7  # v0.1.0
-    secrets:
-      pypi_credential: ${{ secrets.PYPI_CREDENTIAL }}
-      test_pypi_credential: ${{ secrets.TEST_PYPI_CREDENTIAL }}
+    uses: lfreleng-actions/python-workflows/.github/workflows/build-test-release.yaml@4f48e1cd660f94ab9f1d4bbc15a948c1aca105ad  # v0.1.1
+
+  test-pypi:
+    name: 'Test PyPI Publishing'
+    needs: release
+    runs-on: 'ubuntu-latest'
+    # MUST match the environment on the Test PyPI trusted publisher.
+    environment:
+      name: development
+    permissions:
+      contents: read
+      id-token: write  # IMPORTANT: mandatory for trusted publishing
+    timeout-minutes: 5
+    steps:
+      - name: 'Load egress allow-list (block mode)'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@42663a22f7abe31521cbc6120901353a4b2849bc  # v0.2.0
+        with:
+          config: ${{ env.HARDEN_RUNNER_ALLOWLIST }}
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Test PyPI publishing'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/pypi-publish-action@f07400a2b57119f1ceac420f559803264b491f23  # v0.1.6
+        with:
+          environment: development
+          tag: ${{ needs.release.outputs.tag }}
+          trusted_publishing: 'true'
+
+  pypi:
+    name: 'Release PyPI Package'
+    needs:
+      - release
+      - test-pypi
+    runs-on: 'ubuntu-latest'
+    # MUST match the environment on the PyPI trusted publisher.
+    environment:
+      name: production
+    permissions:
+      contents: read
+      id-token: write  # IMPORTANT: mandatory for trusted publishing
+    timeout-minutes: 5
+    steps:
+      - name: 'Load egress allow-list (block mode)'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@42663a22f7abe31521cbc6120901353a4b2849bc  # v0.2.0
+        with:
+          config: ${{ env.HARDEN_RUNNER_ALLOWLIST }}
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'PyPI release'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/pypi-publish-action@f07400a2b57119f1ceac420f559803264b491f23  # v0.1.6
+        with:
+          environment: production
+          tag: ${{ needs.release.outputs.tag }}
+          trusted_publishing: 'true'
+          attestations: true
