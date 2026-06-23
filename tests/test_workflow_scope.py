@@ -90,6 +90,20 @@ class TestTokenScopes:
         assert await api2.check_workflow_scope() is False
 
     @pytest.mark.asyncio
+    async def test_transient_probe_failure_is_not_cached(self):
+        api = _make_api()
+        # A one-off probe failure must yield "undeterminable" without
+        # caching, so it cannot suppress accurate diagnosis later.
+        api._request = AsyncMock(side_effect=RuntimeError("transient boom"))
+        assert await api.get_token_scopes() is None
+
+        # A subsequent call retries and can now report the real scopes.
+        resp = Mock()
+        resp.headers = {"X-OAuth-Scopes": "repo, workflow"}
+        api._request = AsyncMock(return_value=resp)
+        assert await api.get_token_scopes() == {"repo", "workflow"}
+
+    @pytest.mark.asyncio
     async def test_probe_failure_is_undeterminable(self):
         api = _make_api()
         api._request = AsyncMock(side_effect=RuntimeError("network down"))
@@ -254,6 +268,25 @@ class TestDetectBranchProtectionKind:
 
         api.get = fake_get
         assert await api._detect_branch_protection_kind("o", "r", "main") == "none"
+
+    @pytest.mark.asyncio
+    async def test_branch_name_is_url_encoded(self):
+        api = _make_api()
+        seen_paths: list[str] = []
+
+        async def fake_get(path, params=None):
+            seen_paths.append(path)
+            if "/rules/branches/" in path:
+                return [{"type": "pull_request"}]
+            raise AssertionError(f"unexpected path {path}")
+
+        api.get = fake_get
+        kind = await api._detect_branch_protection_kind("o", "r", "release/v1")
+        assert kind == "ruleset"
+        # The '/' in the branch name must be percent-encoded, not passed
+        # through raw (which would 404 / misroute the REST call).
+        assert "release%2Fv1" in seen_paths[0]
+        assert "release/v1" not in seen_paths[0]
 
 
 class TestAnalyzeBlockReasonFallback:

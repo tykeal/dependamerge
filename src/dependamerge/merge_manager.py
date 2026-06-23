@@ -1214,8 +1214,6 @@ class AsyncMergeManager:
                 )
                 return result
 
-            result.status = MergeStatus.APPROVED
-
             # Step 5: Handle rebase if needed before merge.
             #
             # Dispatched to the dedicated ``rebase`` module so the

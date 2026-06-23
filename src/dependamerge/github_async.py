@@ -1592,20 +1592,25 @@ class GitHubAsync:
         if self._token_scopes_fetched:
             return self._token_scopes
 
-        raw: str | None
         try:
             # Any authenticated REST endpoint echoes the header.
             # ``/rate_limit`` is the cheapest and is itself exempt from the
             # primary rate limit, so it never consumes quota.
             r = await self._request("GET", f"{self.api_url}/rate_limit")
-            raw = r.headers.get("X-OAuth-Scopes")
         except Exception as e:
+            # A transient probe failure must NOT be cached as
+            # "undeterminable": doing so would let a one-off network error
+            # suppress accurate scope diagnosis for the rest of the run
+            # (a classic PAT that has ``workflow`` could still be reported
+            # as missing it).  Leave the cache unset so a later call can
+            # retry and produce an accurate result.
             self.log.debug("Could not determine token scopes: %s", e)
-            raw = None
+            return None
 
+        raw = r.headers.get("X-OAuth-Scopes")
         if raw is None:
-            # Header absent → fine-grained / app token (or the probe
-            # failed).  Either way the scope set is undeterminable.
+            # Header absent on a successful probe → fine-grained / app
+            # token.  The scope set is genuinely undeterminable; cache it.
             self._token_scopes = None
         else:
             # Header present (possibly empty for a scope-less classic PAT).
@@ -2040,13 +2045,11 @@ class GitHubAsync:
         kind = await self._detect_branch_protection_kind(owner, repo, base_branch)
         if kind == "ruleset":
             return (
-                "Blocked by repository ruleset "
-                "(no specific failing condition detected)"
+                "Blocked by repository ruleset (no specific failing condition detected)"
             )
         if kind == "protection":
             return (
-                "Blocked by branch protection "
-                "(no specific failing condition detected)"
+                "Blocked by branch protection (no specific failing condition detected)"
             )
         return (
             "Blocked for an undetermined reason "
@@ -2076,9 +2079,12 @@ class GitHubAsync:
         # Repository rulesets (newer API): the effective-rules endpoint
         # returns every rule that applies to the branch from any active
         # ruleset.  A non-empty list means a ruleset guards the branch.
+        # Branch names can contain '/' (e.g. ``release/v1``), so they must
+        # be URL-encoded before interpolation into the REST path.
+        encoded_branch = quote(branch, safe="")
         try:
             rules = await self.get(
-                f"/repos/{owner}/{repo}/rules/branches/{branch}"
+                f"/repos/{owner}/{repo}/rules/branches/{encoded_branch}"
             )
             if isinstance(rules, list) and rules:
                 return "ruleset"
@@ -2093,7 +2099,9 @@ class GitHubAsync:
 
         # Classic branch protection: 200 = protected, 404 = no rule.
         try:
-            await self.get(f"/repos/{owner}/{repo}/branches/{branch}/protection")
+            await self.get(
+                f"/repos/{owner}/{repo}/branches/{encoded_branch}/protection"
+            )
             return "protection"
         except Exception as e:
             if "404" not in str(e):
