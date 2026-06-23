@@ -84,7 +84,7 @@ MAX_RETRIES = 2
 def version_callback(value: bool):
     """Callback to show version and exit."""
     if value:
-        console.print(f"🏷️  dependamerge version {__version__}")
+        console.print(f"🏷️ dependamerge version {__version__}")
         raise typer.Exit()
 
 
@@ -94,7 +94,7 @@ class CustomTyper(typer.Typer):
     def __call__(self, *args, **kwargs):
         # Check if help is being requested
         if "--help" in sys.argv or "-h" in sys.argv:
-            console.print(f"🏷️  dependamerge version {__version__}")
+            console.print(f"🏷️ dependamerge version {__version__}")
         return super().__call__(*args, **kwargs)
 
 
@@ -408,7 +408,7 @@ def _validate_merge_inputs(
         raise typer.Exit(1)
 
     if force == "all":
-        console.print("⚠️  Warning: Using --force=all will bypass most safety checks.")
+        console.print("⚠️ Warning: Using --force=all will bypass most safety checks.")
         console.print("   This may attempt merges that will fail at GitHub API level.")
 
     return github2gerrit_mode
@@ -594,7 +594,7 @@ def _check_merge_permissions(ctx: _MergeContext) -> None:
         # the required permissions.
         raise
     except Exception as e:
-        console.print(f"⚠️  Could not verify permissions: {e}")
+        console.print(f"⚠️ Could not verify permissions: {e}")
         console.print("   Continuing anyway...")
 
 
@@ -701,7 +701,7 @@ def _scan_and_find_similar(ctx: _MergeContext) -> None:
         )
         console.print(f"🔍 Found {similar_prs_found} similar PRs")
         if errors_count > 0:
-            console.print(f"⚠️  {errors_count} errors encountered during analysis")
+            console.print(f"⚠️ {errors_count} errors encountered during analysis")
         # The trailing blank line delineates the similar-PR list that
         # follows.  When no similar PRs were found there is no list to
         # separate, so the blank line is suppressed (see below).
@@ -842,7 +842,7 @@ def _handle_preview_confirmation(
 
     try:
         if "pytest" in sys.modules or os.getenv("TESTING"):
-            console.print("⚠️  Test mode detected - skipping interactive prompt")
+            console.print("⚠️ Test mode detected - skipping interactive prompt")
             return
 
         user_input = input(
@@ -897,7 +897,7 @@ def _execute_confirmed_merge(
         parts.append(f"{final_skipped} skipped")
     console.print(f"\n🚀 Final Results: {', '.join(parts)}")
     if final_skipped > 0:
-        console.print(f"⏭️  Skipped {final_skipped} PRs")
+        console.print(f"⏭️ Skipped {final_skipped} PRs")
     if final_blocked > 0:
         console.print(f"🛑 Blocked {final_blocked} PRs")
     if final_auto_merge > 0:
@@ -995,7 +995,7 @@ def _display_merge_results(
         else:
             console.print(f"❌ Failed {failed_count} PRs")
     if skipped_count > 0:
-        console.print(f"⏭️  Skipped {skipped_count} PRs")
+        console.print(f"⏭️ Skipped {skipped_count} PRs")
     if blocked_count > 0:
         console.print(f"🛑 Blocked {blocked_count} PRs")
     if auto_merge_count > 0:
@@ -1133,7 +1133,7 @@ def _handle_repo_merge(
     # because --include-human-prs was supplied.
     needs_human_confirm = bool(human_prs) and not ctx.no_confirm
     if needs_human_confirm:
-        console.print("\n⚠️  Human-authored PRs are included in this merge operation.")
+        console.print("\n⚠️ Human-authored PRs are included in this merge operation.")
         console.print("   Review the list above carefully before proceeding.")
         try:
             user_input = (
@@ -1146,7 +1146,7 @@ def _handle_repo_merge(
                 .lower()
             )
             if user_input != "yes":
-                console.print("ℹ️  Excluding human PRs from merge.")
+                console.print("ℹ️ Excluding human PRs from merge.")
                 # Remove human PRs from the working set
                 repo_prs = automation_prs
                 if not repo_prs:
@@ -1315,7 +1315,7 @@ def _execute_repo_confirmed_merge(
         parts.append(f"{final_skipped} skipped")
     console.print(f"\n🚀 Final Results: {', '.join(parts)}")
     if final_skipped > 0:
-        console.print(f"⏭️  Skipped {final_skipped} PRs")
+        console.print(f"⏭️ Skipped {final_skipped} PRs")
     if final_blocked > 0:
         console.print(f"🛑 Blocked {final_blocked} PRs")
     if final_auto_merge > 0:
@@ -1355,7 +1355,7 @@ def _handle_gerrit_merge(
             netrc_file=netrc_file,
         )
     except NetrcParseError as e:
-        console.print(f"⚠️  Error parsing .netrc file: {e}")
+        console.print(f"⚠️ Error parsing .netrc file: {e}")
         credentials = None
 
     if credentials is None or not credentials.is_valid:
@@ -1385,7 +1385,7 @@ def _handle_gerrit_merge(
         )
 
         if not service.is_authenticated:
-            console.print("⚠️  Warning: Service created but may not be authenticated")
+            console.print("⚠️ Warning: Service created but may not be authenticated")
 
         # Get the source change info
         console.print(f"📋 Fetching change {parsed_url.change_number}...")
@@ -1412,7 +1412,7 @@ def _handle_gerrit_merge(
 
         # Check for merge conflicts and attempt rebase if needed
         if source_change.mergeable is False:
-            console.print("\n⚠️  Change has merge conflicts. Attempting to rebase...")
+            console.print("\n⚠️ Change has merge conflicts. Attempting to rebase...")
             rebase_result = service.rebase_change(source_change.number)
 
             if rebase_result["success"]:
@@ -1475,7 +1475,7 @@ def _handle_gerrit_merge(
         # and warn if the user may not have sufficient permissions
         permission_warnings = source_change.get_permission_warnings()
         if permission_warnings:
-            console.print("\n⚠️  Permission warnings:")
+            console.print("\n⚠️ Permission warnings:")
             for warning in permission_warnings:
                 console.print(f"   • {warning}")
             console.print(
@@ -1494,7 +1494,7 @@ def _handle_gerrit_merge(
                 )
             else:
                 console.print(
-                    "   ⚠️  You may not have all required permissions (see warnings above)"
+                    "   ⚠️ You may not have all required permissions (see warnings above)"
                 )
             console.print("\nTo proceed, run with --no-confirm flag")
             return
@@ -2010,7 +2010,7 @@ def _print_debug_matching(ctx: _MergeContext) -> None:
             f"{ctx.comparator._is_dependabot_body(ctx.source_pr.body)}"
         )
     else:
-        console.print("   ⚠️  Source PR has no body")
+        console.print("   ⚠️ Source PR has no body")
     console.print()
 
 
@@ -2136,7 +2136,7 @@ def close(
                     f"   Is dependabot body: {comparator._is_dependabot_body(source_pr.body)}"
                 )
             else:
-                console.print("   ⚠️  Source PR has no body")
+                console.print("   ⚠️ Source PR has no body")
             console.print()
 
         # Check if source PR is from automation or has valid override
@@ -2231,7 +2231,7 @@ def close(
             )
             console.print(f"🔍 Found {similar_prs_found} similar PRs")
             if errors_count > 0:
-                console.print(f"⚠️  {errors_count} errors encountered during analysis")
+                console.print(f"⚠️ {errors_count} errors encountered during analysis")
             console.print()
         else:
             console.print(f"\n🔍 Found {len(all_similar_prs)} similar PRs")
@@ -2310,7 +2310,7 @@ def close(
                     # Check if in test mode (don't prompt during tests)
                     if "pytest" in sys.modules or os.getenv("TESTING"):
                         console.print(
-                            "⚠️  Test mode detected - skipping interactive prompt"
+                            "⚠️ Test mode detected - skipping interactive prompt"
                         )
                         return
 
@@ -2504,7 +2504,7 @@ def status(
     except KeyboardInterrupt:
         if progress_tracker:
             progress_tracker.stop()
-        console.print("\n⚠️  Scan interrupted by user")
+        console.print("\n⚠️ Scan interrupted by user")
         raise typer.Exit(130) from None
     except Exception as e:
         if progress_tracker:
@@ -2645,7 +2645,7 @@ def blocked(
                 f"📊 Analyzed {total_prs_analyzed} PRs across {completed_repositories} repositories"
             )
             if errors_count > 0:
-                console.print(f"⚠️  {errors_count} errors encountered during check")
+                console.print(f"⚠️ {errors_count} errors encountered during check")
             console.print()  # Add blank line before results
 
         # Display results

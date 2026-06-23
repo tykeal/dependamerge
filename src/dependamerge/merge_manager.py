@@ -1009,7 +1009,7 @@ class AsyncMergeManager:
                     log_and_print(
                         self.log,
                         self._console,
-                        (f"⏭️  Skipped: {pr_info.html_url} [already merged externally]"),
+                        (f"⏭️ Skipped: {pr_info.html_url} [already merged externally]"),
                         level="info",
                     )
                     return result
@@ -1129,7 +1129,7 @@ class AsyncMergeManager:
                     # Only log during preview evaluation to avoid duplicate messages
                     if self.preview_mode:
                         self.log.warning(
-                            f"⚠️  Overriding blocking reviews for {pr_info.repository_full_name}#{pr_info.number} (--force=all)"
+                            f"⚠️ Overriding blocking reviews for {pr_info.repository_full_name}#{pr_info.number} (--force=all)"
                         )
 
             # Step 0.5: If the PR is blocked, check for stale pre-commit.ci
@@ -1192,7 +1192,7 @@ class AsyncMergeManager:
                         pass
                 except Exception as e:
                     self.log.warning(
-                        f"⚠️  Failed to process Copilot items for PR {pr_info.number}: {e}"
+                        f"⚠️ Failed to process Copilot items for PR {pr_info.number}: {e}"
                     )
                     copilot_processing_successful = False
 
@@ -1449,7 +1449,7 @@ class AsyncMergeManager:
                     if self.progress_tracker:
                         self.progress_tracker.merge_success()
                     self._console.print(
-                        f"⚠️  Rebase/merge: {pr_info.html_url} [behind base branch]",
+                        f"⚠️ Rebase/merge: {pr_info.html_url} [behind base branch]",
                         markup=False,
                     )
                 elif pr_info.mergeable_state == "dirty":
@@ -1684,7 +1684,7 @@ class AsyncMergeManager:
                             self.log,
                             self._console,
                             (
-                                f"⏭️  Skipped: {pr_info.html_url} "
+                                f"⏭️ Skipped: {pr_info.html_url} "
                                 "[already merged externally]"
                             ),
                             level="info",
@@ -2049,7 +2049,7 @@ class AsyncMergeManager:
         for review in pr_info.reviews:
             if review.state == "CHANGES_REQUESTED":
                 self.log.info(
-                    f"⚠️  PR {pr_info.number} has changes requested by {review.user} - will not override human feedback"
+                    f"⚠️ PR {pr_info.number} has changes requested by {review.user} - will not override human feedback"
                 )
                 return True
         return False
@@ -2320,7 +2320,7 @@ class AsyncMergeManager:
                             # Only log during preview evaluation to avoid duplicate messages
                             if self.preview_mode:
                                 self.log.warning(
-                                    f"⚠️  Bypassing code owner review requirement for {repo_owner}/{repo_name}#{pr_info.number} (--force={self.force_level})"
+                                    f"⚠️ Bypassing code owner review requirement for {repo_owner}/{repo_name}#{pr_info.number} (--force={self.force_level})"
                                 )
                             return (
                                 True,
@@ -2377,7 +2377,7 @@ class AsyncMergeManager:
                     # Only log during preview evaluation to avoid duplicate messages
                     if self.preview_mode:
                         self.log.warning(
-                            f"⚠️  Bypassing branch protection check for {repo_owner}/{repo_name}#{pr_info.number}: {test_result[1]} (--force={self.force_level})"
+                            f"⚠️ Bypassing branch protection check for {repo_owner}/{repo_name}#{pr_info.number}: {test_result[1]} (--force={self.force_level})"
                         )
                     # When bypassing, return early to allow merge to proceed
                     return (
@@ -2415,7 +2415,7 @@ class AsyncMergeManager:
                     # Only log during preview evaluation to avoid duplicate messages
                     if self.preview_mode:
                         self.log.warning(
-                            f"⚠️  Bypassing failing status checks for {repo_owner}/{repo_name}#{pr_info.number} (--force=all)"
+                            f"⚠️ Bypassing failing status checks for {repo_owner}/{repo_name}#{pr_info.number} (--force=all)"
                         )
                     return True, "PR blocked but forcing merge attempt (--force=all)"
                 else:
@@ -2437,7 +2437,7 @@ class AsyncMergeManager:
             if not self.fix_out_of_date:
                 if self.force_level == "all":
                     self.log.warning(
-                        f"⚠️  Attempting merge despite being behind for {repo_owner}/{repo_name}#{pr_info.number} (--force=all)"
+                        f"⚠️ Attempting merge despite being behind for {repo_owner}/{repo_name}#{pr_info.number} (--force=all)"
                     )
                     return True, "PR behind but forcing merge attempt (--force=all)"
                 else:
@@ -2465,7 +2465,7 @@ class AsyncMergeManager:
         elif pr_info.mergeable_state == "dirty":
             if self.force_level == "all":
                 self.log.warning(
-                    f"⚠️  Attempting merge despite conflicts for {repo_owner}/{repo_name}#{pr_info.number} (--force=all)"
+                    f"⚠️ Attempting merge despite conflicts for {repo_owner}/{repo_name}#{pr_info.number} (--force=all)"
                 )
                 return True, "PR has conflicts but forcing merge attempt (--force=all)"
             else:
