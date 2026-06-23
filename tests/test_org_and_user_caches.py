@@ -150,16 +150,16 @@ class TestOrgSettingsCache:
 
 
 # ---------------------------------------------------------------------------
-# _test_merge_capability uses the org cache
+# _predict_merge_outcome uses the org cache
 # ---------------------------------------------------------------------------
 
 
-class TestTestMergeCapabilityUsesOrgCache:
-    """Verify that _test_merge_capability routes through the cached helper."""
+class TestPredictMergeOutcomeUsesOrgCache:
+    """Verify that _predict_merge_outcome routes through the cached helper."""
 
     @pytest.mark.asyncio
     async def test_multiple_prs_same_org_single_org_query(self):
-        """Calling _test_merge_capability for multiple PRs in the same org
+        """Calling _predict_merge_outcome for multiple PRs in the same org
         should only produce one GET /orgs/{owner} call."""
         mgr, client = _make_manager_with_client()
 
@@ -182,7 +182,7 @@ class TestTestMergeCapabilityUsesOrgCache:
 
         # Simulate processing 5 PRs across 3 repos in the same org
         for pr_num in range(1, 6):
-            await mgr._test_merge_capability(
+            await mgr._predict_merge_outcome(
                 "same-org", f"repo-{pr_num}", pr_num, "merge"
             )
 
@@ -190,7 +190,7 @@ class TestTestMergeCapabilityUsesOrgCache:
 
     @pytest.mark.asyncio
     async def test_org_failure_does_not_block_merge_check(self):
-        """If the org settings lookup fails, _test_merge_capability should
+        """If the org settings lookup fails, _predict_merge_outcome should
         still proceed to check the PR's merge status."""
         mgr, client = _make_manager_with_client()
 
@@ -207,7 +207,7 @@ class TestTestMergeCapabilityUsesOrgCache:
 
         client.get = AsyncMock(side_effect=mock_get)
 
-        can_merge, reason = await mgr._test_merge_capability(
+        can_merge, reason = await mgr._predict_merge_outcome(
             "broken-org", "some-repo", 1, "merge"
         )
 

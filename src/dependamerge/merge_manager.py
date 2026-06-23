@@ -1196,7 +1196,15 @@ class AsyncMergeManager:
                     )
                     copilot_processing_successful = False
 
-            # Step 3: Only approve if Copilot processing was successful
+            # Step 3: Gate on Copilot processing, but DO NOT approve
+            # up-front. Approval is now performed on demand (approve-on-
+            # demand): either just before arming auto-merge (see
+            # _enable_auto_merge_with_approval) or after a direct merge is
+            # rejected specifically for a missing review (see
+            # _approve_and_retry_if_review_required). This avoids approving
+            # PRs that did not actually need our review, while the Copilot
+            # gate below still prevents acting on a PR with unresolved
+            # Copilot feedback.
             if not copilot_processing_successful:
                 result.status = MergeStatus.FAILED
                 result.error = "Copilot review processing incomplete - not approving to avoid pollution"
@@ -1206,30 +1214,6 @@ class AsyncMergeManager:
                 )
                 return result
 
-            result.status = MergeStatus.APPROVING
-
-            if self.progress_tracker:
-                self.progress_tracker.update_operation(
-                    f"Approving PR {pr_info.number} in {pr_info.repository_full_name}"
-                )
-
-            if not self.preview_mode:
-                approval_added = await self._approve_pr(
-                    repo_owner, repo_name, pr_info.number
-                )
-                if approval_added:
-                    # Track that we just approved this PR so that the merge
-                    # retry logic knows a propagation delay may be needed.
-                    pr_key = f"{repo_owner}/{repo_name}#{pr_info.number}"
-                    self._recently_approved.add(pr_key)
-
-                    # Give GitHub time to propagate the approval to branch
-                    # protection evaluation before attempting the merge.
-                    if self._post_approval_delay > 0:
-                        self.log.debug(
-                            f"Waiting {self._post_approval_delay}s for approval propagation on {pr_key}"
-                        )
-                        await asyncio.sleep(self._post_approval_delay)
             result.status = MergeStatus.APPROVED
 
             # Step 5: Handle rebase if needed before merge.
@@ -1249,7 +1233,7 @@ class AsyncMergeManager:
                     log=self.log,
                     console=self._console,
                     rebased_prs=self._rebased_prs,
-                    enable_auto_merge=self._enable_auto_merge_for_pr,
+                    enable_auto_merge=self._enable_auto_merge_with_approval,
                 )
                 outcome = await rebase.perform_step5_rebase(
                     ctx=rebase_ctx,
@@ -1373,7 +1357,10 @@ class AsyncMergeManager:
 
             if should_wait:
                 if pr_key_for_wait not in self._auto_merge_enabled:
-                    auto_ok_pre = await self._enable_auto_merge_for_pr(
+                    # Approve-on-demand: arming auto-merge implies we want
+                    # the PR to merge once checks pass, so approve the
+                    # current head first (idempotent) before enabling.
+                    auto_ok_pre = await self._enable_auto_merge_with_approval(
                         pr_info, repo_owner, repo_name
                     )
                     if auto_ok_pre:
@@ -1624,6 +1611,17 @@ class AsyncMergeManager:
                             return await self._handle_merge_conflict(
                                 pr_info, repo_owner, repo_name, result
                             )
+
+                    # Approve-on-demand (merge-path trigger): if the
+                    # direct merge was rejected solely because our review
+                    # is missing, approve the current head and retry once.
+                    # Returns True only if the retry merged the PR; any
+                    # other failure is left for the classifier below.
+                    if not merged:
+                        if await self._approve_and_retry_if_review_required(
+                            pr_info, repo_owner, repo_name
+                        ):
+                            merged = True
 
                 if merged is None:
                     # Auto-merge is active — PR will merge asynchronously.
@@ -2285,6 +2283,142 @@ class AsyncMergeManager:
         )
         return True
 
+    async def _ensure_pr_approved(
+        self, pr_info: PullRequestInfo, owner: str, repo: str
+    ) -> bool:
+        """Approve the current PR head on demand and track the approval.
+
+        Thin wrapper around :meth:`_approve_pr` that also records the PR
+        in ``_recently_approved`` and applies the post-approval
+        propagation delay, exactly as the (now removed) up-front Step 3
+        approval used to.  :meth:`_approve_pr` is idempotent — it no-ops
+        when the current user already has an active ``APPROVED`` review on
+        the current head — so this is safe to call unconditionally at any
+        approve-on-demand trigger.
+
+        Returns:
+            True if a *new* approval was submitted, False if the PR was
+            already approved (or approval was declined).
+        """
+        approved = await self._approve_pr(owner, repo, pr_info.number)
+        if approved:
+            pr_key = f"{owner}/{repo}#{pr_info.number}"
+            self._recently_approved.add(pr_key)
+            # Give GitHub time to propagate the approval to the branch
+            # protection evaluation before a merge is attempted.
+            if self._post_approval_delay > 0:
+                self.log.debug(
+                    f"Waiting {self._post_approval_delay}s for approval "
+                    f"propagation on {pr_key}"
+                )
+                await asyncio.sleep(self._post_approval_delay)
+        return approved
+
+    async def _enable_auto_merge_with_approval(
+        self, pr_info: PullRequestInfo, owner: str, repo: str
+    ) -> bool:
+        """Approve the current head (if needed) then enable auto-merge.
+
+        Enabling auto-merge is a commitment to let GitHub complete the
+        merge as soon as branch protection is satisfied, so the current
+        head must already carry our approval — otherwise auto-merge would
+        wait forever on a missing review.  This is the *de-facto*
+        approve-on-demand trigger for the auto-merge path: when we enable
+        auto-merge on a PR whose current version we have not approved, we
+        approve it as part of arming auto-merge.
+
+        Approval failures other than typed permission errors are logged
+        and swallowed so a transient approval hiccup does not prevent us
+        from at least arming auto-merge; the permission error is
+        propagated so the caller's dedicated handler can report it.
+
+        Used at the Step 5.5 auto-merge enable point and as the rebase
+        module's auto-merge callback (which fires *after* the rebase, so
+        we approve the rebased head rather than a soon-to-be-dismissed
+        pre-rebase commit).
+        """
+        if not self.preview_mode:
+            try:
+                await self._ensure_pr_approved(pr_info, owner, repo)
+            except GitHubPermissionError:
+                # Surface token permission problems to the caller's
+                # dedicated handler rather than masking them here.
+                raise
+            except Exception as exc:
+                self.log.warning(
+                    "Could not approve %s/%s#%s before enabling auto-merge: %s",
+                    owner,
+                    repo,
+                    pr_info.number,
+                    exc,
+                )
+        return await self._enable_auto_merge_for_pr(pr_info, owner, repo)
+
+    async def _approve_and_retry_if_review_required(
+        self, pr_info: PullRequestInfo, owner: str, repo: str
+    ) -> bool:
+        """Approve-on-demand recovery after a failed direct merge.
+
+        This is the merge-path approve-on-demand trigger: rather than
+        approving every PR up-front, we attempt the merge first and only
+        approve when GitHub rejects it *specifically* because our review
+        is missing.  This avoids approving PRs that did not need it (e.g.
+        a PR that fails for an unrelated reason).
+
+        Called only after a direct merge attempt returned ``False``.  It
+        consults :meth:`analyze_block_reason`; if (and only if) the PR is
+        blocked pending approval and we have not already approved it this
+        run, it approves the current head and retries the merge once.
+
+        Returns:
+            True if the approve-then-retry merged the PR, False otherwise
+            (including when the failure was not approval-related, so the
+            caller can proceed to its normal failure handling).
+        """
+        if self.preview_mode or self._github_client is None:
+            return False
+
+        # A missing review manifests as the ``blocked`` mergeable state.
+        # A merge that fails from any other state (e.g. a transient 405 on
+        # a ``clean`` PR) is not an approval problem, so don't probe or
+        # approve it — let the caller's classifier handle it.
+        if pr_info.mergeable_state != "blocked":
+            return False
+
+        pr_key = f"{owner}/{repo}#{pr_info.number}"
+        if pr_key in self._recently_approved:
+            # We already approved this PR this run; the retry machinery in
+            # _merge_pr_with_retry has already had its post-approval
+            # propagation retry, so a missing approval is not the cause.
+            return False
+
+        try:
+            block_reason = await self._github_client.analyze_block_reason(
+                owner, repo, pr_info.number, pr_info.head_sha
+            )
+        except Exception as exc:
+            self.log.debug(
+                "approve-on-demand block-reason check failed for %s: %s",
+                pr_key,
+                exc,
+            )
+            return False
+
+        if not block_reason or "requires approval" not in block_reason.lower():
+            # The merge failed for some reason other than a missing
+            # review — do not approve; let the caller classify and report.
+            return False
+
+        self.log.debug(
+            "Merge for %s was blocked pending approval; approving on "
+            "demand and retrying",
+            pr_key,
+        )
+        approved = await self._ensure_pr_approved(pr_info, owner, repo)
+        if not approved:
+            return False
+        return await self._merge_pr_with_retry(pr_info, owner, repo)
+
     async def _check_merge_requirements(
         self, pr_info: PullRequestInfo
     ) -> tuple[bool, str]:
@@ -2346,62 +2480,70 @@ class AsyncMergeManager:
             # Don't fail the merge attempt if we can't check protection rules
             pass
 
-        # Test merge capability to detect hidden branch protection rules
-        try:
-            # Use pre-determined merge method for this repository
-            cache_key = f"{repo_owner}/{repo_name}"
-            merge_method = self._pr_merge_methods.get(
-                cache_key, self.default_merge_method
-            )
+        # Predictive merge probe. This is a *best-effort* dry-run verdict
+        # only: GitHub's mergeable_state can lag, and repository rulesets
+        # are invisible to it, so it must never gate the real merge. Run it
+        # only in preview mode to render the evaluation; the execution path
+        # is attempt-first and lets the actual merge response be
+        # authoritative (Step 6 + _merge_pr_with_retry).
+        if self.preview_mode:
+            try:
+                # Use pre-determined merge method for this repository
+                cache_key = f"{repo_owner}/{repo_name}"
+                merge_method = self._pr_merge_methods.get(
+                    cache_key, self.default_merge_method
+                )
 
-            # Attempt a test merge to detect hidden branch protection rules
-            test_result = await self._test_merge_capability(
-                repo_owner, repo_name, pr_info.number, merge_method
-            )
-            if not test_result[0]:
-                # Check if we should bypass protection rules
-                if self.force_level in ["code-owners", "protection-rules", "all"]:
-                    # Check if user has permissions to bypass before attempting
-                    if self._github_client:
-                        self.log.debug(
-                            f"Checking bypass permissions for {repo_owner}/{repo_name} with force_level={self.force_level}"
-                        )
-                        (
-                            can_bypass,
-                            bypass_reason,
-                        ) = await self._github_client.check_user_can_bypass_protection(
-                            repo_owner, repo_name, self.force_level
-                        )
-                        self.log.debug(
-                            f"Bypass check result: can_bypass={can_bypass}, reason={bypass_reason}"
-                        )
-                        if not can_bypass:
-                            self.log.warning(
-                                f"Cannot bypass branch protection for {repo_owner}/{repo_name}#{pr_info.number}: {bypass_reason}"
+                # Predict the outcome to detect hidden branch protection rules
+                test_result = await self._predict_merge_outcome(
+                    repo_owner, repo_name, pr_info.number, merge_method
+                )
+                if not test_result[0]:
+                    # Check if we should bypass protection rules
+                    if self.force_level in [
+                        "code-owners",
+                        "protection-rules",
+                        "all",
+                    ]:
+                        # Check bypass permissions before reporting success
+                        if self._github_client:
+                            self.log.debug(
+                                f"Checking bypass permissions for {repo_owner}/{repo_name} with force_level={self.force_level}"
                             )
-                            return (
-                                False,
-                                f"cannot bypass branch protection: {bypass_reason}",
+                            (
+                                can_bypass,
+                                bypass_reason,
+                            ) = await self._github_client.check_user_can_bypass_protection(
+                                repo_owner, repo_name, self.force_level
                             )
+                            self.log.debug(
+                                f"Bypass check result: can_bypass={can_bypass}, reason={bypass_reason}"
+                            )
+                            if not can_bypass:
+                                self.log.warning(
+                                    f"Cannot bypass branch protection for {repo_owner}/{repo_name}#{pr_info.number}: {bypass_reason}"
+                                )
+                                return (
+                                    False,
+                                    f"cannot bypass branch protection: {bypass_reason}",
+                                )
 
-                    # Only log during preview evaluation to avoid duplicate messages
-                    if self.preview_mode:
                         self.log.warning(
                             f"⚠️ Bypassing branch protection check for {repo_owner}/{repo_name}#{pr_info.number}: {test_result[1]} (--force={self.force_level})"
                         )
-                    # When bypassing, return early to allow merge to proceed
-                    return (
-                        True,
-                        f"branch protection check bypassed (--force={self.force_level})",
-                    )
-                else:
-                    return False, test_result[1]
+                        # When bypassing, return early to allow merge
+                        return (
+                            True,
+                            f"branch protection check bypassed (--force={self.force_level})",
+                        )
+                    else:
+                        return False, test_result[1]
 
-        except Exception as e:
-            # If we can't test merge, continue with other checks
-            self.log.debug(
-                f"Could not test merge capability for {repo_owner}/{repo_name}#{pr_info.number}: {e}"
-            )
+            except Exception as e:
+                # If we can't predict the outcome, continue with other checks
+                self.log.debug(
+                    f"Could not predict merge outcome for {repo_owner}/{repo_name}#{pr_info.number}: {e}"
+                )
 
         # Additional checks based on PR state
         if pr_info.mergeable_state == "blocked":
@@ -4371,8 +4513,13 @@ class AsyncMergeManager:
                 # Arm auto-merge when the PR is otherwise mergeable
                 # (not dirty) so it lands automatically once the stuck
                 # check is re-triggered, without a second review round.
+                # Approve the current head first (approve-on-demand): the
+                # PR is no longer approved up-front, so auto-merge would
+                # otherwise wait forever on a missing review.
                 if pr_info.mergeable_state != "dirty":
-                    await self._enable_auto_merge_for_pr(pr_info, owner, repo)
+                    await self._enable_auto_merge_with_approval(
+                        pr_info, owner, repo
+                    )
                 result.error = f"stuck check: {stuck_check}"
                 stuck_reported = True
 
@@ -4693,14 +4840,23 @@ class AsyncMergeManager:
                 self._org_settings_cache[owner] = None
                 return None
 
-    async def _test_merge_capability(
+    async def _predict_merge_outcome(
         self, owner: str, repo: str, pr_number: int, merge_method: str
     ) -> tuple[bool, str]:
-        """
-        Test if a PR can be merged by validating merge requirements.
+        """Best-effort, read-only prediction of whether a PR would merge.
 
-        This helps detect branch protection rules that aren't visible through the API,
-        such as organization-level restrictions.
+        This is a **preview-only** probe used to render the dry-run
+        evaluation.  It inspects the PR's ``mergeable`` / ``mergeable_state``
+        and, for ``blocked`` PRs, consults :meth:`analyze_block_reason` to
+        produce a one-line verdict.
+
+        It deliberately has **no authority over the real merge**: GitHub's
+        ``mergeable_state`` can lag the true state, and repository rulesets
+        are invisible to this code path, so a confident "would block"
+        verdict here can still be wrong.  The execution path therefore does
+        not gate on this prediction — it attempts the merge and treats
+        GitHub's actual response (Step 6 and ``_merge_pr_with_retry``) as
+        authoritative.  Only the preview path calls this method.
 
         Args:
             owner: Repository owner
@@ -4804,7 +4960,7 @@ class AsyncMergeManager:
         except Exception as e:
             error_msg = str(e)
             self.log.debug(
-                f"Exception in _test_merge_capability for {owner}/{repo}#{pr_number}: {error_msg}"
+                f"Exception in _predict_merge_outcome for {owner}/{repo}#{pr_number}: {error_msg}"
             )
 
             # Look for specific DCO-related errors in the GitHub API response
