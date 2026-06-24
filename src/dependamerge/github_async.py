@@ -879,6 +879,8 @@ class GitHubAsync:
             if isinstance(body, dict) and isinstance(body.get("message"), str):
                 return " ".join(body["message"].split())
         except Exception:
+            # Response body was not JSON (or .json() failed); fall through
+            # to the raw-text extraction below rather than failing here.
             pass
         try:
             raw = getattr(response, "text", "") or ""
