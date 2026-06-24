@@ -1961,36 +1961,55 @@ class GitHubAsync:
         # Detect missing/pending required status checks (e.g. stale pre-commit.ci)
         missing_required_checks: list[str] = []
         pending_required_checks: list[str] = []
-        # Default base branch; the block below refines it from the PR data
-        # and the fallback at the end of this method reuses it to classify
-        # what kind of rule is guarding the branch.
-        base_branch = "main"
+        # Resolve the PR's actual base branch.  It drives both the
+        # required status-check lookup and the final guard-kind
+        # classification, so a wrong value (e.g. assuming "main" on a repo
+        # that defaults to "master") produces a misleading block reason.
+        # Prefer the PR's own base ref; if that cannot be read, fall back
+        # to the repository's real default branch rather than a hardcoded
+        # name, and only give up (leaving it ``None``) when neither is
+        # available.
+        base_branch: str | None = None
         try:
-            # Determine the base branch for this PR
             pr_data = await self.get(f"/repos/{owner}/{repo}/pulls/{number}")
-            base_branch = (
-                pr_data.get("base", {}).get("ref", "main")
-                if isinstance(pr_data, dict)
-                else "main"
-            )
-            required_checks = await self.get_required_status_checks(
-                owner, repo, base_branch
-            )
-            for check in required_checks:
-                ctx = check.get("context", "")
-                if not ctx:
-                    continue
-                if ctx in reported_check_names:
-                    # Check has been reported — distinguish pending from completed
-                    if ctx not in completed_check_names and ctx in pending_check_names:
-                        pending_required_checks.append(ctx)
-                else:
-                    # Never reported via either API — truly missing
-                    missing_required_checks.append(ctx)
-        except Exception as req_err:
+            if isinstance(pr_data, dict):
+                ref = pr_data.get("base", {}).get("ref")
+                if isinstance(ref, str) and ref:
+                    base_branch = ref
+        except Exception as pr_err:
             self.log.debug(
-                f"Could not check required status checks for {owner}/{repo}#{number}: {req_err}"
+                f"Could not read base branch for {owner}/{repo}#{number}: {pr_err}"
             )
+
+        if base_branch is None:
+            base_branch = await self._resolve_default_branch(owner, repo)
+
+        # Only inspect required status checks when we know which branch to
+        # query; an assumed branch would yield checks for the wrong ref.
+        if base_branch is not None:
+            try:
+                required_checks = await self.get_required_status_checks(
+                    owner, repo, base_branch
+                )
+                for check in required_checks:
+                    ctx = check.get("context", "")
+                    if not ctx:
+                        continue
+                    if ctx in reported_check_names:
+                        # Check reported — distinguish pending from completed
+                        if (
+                            ctx not in completed_check_names
+                            and ctx in pending_check_names
+                        ):
+                            pending_required_checks.append(ctx)
+                    else:
+                        # Never reported via either API — truly missing
+                        missing_required_checks.append(ctx)
+            except Exception as req_err:
+                self.log.debug(
+                    f"Could not check required status checks for "
+                    f"{owner}/{repo}#{number}: {req_err}"
+                )
 
         # Prioritize blocking conditions by specificity
         # Most specific blockers first
@@ -2042,6 +2061,16 @@ class GitHubAsync:
         # rulesets), determine what kind of rule actually guards the branch
         # and keep the wording non-committal: we know the branch is guarded,
         # not that a specific condition is failing.
+        if base_branch is None:
+            # The base branch could not be resolved, so no branch-specific
+            # inspection ran.  Say exactly that rather than implying we
+            # looked for protection rules and found none.
+            return (
+                "Blocked for an undetermined reason "
+                "(GitHub reports the PR as blocked, but the PR's base "
+                "branch could not be determined, so its protection rules "
+                "and required checks could not be inspected)"
+            )
         kind = await self._detect_branch_protection_kind(owner, repo, base_branch)
         if kind == "ruleset":
             return (
@@ -2057,6 +2086,29 @@ class GitHubAsync:
             "required reviews, or visible protection rules were found; "
             "the repository may use rulesets this token cannot read)"
         )
+
+    async def _resolve_default_branch(self, owner: str, repo: str) -> str | None:
+        """Return the repository's actual default branch, or ``None``.
+
+        Many repositories default to ``master`` rather than ``main``, so
+        callers must never assume a name.  This reads the authoritative
+        ``default_branch`` field from the repository metadata and returns
+        ``None`` when it cannot be determined (the repo is unreadable or
+        the field is absent), letting callers degrade gracefully instead
+        of operating on a wrong branch.
+        """
+        try:
+            repo_data = await self.get(f"/repos/{owner}/{repo}")
+        except Exception as e:
+            self.log.debug(
+                "Could not resolve default branch for %s/%s: %s", owner, repo, e
+            )
+            return None
+        if isinstance(repo_data, dict):
+            default_branch = repo_data.get("default_branch")
+            if isinstance(default_branch, str) and default_branch:
+                return default_branch
+        return None
 
     async def _detect_branch_protection_kind(
         self, owner: str, repo: str, branch: str
