@@ -159,6 +159,39 @@ or Gerrit based on the URL pattern.
 - **Interactive Mode by Default**: Preview what changes will apply, then
   optionally proceed with merge
 
+### Org/Owner-Wide Bulk Merging
+
+Pass a bare owner URL (e.g. `https://github.com/lfreleng-actions`) to merge
+every in-scope automation pull request across an entire GitHub organisation
+or user account in one command.
+
+- **Owner-Wide Scope**: Enumerates every repository owned by the
+  organisation or user, then bulk merges their open automation PRs
+  (`dependabot`, `pre-commit`, `renovate`, and other recognised bots)
+- **Organisation or User**: Detects the account type (org vs user)
+  automatically at runtime; the same URL works for both
+- **Archived and Fork Exclusion**: Skips archived repositories, and
+  **excludes fork repositories by default** (owner-wide merges target
+  the owner's own repositories, not mirrored forks)
+- **Striped Sequencing**: Schedules merges so that **at most one PR per
+  repository runs at a time** while distinct repositories run
+  concurrently. This spreads ("stripes") work across repositories and
+  structurally avoids the data-replication races that otherwise arise
+  when two same-repository PRs land back-to-back — without injected
+  delays or random retries
+- **Resilient Enumeration**: The run reports and skips a transient
+  failure scanning one repository, then continues with the repositories
+  it scanned
+- **Grouped Preview**: The preview lists candidate PRs grouped by repository
+  for readability, then prompts for a confirmation token before merging
+- **Human PR Safety**: The run excludes human-authored PRs by default;
+  passing `--include-human-prs` brings them into scope behind an explicit
+  confirmation prompt covering the entire owner
+
+> **Note**: Owner-wide merging supports `github.com` alone for now.
+> GitHub Enterprise Server support exists in scaffold form but remains
+> disabled.
+
 ### General Features
 
 - **Rich CLI Output**: Beautiful terminal output with progress indicators and
@@ -433,12 +466,12 @@ machine gerrit.opendaylight.org login myuser password anothertoken
 
 **CLI options:**
 
-| Option | Description |
-| ------ | ----------- |
-| `--no-netrc` | Disable .netrc file lookup |
-| `--netrc-file PATH` | Use a specific .netrc file |
-| `--netrc-optional` | Do not fail if .netrc file is missing (default) |
-| `--netrc-required` | Require a .netrc file and fail if missing |
+| Option              | Description                                     |
+| ------------------- | ----------------------------------------------- |
+| `--no-netrc`        | Disable .netrc file lookup                      |
+| `--netrc-file PATH` | Use a specific .netrc file                      |
+| `--netrc-optional`  | Do not fail if .netrc file is missing (default) |
+| `--netrc-required`  | Require a .netrc file and fail if missing       |
 
 By default, `.netrc` lookup is optional (`--netrc-optional`): if no `.netrc`
 file exists, the tool continues and falls back to environment variables.
@@ -942,6 +975,30 @@ dependamerge merge https://github.com/owner/repo/pull/123/files/diff
 
 This enhancement allows you to copy URLs directly from GitHub's PR pages
 without worrying about the specific tab you're viewing.
+
+The `merge` command also accepts repository and owner (organisation or
+user) URLs, selecting the operation scope from the URL shape:
+
+```bash
+# Single PR
+dependamerge merge https://github.com/owner/repo/pull/123
+
+# Whole repository (all open automation PRs)
+dependamerge merge https://github.com/owner/repo
+dependamerge merge https://github.com/owner/repo/pulls
+
+# Whole owner: every repository of an organisation or user
+dependamerge merge https://github.com/owner
+dependamerge merge https://github.com/owner/
+dependamerge merge https://github.com/orgs/owner
+dependamerge merge https://github.com/orgs/owner/repositories
+```
+
+| URL shape                          | Scope      |
+| ---------------------------------- | ---------- |
+| `.../owner/repo/pull/123`          | single PR  |
+| `.../owner/repo`                   | repository |
+| `.../owner` or `.../orgs/owner`    | owner-wide |
 
 ## Development
 

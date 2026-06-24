@@ -358,12 +358,23 @@ class AsyncMergeManager:
     async def merge_prs_parallel(
         self,
         pr_list: list[tuple[PullRequestInfo, ComparisonResult | None]],
+        *,
+        stripe: bool = False,
     ) -> list[MergeResult]:
         """
         Merge multiple PRs in parallel.
 
         Args:
             pr_list: List of (PullRequestInfo, ComparisonResult) tuples
+            stripe: When True, schedule the batch with the striped
+                scheduler (see :meth:`_run_striped`): PRs are grouped by
+                repository and at most one PR per repository is processed
+                at a time, while distinct repositories run concurrently.
+                Used for owner-wide runs where the flat list mixes many
+                repositories and back-to-back same-repo merges would race
+                GitHub's mergeability propagation.  When False (default)
+                the flat scheduler is used (one task per PR), suitable for
+                single-PR and single-repository batches.
 
         Returns:
             List of MergeResult objects with operation results
@@ -383,15 +394,6 @@ class AsyncMergeManager:
             owner = pr_list[0][0].repository_full_name.split("/", 1)[0]
             await self._org_approval_rulesets(owner)
 
-        # Create tasks for all PRs
-        tasks = []
-        for pr_info, _comparison in pr_list:
-            task = asyncio.create_task(
-                self._merge_single_pr_with_semaphore(pr_info),
-                name=f"merge-{pr_info.repository_full_name}#{pr_info.number}",
-            )
-            tasks.append(task)
-
         # Background ticker that surfaces a single-line countdown
         # whenever one or more workers are waiting for required
         # checks to complete (auto-merge wait loop). The countdown
@@ -403,8 +405,10 @@ class AsyncMergeManager:
         )
 
         try:
-            # Wait for all tasks to complete
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            if stripe:
+                final_results = await self._run_striped(pr_list)
+            else:
+                final_results = await self._run_flat(pr_list)
         finally:
             ticker_task.cancel()
             try:
@@ -423,7 +427,114 @@ class AsyncMergeManager:
                     exc_info=True,
                 )
 
-        # Process results and handle exceptions
+        self._results = final_results
+        return final_results
+
+    async def _run_flat(
+        self,
+        pr_list: list[tuple[PullRequestInfo, ComparisonResult | None]],
+    ) -> list[MergeResult]:
+        """Flat scheduler: one task per PR, bounded by the merge semaphore.
+
+        Suitable for single-PR and single-repository batches where there
+        is no need to avoid stacking same-repo merges (the per-repo merge
+        dispatch lock already serialises the final API call).
+        """
+        tasks = []
+        for pr_info, _comparison in pr_list:
+            task = asyncio.create_task(
+                self._merge_single_pr_with_semaphore(pr_info),
+                name=f"merge-{pr_info.repository_full_name}#{pr_info.number}",
+            )
+            tasks.append(task)
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return self._collect_results(pr_list, results)
+
+    async def _run_striped(
+        self,
+        pr_list: list[tuple[PullRequestInfo, ComparisonResult | None]],
+    ) -> list[MergeResult]:
+        """Striped scheduler: one serial worker per repository.
+
+        Owner-wide batches frequently contain several PRs targeting the
+        same repository (e.g. dependabot and pre-commit-ci both opening
+        PRs in one repo).  Merging two PRs in the same repository
+        back-to-back races GitHub's branch-protection / mergeability
+        propagation.  To avoid that structurally (no injected delays, no
+        random retries) this scheduler:
+
+        - Groups PRs by repository, preserving first-seen order.
+        - Runs one worker coroutine per repository that processes that
+          repository's PRs strictly sequentially, so **at most one PR per
+          repository is ever in flight**.
+        - Lets distinct repositories run concurrently, bounded by the
+          shared merge semaphore.  Because ``asyncio.Semaphore`` is FIFO,
+          a repository releasing its slot between PRs goes to the back of
+          the queue behind other repositories' waiting PRs, which
+          naturally round-robins ("stripes") work across repositories.
+
+        Combined with ``repo_scoped`` mergeability refresh, when a
+        repository's second PR finally starts it re-reads state the first
+        PR's merge may have invalidated.
+        """
+        # Group by repository, preserving first-seen order so the stripe
+        # ordering is deterministic.
+        grouped: dict[str, list[tuple[PullRequestInfo, ComparisonResult | None]]] = {}
+        for item in pr_list:
+            grouped.setdefault(item[0].repository_full_name, []).append(item)
+
+        # Results are keyed by the identity of each work item so they can
+        # be reassembled in the caller's original order.
+        result_by_id: dict[int, MergeResult] = {}
+
+        async def _repo_worker(
+            items: list[tuple[PullRequestInfo, ComparisonResult | None]],
+        ) -> None:
+            for item in items:
+                pr_info = item[0]
+                try:
+                    res = await self._merge_single_pr_with_semaphore(pr_info)
+                except Exception as e:
+                    # Defensive: a crash on one PR must not lose results
+                    # for the remaining PRs in the same repository.
+                    res = MergeResult(
+                        pr_info=pr_info,
+                        status=MergeStatus.FAILED,
+                        error=str(e),
+                    )
+                    self.log.error(
+                        "Unexpected error merging PR %s#%s: %s",
+                        pr_info.repository_full_name,
+                        pr_info.number,
+                        e,
+                    )
+                result_by_id[id(item)] = res
+
+        tasks = [
+            asyncio.create_task(
+                _repo_worker(items),
+                name=f"merge-repo-{repo}",
+            )
+            for repo, items in grouped.items()
+        ]
+
+        # Workers never raise (each PR is wrapped defensively above).
+        await asyncio.gather(*tasks)
+
+        return [result_by_id[id(item)] for item in pr_list]
+
+    def _collect_results(
+        self,
+        pr_list: list[tuple[PullRequestInfo, ComparisonResult | None]],
+        results: list[Any],
+    ) -> list[MergeResult]:
+        """Map gathered task outcomes back to ``MergeResult`` objects.
+
+        Converts any propagated exception (from a per-PR task run with
+        ``return_exceptions=True``) into a FAILED result for the matching
+        PR, preserving the input ordering.
+        """
         final_results: list[MergeResult] = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
@@ -438,8 +549,6 @@ class AsyncMergeManager:
             else:
                 # result is guaranteed to be MergeResult here since it's not an Exception
                 final_results.append(cast(MergeResult, result))
-
-        self._results = final_results
         return final_results
 
     async def _merge_single_pr_with_semaphore(
@@ -1065,80 +1174,7 @@ class AsyncMergeManager:
                 )
 
             if not self._is_pr_mergeable(pr_info):
-                # Get detailed status for a more informative skip message
-                # Use async method to avoid event loop conflicts
-                repo_owner, repo_name = pr_info.repository_full_name.split("/")
-
-                # Check if blocked to get more detailed status
-                if pr_info.mergeable_state == "blocked" and self._github_client:
-                    try:
-                        detailed_status = (
-                            await self._github_client.analyze_block_reason(
-                                repo_owner, repo_name, pr_info.number, pr_info.head_sha
-                            )
-                        )
-                    except Exception:
-                        detailed_status = f"Blocked (state: {pr_info.mergeable_state})"
-                else:
-                    # For non-blocked states, provide basic status
-                    if pr_info.mergeable_state == "dirty":
-                        detailed_status = "Merge conflicts"
-                    elif pr_info.mergeable_state == "behind":
-                        detailed_status = "Rebase required (out of date)"
-                    elif pr_info.mergeable_state == "draft":
-                        detailed_status = "Draft PR"
-                    else:
-                        detailed_status = (
-                            f"Not mergeable (state: {pr_info.mergeable_state})"
-                        )
-
-                # Use the detailed status as the skip reason, with fallback
-                if detailed_status and detailed_status != "Status unclear":
-                    skip_reason = detailed_status.lower()
-                else:
-                    # Fallback to basic mapping if detailed status is unclear
-                    if pr_info.mergeable_state == "dirty":
-                        skip_reason = "merge conflicts"
-                    elif pr_info.mergeable_state == "behind":
-                        skip_reason = "behind"
-                    elif pr_info.mergeable_state == "blocked":
-                        if pr_info.mergeable is True:
-                            skip_reason = "blocked, requires review"
-                        else:
-                            skip_reason = "blocked by failing checks"
-                    elif pr_info.mergeable_state == "unstable":
-                        skip_reason = "unstable"
-                    elif pr_info.mergeable is False:
-                        skip_reason = "not mergeable"
-                    else:
-                        skip_reason = "unknown"
-
-                # Determine if this is truly blocked (unmergeable) or just skipped
-                if pr_info.mergeable_state == "dirty" or (
-                    pr_info.mergeable_state == "behind" and pr_info.mergeable is False
-                ):
-                    result.status = MergeStatus.BLOCKED
-                    icon = "🛑"
-                    status = "Blocked"
-                else:
-                    result.status = MergeStatus.SKIPPED
-                    icon = "⏭️"
-                    status = "Skipped"
-
-                log_and_print(
-                    self.log,
-                    self._console,
-                    f"{icon} {status}: {pr_info.html_url} [{skip_reason}]",
-                    level="info",
-                )
-
-                result.error = f"PR is not mergeable (state: {pr_info.mergeable_state}, mergeable: {pr_info.mergeable})"
-
-                # For the result error (used in CLI output), use the detailed status if it's more informative
-                if detailed_status and detailed_status != "Status unclear":
-                    result.error = detailed_status
-
-                return result
+                return await self._handle_not_mergeable_pr(pr_info, result)
 
             # Check for blocking reviews (changes requested)
             if self._has_blocking_reviews(pr_info):
@@ -1346,6 +1382,7 @@ class AsyncMergeManager:
                 and pr_info.mergeable_state == "blocked"
                 and self._github_client is not None
             ):
+                pre_block_reason: str | None = None
                 try:
                     pre_block_reason = await self._github_client.analyze_block_reason(
                         repo_owner,
@@ -1442,57 +1479,7 @@ class AsyncMergeManager:
             # Step 6: Attempt merge
             result.status = MergeStatus.MERGING
             if self.preview_mode:
-                # IMPORTANT: Preview output must be SINGLE LINE per PR for clean evaluation display
-                # Each PR should have exactly one line of output under "🔍 Dependamerge Evaluation"
-
-                # In preview mode, simulate what would happen based on current PR state
-                if pr_info.mergeable_state == "behind" and not self.fix_out_of_date:
-                    result.status = MergeStatus.SKIPPED
-                    result.error = "PR is behind base branch and --no-fix option is set"
-                    self._console.print(
-                        f"⏭️ Skipped: {pr_info.html_url} [behind, rebase disabled]",
-                        markup=False,
-                    )
-                elif pr_info.mergeable_state == "behind" and self.fix_out_of_date:
-                    # For behind PRs with fix enabled, show warning with rebase info
-                    result.status = MergeStatus.MERGED  # Would succeed after rebase
-                    # Use ``warning`` (not ``error``) so the MERGED result
-                    # does not carry a contradictory error message.
-                    result.warning = "behind base branch"
-                    if self.progress_tracker:
-                        self.progress_tracker.merge_success()
-                    self._console.print(
-                        f"⚠️ Rebase/merge: {pr_info.html_url} [behind base branch]",
-                        markup=False,
-                    )
-                elif pr_info.mergeable_state == "dirty":
-                    result.status = MergeStatus.BLOCKED
-                    result.error = "PR has merge conflicts"
-                    self._console.print(
-                        f"🛑 Blocked: {pr_info.html_url} [merge conflicts]",
-                        markup=False,
-                    )
-                elif (
-                    pr_info.mergeable is False and pr_info.mergeable_state == "blocked"
-                ):
-                    result.status = MergeStatus.BLOCKED
-                    result.error = "PR blocked by failing checks"
-                    self._console.print(
-                        f"🛑 Blocked: {pr_info.html_url} [blocked by failing checks]",
-                        markup=False,
-                    )
-                else:
-                    # Simulate successful merge in preview mode
-                    result.status = MergeStatus.MERGED
-                    if self.progress_tracker:
-                        self.progress_tracker.merge_success()
-                    # Single line summary for successful preview
-                    log_and_print(
-                        self.log,
-                        self._console,
-                        f"☑️ Approve/merge: {pr_info.html_url}",
-                        level="debug",
-                    )
+                self._simulate_preview_merge(pr_info, result)
             else:
                 if self.progress_tracker:
                     self.progress_tracker.update_operation(
@@ -1959,6 +1946,141 @@ class AsyncMergeManager:
             self._recently_approved.discard(pr_key)
 
         return result
+
+    async def _handle_not_mergeable_pr(
+        self, pr_info: PullRequestInfo, result: MergeResult
+    ) -> MergeResult:
+        """Classify and report a PR that failed the mergeability gate.
+
+        Extracted from ``_merge_single_pr`` to keep that method's
+        branch count manageable. Produces a detailed skip/block
+        reason, sets ``result`` accordingly, and returns it.
+        """
+        # Get detailed status for a more informative skip message
+        # Use async method to avoid event loop conflicts
+        repo_owner, repo_name = pr_info.repository_full_name.split("/")
+
+        # Check if blocked to get more detailed status
+        if pr_info.mergeable_state == "blocked" and self._github_client:
+            try:
+                detailed_status = await self._github_client.analyze_block_reason(
+                    repo_owner, repo_name, pr_info.number, pr_info.head_sha
+                )
+            except Exception:
+                detailed_status = f"Blocked (state: {pr_info.mergeable_state})"
+        else:
+            # For non-blocked states, provide basic status
+            if pr_info.mergeable_state == "dirty":
+                detailed_status = "Merge conflicts"
+            elif pr_info.mergeable_state == "behind":
+                detailed_status = "Rebase required (out of date)"
+            elif pr_info.mergeable_state == "draft":
+                detailed_status = "Draft PR"
+            else:
+                detailed_status = f"Not mergeable (state: {pr_info.mergeable_state})"
+
+        # Use the detailed status as the skip reason, with fallback
+        if detailed_status and detailed_status != "Status unclear":
+            skip_reason = detailed_status.lower()
+        else:
+            # Fallback to basic mapping if detailed status is unclear
+            if pr_info.mergeable_state == "dirty":
+                skip_reason = "merge conflicts"
+            elif pr_info.mergeable_state == "behind":
+                skip_reason = "behind"
+            elif pr_info.mergeable_state == "blocked":
+                if pr_info.mergeable is True:
+                    skip_reason = "blocked, requires review"
+                else:
+                    skip_reason = "blocked by failing checks"
+            elif pr_info.mergeable_state == "unstable":
+                skip_reason = "unstable"
+            elif pr_info.mergeable is False:
+                skip_reason = "not mergeable"
+            else:
+                skip_reason = "unknown"
+
+        # Determine if this is truly blocked (unmergeable) or just skipped
+        if pr_info.mergeable_state == "dirty" or (
+            pr_info.mergeable_state == "behind" and pr_info.mergeable is False
+        ):
+            result.status = MergeStatus.BLOCKED
+            icon = "🛑"
+            status = "Blocked"
+        else:
+            result.status = MergeStatus.SKIPPED
+            icon = "⏭️"
+            status = "Skipped"
+
+        log_and_print(
+            self.log,
+            self._console,
+            f"{icon} {status}: {pr_info.html_url} [{skip_reason}]",
+            level="info",
+        )
+
+        result.error = f"PR is not mergeable (state: {pr_info.mergeable_state}, mergeable: {pr_info.mergeable})"
+
+        # For the result error (used in CLI output), use the detailed status if it's more informative
+        if detailed_status and detailed_status != "Status unclear":
+            result.error = detailed_status
+
+        return result
+
+    def _simulate_preview_merge(
+        self, pr_info: PullRequestInfo, result: MergeResult
+    ) -> None:
+        """Simulate the Step 6 merge outcome for preview mode.
+
+        Preview output must be SINGLE LINE per PR for clean evaluation
+        display: each PR should produce exactly one line under the
+        "🔍 Dependamerge Evaluation" heading. Mutates ``result`` in place.
+        """
+        if pr_info.mergeable_state == "behind" and not self.fix_out_of_date:
+            result.status = MergeStatus.SKIPPED
+            result.error = "PR is behind base branch and --no-fix option is set"
+            self._console.print(
+                f"⏭️ Skipped: {pr_info.html_url} [behind, rebase disabled]",
+                markup=False,
+            )
+        elif pr_info.mergeable_state == "behind" and self.fix_out_of_date:
+            # For behind PRs with fix enabled, show warning with rebase info
+            result.status = MergeStatus.MERGED  # Would succeed after rebase
+            # Use ``warning`` (not ``error``) so the MERGED result
+            # does not carry a contradictory error message.
+            result.warning = "behind base branch"
+            if self.progress_tracker:
+                self.progress_tracker.merge_success()
+            self._console.print(
+                f"⚠️ Rebase/merge: {pr_info.html_url} [behind base branch]",
+                markup=False,
+            )
+        elif pr_info.mergeable_state == "dirty":
+            result.status = MergeStatus.BLOCKED
+            result.error = "PR has merge conflicts"
+            self._console.print(
+                f"🛑 Blocked: {pr_info.html_url} [merge conflicts]",
+                markup=False,
+            )
+        elif pr_info.mergeable is False and pr_info.mergeable_state == "blocked":
+            result.status = MergeStatus.BLOCKED
+            result.error = "PR blocked by failing checks"
+            self._console.print(
+                f"🛑 Blocked: {pr_info.html_url} [blocked by failing checks]",
+                markup=False,
+            )
+        else:
+            # Simulate successful merge in preview mode
+            result.status = MergeStatus.MERGED
+            if self.progress_tracker:
+                self.progress_tracker.merge_success()
+            # Single line summary for successful preview
+            log_and_print(
+                self.log,
+                self._console,
+                f"☑️ Approve/merge: {pr_info.html_url}",
+                level="debug",
+            )
 
     @staticmethod
     def _block_reason_indicates_pending_checks(
