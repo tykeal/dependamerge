@@ -196,6 +196,15 @@ class TestDeriveApiUrls:
         api, _ = derive_api_urls("GitHub.com")
         assert api == "https://api.github.com"
 
+    def test_empty_host_raises(self):
+        with pytest.raises(ValueError):
+            derive_api_urls("")
+
+    def test_whitespace_host_raises(self):
+        # A whitespace-only host would otherwise produce "https:///api/v3".
+        with pytest.raises(ValueError):
+            derive_api_urls("   ")
+
 
 # ---------------------------------------------------------------------------
 # CLI routing: owner URL -> _handle_org_merge
@@ -225,8 +234,8 @@ class TestMergeOrgUrl:
 
         mock_asyncio_run.side_effect = _mock_asyncio_run(
             [
-                _PERMS_OK,  # permissions check
                 ([auto_pr], []),  # fetch_owner_open_prs -> (prs, errors)
+                _PERMS_OK,  # permissions check (deferred until after scan)
                 [],  # parallel merge preview
             ]
         )
@@ -250,8 +259,7 @@ class TestMergeOrgUrl:
 
         mock_asyncio_run.side_effect = _mock_asyncio_run(
             [
-                _PERMS_OK,
-                ([], []),  # no PRs, no errors
+                ([], []),  # no PRs, no errors (perms check is skipped)
             ]
         )
 
@@ -278,7 +286,7 @@ class TestMergeOrgUrl:
         mock_client.token = "test_token"
         mock_client_class.return_value = mock_client
 
-        mock_asyncio_run.side_effect = _mock_asyncio_run([_PERMS_OK, (prs, []), []])
+        mock_asyncio_run.side_effect = _mock_asyncio_run([(prs, []), _PERMS_OK, []])
 
         result = self.runner.invoke(
             app,
@@ -303,8 +311,8 @@ class TestMergeOrgUrl:
 
         mock_asyncio_run.side_effect = _mock_asyncio_run(
             [
-                _PERMS_OK,
                 ([auto_pr], ["Error scanning repository acme/broken: boom"]),
+                _PERMS_OK,
                 [],
             ]
         )
@@ -329,7 +337,7 @@ class TestMergeOrgUrl:
         mock_client.token = "test_token"
         mock_client_class.return_value = mock_client
 
-        mock_asyncio_run.side_effect = _mock_asyncio_run([_PERMS_OK, ([], [])])
+        mock_asyncio_run.side_effect = _mock_asyncio_run([([], [])])
 
         result = self.runner.invoke(
             app,
@@ -347,6 +355,64 @@ class TestMergeOrgUrl:
         assert result.exit_code == 0
         out = _strip_ansi(result.stdout)
         assert "owner" in out.lower()
+
+    @patch("dependamerge.cli._check_merge_permissions")
+    @patch("dependamerge.cli.GitHubClient")
+    @patch("dependamerge.cli.asyncio.run")
+    def test_permission_check_uses_concrete_repo(
+        self, mock_asyncio_run, mock_client_class, mock_check_perms
+    ):
+        # Regression: the owner-wide permission check must probe a real
+        # repository.  check_token_permissions reports every operation as
+        # missing when handed an empty repo, which would abort every
+        # owner-wide run.  Capture ctx.repo_name at call time and assert
+        # it names the representative repo, not "".
+        auto_pr = _make_pr(1, repo="acme/widget")
+
+        mock_client = Mock()
+        mock_client.token = "test_token"
+        mock_client_class.return_value = mock_client
+
+        # Enumeration runs first; the deferred permission check follows.
+        mock_asyncio_run.side_effect = _mock_asyncio_run([([auto_pr], []), []])
+
+        captured: dict[str, str] = {}
+
+        def _capture(ctx):
+            captured["repo_name"] = ctx.repo_name
+
+        mock_check_perms.side_effect = _capture
+
+        result = self.runner.invoke(
+            app,
+            ["merge", "https://github.com/acme", "--token", "test_token"],
+        )
+
+        assert result.exit_code == 0, f"CLI failed: {result.stdout}"
+        mock_check_perms.assert_called_once()
+        assert captured["repo_name"] == "widget"
+
+    @patch("dependamerge.cli._check_merge_permissions")
+    @patch("dependamerge.cli.GitHubClient")
+    @patch("dependamerge.cli.asyncio.run")
+    def test_permission_check_skipped_when_no_prs(
+        self, mock_asyncio_run, mock_client_class, mock_check_perms
+    ):
+        # With nothing to merge there is no representative repo, so the
+        # permission check must not run at all.
+        mock_client = Mock()
+        mock_client.token = "test_token"
+        mock_client_class.return_value = mock_client
+
+        mock_asyncio_run.side_effect = _mock_asyncio_run([([], [])])
+
+        result = self.runner.invoke(
+            app,
+            ["merge", "https://github.com/acme", "--token", "test_token"],
+        )
+
+        assert result.exit_code == 0, f"CLI failed: {result.stdout}"
+        mock_check_perms.assert_not_called()
 
 
 class TestOrgConfirmationHash:
@@ -468,6 +534,71 @@ class TestFetchOwnerOpenPrs:
         assert root_key == "user"
 
     @pytest.mark.asyncio
+    async def test_resolve_owner_root_user_fallback_on_not_found_error(self):
+        # Against real GitHub, organization(login: <user>) returns a
+        # NOT_FOUND GraphQL error (data.organization = null), which
+        # GitHubAsync.graphql surfaces as GraphQLError.  That must be
+        # treated as "not an org" and fall back to the user root.
+        from dependamerge.github_async import GraphQLError
+
+        svc = GitHubService(token="test_token")
+
+        async def fake_graphql(query, variables):
+            raise GraphQLError(
+                '[{"type": "NOT_FOUND", "path": ["organization"], '
+                '"message": "Could not resolve to an Organization with '
+                "the login of 'someuser'.\"}]"
+            )
+
+        svc._api.graphql = fake_graphql  # type: ignore[assignment]
+
+        root_key, _query = await svc._resolve_owner_root("someuser")
+        await svc.close()
+        assert root_key == "user"
+
+    @pytest.mark.asyncio
+    async def test_resolve_owner_root_propagates_unrelated_graphql_error(self):
+        # A GraphQL error that is *not* the not-an-organization NOT_FOUND
+        # must propagate rather than be silently downgraded to a user
+        # fallback.
+        from dependamerge.github_async import GraphQLError
+
+        svc = GitHubService(token="test_token")
+
+        async def fake_graphql(query, variables):
+            raise GraphQLError(
+                '[{"type": "FORBIDDEN", "message": "Resource not accessible"}]'
+            )
+
+        svc._api.graphql = fake_graphql  # type: ignore[assignment]
+
+        with pytest.raises(GraphQLError):
+            await svc._resolve_owner_root("someuser")
+        await svc.close()
+
+    @pytest.mark.asyncio
+    async def test_resolve_owner_root_propagates_nested_not_found(self):
+        # A NOT_FOUND on a *nested* field under the organization root
+        # (path longer than ["organization"]) means the org resolved but a
+        # sub-field failed; it must NOT be downgraded to a user fallback.
+        # Only an exact top-level ["organization"] NOT_FOUND counts.
+        from dependamerge.github_async import GraphQLError
+
+        svc = GitHubService(token="test_token")
+
+        async def fake_graphql(query, variables):
+            raise GraphQLError(
+                '[{"type": "NOT_FOUND", "path": ["organization", "repositories"], '
+                '"message": "Could not resolve organization repositories."}]'
+            )
+
+        svc._api.graphql = fake_graphql  # type: ignore[assignment]
+
+        with pytest.raises(GraphQLError):
+            await svc._resolve_owner_root("someuser")
+        await svc.close()
+
+    @pytest.mark.asyncio
     async def test_resolve_owner_root_cached(self):
         svc = GitHubService(token="test_token")
         calls = 0
@@ -484,6 +615,40 @@ class TestFetchOwnerOpenPrs:
         await svc.close()
         # Second call served from cache; only one probe.
         assert calls == 1
+
+    @pytest.mark.asyncio
+    async def test_fetch_repo_open_prs_reports_result_count_to_progress(self):
+        # complete_repository must receive the in-scope PR count (len of
+        # results), consistent with find_similar_prs / fetch_owner_open_prs,
+        # not a hard-coded 0.
+        completed: list[int] = []
+
+        class _Progress:
+            def start_repository(self, name):  # noqa: D401
+                pass
+
+            def update_operation(self, msg):
+                pass
+
+            def complete_repository(self, count):
+                completed.append(count)
+
+        svc = GitHubService(token="test_token")
+        svc._progress = _Progress()  # type: ignore[assignment]
+
+        async def fake_collect(owner, repo, *, only_automation=True):
+            return [
+                _make_pr(1, repo="acme/repo"),
+                _make_pr(2, repo="acme/repo"),
+            ]
+
+        svc._collect_repo_open_prs = fake_collect  # type: ignore[assignment]
+
+        results = await svc.fetch_repo_open_prs("acme", "repo")
+        await svc.close()
+
+        assert len(results) == 2
+        assert completed == [2]
 
     @pytest.mark.asyncio
     async def test_iter_owner_repositories_excludes_archived_and_forks(self):

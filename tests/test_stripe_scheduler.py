@@ -217,3 +217,26 @@ async def test_striped_isolates_per_pr_failures():
     assert by_number[2].error and "boom" in by_number[2].error
     # PR #3 still ran even though #2 (earlier in the same repo) failed.
     assert by_number[3].status is MergeStatus.MERGED
+
+
+@pytest.mark.asyncio
+async def test_striped_handles_duplicate_work_item_objects():
+    """Reused tuple objects do not collapse into a single result.
+
+    Results are keyed by input position, not ``id(item)``, so passing the
+    same tuple object multiple times must still yield one result per slot
+    rather than overwriting earlier entries.
+    """
+    shared: PRPair = (_make_pr(1, "owner/a"), None)
+    pr_list: list[PRPair] = [shared, shared, shared]
+    mgr = _manager(concurrency=5)
+    recorder = _Recorder()
+    mgr._merge_single_pr = recorder  # type: ignore[assignment]
+
+    results = await mgr.merge_prs_parallel(pr_list, stripe=True)
+
+    # One result per input slot, despite the shared tuple identity.
+    assert len(results) == len(pr_list)
+    assert all(r.status is MergeStatus.MERGED for r in results)
+    # The repository's three (identical) PRs were each dispatched.
+    assert len(recorder.dispatch_order) == 3

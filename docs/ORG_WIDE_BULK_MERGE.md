@@ -16,7 +16,7 @@ merges every in-scope automation pull request across an entire GitHub
 organisation (or user account):
 
 ```bash
-dependamerge https://github.com/lfreleng-actions/
+dependamerge merge https://github.com/lfreleng-actions/
 ```
 
 This hybridises the two existing bulk modes:
@@ -62,8 +62,13 @@ shape continues to establish the scope:
 | `…/owner/repo`                                | whole repo  |
 | `…/owner` (and `…/orgs/owner[/repositories]`) | whole owner |
 
-Routing in `merge()` gains a third fallback after `parse_change_url`
-(single PR) and `parse_repo_url` (repo): `parse_org_url` (owner). If all
+Routing in `merge()` tries three parsers in order: `parse_change_url`
+(single PR) first, then `parse_org_url` (owner), then `parse_repo_url`
+(repo). Routing tries owner parsing ahead of repo parsing so the
+canonical `…/orgs/owner` form does not mis-parse as `owner="orgs"`.
+`parse_org_url` is strict — it accepts a bare owner or the
+`orgs/owner[/repositories]` forms and rejects everything else, so a
+two-segment `owner/repo` URL falls through to `parse_repo_url`. If all
 three fail, routing surfaces the most relevant error.
 
 ## URL parsing
@@ -283,7 +288,7 @@ parity** and no org-specific special-casing.
 - Document the striping / single-flight sequencing behaviour at a high
   level.
 - Update the `merge` command help/docstring and Usage examples to show
-  `dependamerge https://github.com/<owner>`.
+  `dependamerge merge https://github.com/<owner>`.
 
 ## Reused components
 

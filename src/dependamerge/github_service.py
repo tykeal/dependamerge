@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator
 from datetime import datetime
@@ -11,6 +12,7 @@ from typing import Any
 
 from .github_async import (
     GitHubAsync,
+    GraphQLError,
     RateLimitError,
     SecondaryRateLimitError,
 )
@@ -379,13 +381,65 @@ class GitHubService:
             return cached
 
         variables = {"org": owner, "reposCursor": None}
-        data = await self._api.graphql(ORG_REPOS_ONLY, variables)
-        if (data or {}).get("organization") is not None:
+        # GitHub answers ``organization(login:)`` for a *user* login with
+        # ``data.organization = null`` AND a NOT_FOUND error in the
+        # ``errors`` array ("Could not resolve to an Organization ...").
+        # ``GitHubAsync.graphql`` raises ``GraphQLError`` on any non-transient
+        # ``errors`` payload, so the null-organization case never reaches the
+        # ``data`` check below — it surfaces as an exception instead.  Treat a
+        # NOT_FOUND-on-organization error as "not an org" and fall back to the
+        # user root; re-raise anything else (e.g. genuine transport or schema
+        # errors).
+        try:
+            data = await self._api.graphql(ORG_REPOS_ONLY, variables)
+            is_org = (data or {}).get("organization") is not None
+        except GraphQLError as exc:
+            if not self._is_not_an_organization_error(exc):
+                raise
+            is_org = False
+
+        if is_org:
             resolved = ("organization", ORG_REPOS_ONLY)
         else:
             resolved = ("user", USER_REPOS_ONLY)
         self._owner_root_cache[owner] = resolved
         return resolved
+
+    @staticmethod
+    def _is_not_an_organization_error(exc: GraphQLError) -> bool:
+        """Return True when a GraphQL error means "login is not an org".
+
+        ``GitHubAsync.graphql`` raises ``GraphQLError(json.dumps(errors))``,
+        so the exception text is the structured GraphQL ``errors`` array.
+        Parse it and match only a ``NOT_FOUND`` error reported against the
+        top-level ``organization`` field (``path == ["organization"]``),
+        so an unrelated ``NOT_FOUND`` on a nested field that merely mentions
+        "organization" cannot trigger the user-account fallback.
+
+        If the payload is not the expected JSON shape (e.g. the
+        retries-exhausted sentinel), fall back to the conservative
+        substring heuristic so a genuinely-missing org still falls back
+        rather than aborting.
+        """
+        try:
+            errors = json.loads(str(exc))
+        except (ValueError, TypeError):
+            errors = None
+
+        if isinstance(errors, list):
+            for error in errors:
+                if not isinstance(error, dict):
+                    continue
+                if str(error.get("type", "")).upper() != "NOT_FOUND":
+                    continue
+                path = error.get("path")
+                if path == ["organization"]:
+                    return True
+            return False
+
+        # Payload was not the structured errors array; degrade gracefully.
+        msg = str(exc).lower()
+        return "not_found" in msg and "organization" in msg
 
     async def _iter_owner_repositories(
         self, owner: str
@@ -934,7 +988,7 @@ class GitHubService:
         )
 
         if self._progress:
-            self._progress.complete_repository(0)
+            self._progress.complete_repository(len(results))
 
         return results
 
@@ -991,19 +1045,56 @@ class GitHubService:
                         self._progress.add_error()
                     return [], [f"Error scanning repository {repo_full_name}: {e}"]
 
-        tasks: list[asyncio.Task[Any]] = []
-        async for repo in self._iter_owner_repositories(owner):
-            tasks.append(asyncio.create_task(process_repo(repo)))
-
         all_prs: list[PullRequestInfo] = []
         errors: list[str] = []
-        if tasks:
-            # No return_exceptions: a propagated rate-limit error aborts
-            # the gather (the desired behaviour for global throttling).
-            results = await asyncio.gather(*tasks)
-            for repo_prs, repo_errors in results:
+
+        # Bounded producer/consumer pipeline.  A fixed pool of workers
+        # (sized to the repo-concurrency limit) drains repository nodes
+        # from a queue fed by the paginated iterator.  This caps in-flight
+        # work — both pending tasks and buffered nodes — instead of
+        # materialising one task per repository up front, which matters
+        # for owners with thousands of repositories.  A propagated
+        # rate-limit error from any worker tears the whole pipeline down
+        # (see the teardown below), preserving the global-throttle
+        # semantics of aborting the run rather than skipping repos.
+        worker_count = max(1, self._max_repo_tasks)
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(
+            maxsize=worker_count * 2
+        )
+
+        async def producer() -> None:
+            async for repo in self._iter_owner_repositories(owner):
+                await queue.put(repo)
+            # One sentinel per worker so each terminates once the backlog
+            # drains.
+            for _ in range(worker_count):
+                await queue.put(None)
+
+        async def worker() -> None:
+            while True:
+                repo = await queue.get()
+                if repo is None:
+                    return
+                repo_prs, repo_errors = await process_repo(repo)
+                # Safe to mutate the shared lists without a lock: asyncio
+                # is single-threaded and ``extend`` does not await.
                 all_prs.extend(repo_prs)
                 errors.extend(repo_errors)
+
+        producer_task = asyncio.create_task(producer())
+        worker_tasks = [asyncio.create_task(worker()) for _ in range(worker_count)]
+        pipeline = [producer_task, *worker_tasks]
+        try:
+            # No return_exceptions: a propagated rate-limit error aborts
+            # the pipeline (the desired behaviour for global throttling).
+            await asyncio.gather(*pipeline)
+        except BaseException:
+            # Tear the pipeline down so no worker is left blocked on the
+            # queue, then re-raise the original (e.g. rate-limit) error.
+            for task in pipeline:
+                task.cancel()
+            await asyncio.gather(*pipeline, return_exceptions=True)
+            raise
 
         return all_prs, errors
 

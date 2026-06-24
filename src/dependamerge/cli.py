@@ -777,11 +777,14 @@ def _run_parallel_merge(
             preceding similar-PR list.  Callers pass False when no
             list was printed (e.g. no similar PRs were found) so the
             output stays compact.
-        repo_scoped: When True, all PRs target a single repository, so
-            each worker refreshes its PR's live merge state just before
-            dispatching the merge (a sibling merge can make a PR
-            ``dirty`` / ``behind`` mid-batch).  Left False for org-wide
-            runs.  See ``AsyncMergeManager._refresh_pr_mergeability``.
+        repo_scoped: When True, each worker refreshes its PR's live
+            merge state just before dispatching the merge, because a
+            sibling merge in the same repository can make a PR ``dirty``
+            / ``behind`` mid-batch.  Enabled for both repo-scoped merges
+            (all PRs in one repository) and owner-wide striped merges
+            (which interleave repositories but serialise PRs within each
+            repository).  See
+            ``AsyncMergeManager._refresh_pr_mergeability``.
         stripe: When True, the merge is scheduled with the striped
             scheduler (one serial worker per repository, distinct repos
             concurrent) so owner-wide batches never stack two merges on
@@ -1397,19 +1400,14 @@ def _handle_org_merge(
         ctx: Shared merge context populated with CLI parameters.
     """
     from .github_service import GitHubService
-    from .url_parser import _host_matches
 
-    # --- Guard: owner-merge only supports github.com for now ---
-    # This mirrors the parser's github.com-only guard; GHE enablement
-    # is tracked separately (see derive_api_urls and the GHE issue).
-    if not _host_matches(parsed_org.host, "github.com"):
-        console.print(
-            "❌ Owner-scoped merge is currently only supported "
-            f"for github.com (got host: {parsed_org.host}).\n"
-            "   GitHub Enterprise support requires API base URL "
-            "configuration — use a direct PR URL instead."
-        )
-        raise typer.Exit(code=1)
+    # The host is guaranteed to be github.com here: ``parse_org_url`` is
+    # the single github.com-only choke point (it rejects every other
+    # host, including GHE, before a ``ParsedOrgUrl`` can reach this
+    # handler).  Enabling GHE (#343) means relaxing that one parser guard
+    # and threading ``derive_api_urls(host)`` through the service stack —
+    # deliberately not re-checked here so there is no second guard to
+    # drift out of sync.
 
     # --- Initialise GitHub client & token ---
     ctx.github_client = GitHubClient(ctx.token)
@@ -1422,8 +1420,12 @@ def _handle_org_merge(
         f"🔍 Owner mode: scanning {parsed_org.owner} for automation PRs..."
     )
 
-    # --- Token permission check (reuse existing helper) ---
-    _check_merge_permissions(ctx)
+    # NOTE: the token permission check is deferred until *after*
+    # enumeration (see below).  ``_check_merge_permissions`` probes a
+    # concrete repository, and ``check_token_permissions`` reports every
+    # operation as missing when no repo is supplied — running it here
+    # with an empty ``ctx.repo_name`` would abort every owner-wide run
+    # unconditionally.
 
     # --- Progress tracker (enumeration phase: repos fraction) ---
     if ctx.show_progress:
@@ -1474,6 +1476,16 @@ def _handle_org_merge(
         label = "automation " if only_automation else ""
         console.print(f"❌ No open {label}PRs found in {parsed_org.owner}")
         return
+
+    # --- Token permission check (reuse existing helper) ---
+    # Deferred from before enumeration: the helper needs a concrete repo
+    # to probe, so point it at the first in-scope PR's repository as a
+    # representative sample.  The common failure modes (expired/invalid
+    # token, no write access) fail identically on any repo; genuine
+    # per-repo permission variance with fine-grained tokens is caught at
+    # merge time by the scheduler's per-repository error isolation.
+    ctx.repo_name = owner_prs[0].repository_full_name.split("/", 1)[-1]
+    _check_merge_permissions(ctx)
 
     # --- Classify PRs as automation vs human ---
     # Substring matching is consistent with

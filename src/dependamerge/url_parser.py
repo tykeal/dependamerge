@@ -581,8 +581,15 @@ def derive_api_urls(host: str) -> tuple[str, str]:
 
     Returns:
         A ``(api_url, graphql_url)`` tuple.
+
+    Raises:
+        ValueError: If ``host`` is empty or whitespace-only, which would
+            otherwise yield a subtly broken base URL such as
+            ``https:///api/v3``.
     """
-    host = (host or "").lower()
+    host = (host or "").strip().lower()
+    if not host:
+        raise ValueError("derive_api_urls requires a non-empty host")
     if _host_matches(host, "github.com"):
         return ("https://api.github.com", "https://api.github.com/graphql")
     # GitHub Enterprise Server base URLs.

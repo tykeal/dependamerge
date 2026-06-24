@@ -365,7 +365,10 @@ class AsyncMergeManager:
         Merge multiple PRs in parallel.
 
         Args:
-            pr_list: List of (PullRequestInfo, ComparisonResult) tuples
+            pr_list: List of ``(PullRequestInfo, ComparisonResult | None)``
+                tuples.  The comparison element is ``None`` for owner-wide
+                and repository-wide runs (no source PR to compare
+                against) and a ``ComparisonResult`` for similar-PR runs.
             stripe: When True, schedule the batch with the striped
                 scheduler (see :meth:`_run_striped`): PRs are grouped by
                 repository and at most one PR per repository is processed
@@ -469,32 +472,53 @@ class AsyncMergeManager:
           repository's PRs strictly sequentially, so **at most one PR per
           repository is ever in flight**.
         - Lets distinct repositories run concurrently, bounded by the
-          shared merge semaphore.  Because ``asyncio.Semaphore`` is FIFO,
-          a repository releasing its slot between PRs goes to the back of
-          the queue behind other repositories' waiting PRs, which
-          naturally round-robins ("stripes") work across repositories.
+          shared merge semaphore.  When a repository releases its slot
+          between PRs it re-acquires the semaphore for its next PR,
+          competing afresh with other repositories' waiting PRs.  In
+          practice CPython wakes semaphore waiters in roughly the order
+          they blocked, so this tends to round-robin ("stripe") work
+          across repositories — but that ordering is only a best-effort
+          optimisation, not a correctness property.  Fairness is **not**
+          part of the public ``asyncio.Semaphore`` contract and is not
+          relied upon: the single-flight-per-repository invariant above
+          comes solely from each repository's serial worker, regardless
+          of the order in which the semaphore admits waiters.
 
         Combined with ``repo_scoped`` mergeability refresh, when a
         repository's second PR finally starts it re-reads state the first
         PR's merge may have invalidated.
         """
         # Group by repository, preserving first-seen order so the stripe
-        # ordering is deterministic.
-        grouped: dict[str, list[tuple[PullRequestInfo, ComparisonResult | None]]] = {}
-        for item in pr_list:
-            grouped.setdefault(item[0].repository_full_name, []).append(item)
+        # ordering is deterministic.  Each item is carried with its index
+        # in ``pr_list`` so results reassemble in the caller's order.
+        grouped: dict[
+            str, list[tuple[int, tuple[PullRequestInfo, ComparisonResult | None]]]
+        ] = {}
+        for index, item in enumerate(pr_list):
+            grouped.setdefault(item[0].repository_full_name, []).append((index, item))
 
-        # Results are keyed by the identity of each work item so they can
-        # be reassembled in the caller's original order.
-        result_by_id: dict[int, MergeResult] = {}
+        # Results are keyed by each work item's position in ``pr_list``.
+        # Positional keys (rather than ``id(item)``) stay correct even if
+        # the caller passes duplicate tuple objects (e.g. ``[item] * n``),
+        # where ``id()`` would collide and later results would overwrite
+        # earlier ones.
+        result_by_index: dict[int, MergeResult] = {}
 
         async def _repo_worker(
-            items: list[tuple[PullRequestInfo, ComparisonResult | None]],
+            items: list[tuple[int, tuple[PullRequestInfo, ComparisonResult | None]]],
         ) -> None:
-            for item in items:
+            for index, item in items:
                 pr_info = item[0]
                 try:
                     res = await self._merge_single_pr_with_semaphore(pr_info)
+                except asyncio.CancelledError:
+                    # Cancellation must propagate so the gather below can
+                    # tear the run down.  On Python >= 3.10 CancelledError
+                    # already derives from BaseException (not Exception),
+                    # so the handler below would not catch it; this
+                    # explicit re-raise documents that intent and guards
+                    # against the broad handler ever being widened.
+                    raise
                 except Exception as e:
                     # Defensive: a crash on one PR must not lose results
                     # for the remaining PRs in the same repository.
@@ -509,7 +533,7 @@ class AsyncMergeManager:
                         pr_info.number,
                         e,
                     )
-                result_by_id[id(item)] = res
+                result_by_index[index] = res
 
         tasks = [
             asyncio.create_task(
@@ -522,7 +546,7 @@ class AsyncMergeManager:
         # Workers never raise (each PR is wrapped defensively above).
         await asyncio.gather(*tasks)
 
-        return [result_by_id[id(item)] for item in pr_list]
+        return [result_by_index[i] for i in range(len(pr_list))]
 
     def _collect_results(
         self,
