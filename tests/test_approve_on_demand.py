@@ -129,6 +129,45 @@ class TestApproveAndRetryIfReviewRequired:
         client.analyze_block_reason.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_authoritative_rejection_overrides_lagging_state(self) -> None:
+        """GitHub's missing-approval body fires even when state isn't blocked.
+
+        ``mergeable_state`` lags and is blind to repository rulesets, so a
+        merge can be rejected for a missing required approval while the
+        cached state is still ``clean``.  The authoritative rejection body
+        must drive approve-and-retry without consulting the heuristic
+        block-reason probe.
+        """
+        mgr, client = make_merge_manager()
+        mgr._post_approval_delay = 0.0
+        pr = _BLOCKED_PR.model_copy(update={"mergeable_state": "clean"})
+        mgr._last_merge_exception["owner/repo#42"] = Exception(
+            "Repository rule violations found Waiting on required "
+            "approvals from owner/releng"
+        )
+
+        with (
+            patch.object(
+                mgr, "_ensure_pr_approved", new_callable=AsyncMock, return_value=True
+            ) as mock_approve,
+            patch.object(
+                mgr,
+                "_merge_pr_with_retry",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_retry,
+        ):
+            result = await mgr._approve_and_retry_if_review_required(
+                pr, "owner", "repo"
+            )
+
+        assert result is True
+        mock_approve.assert_awaited_once()
+        mock_retry.assert_awaited_once()
+        # The authoritative body is sufficient; no heuristic probe needed.
+        client.analyze_block_reason.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_skips_when_already_approved_this_run(self) -> None:
         """If we already approved this run, do not approve again."""
         mgr, client = make_merge_manager()
