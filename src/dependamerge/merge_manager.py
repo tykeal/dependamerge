@@ -3776,6 +3776,27 @@ class AsyncMergeManager:
                 # Enhanced error handling with specific status code checks
                 if "405" in error_msg and "Method Not Allowed" in error_msg:
                     # Don't log here - will be handled in failure summary
+                    if "base branch was modified" in error_msg.lower():
+                        # Pure concurrency race: in a same-repo batch a
+                        # sibling PR merged and advanced the base branch
+                        # between GitHub computing this PR's merge commit
+                        # and applying it, so GitHub returns 405 "Base
+                        # branch was modified. Review and try the merge
+                        # again."  It is always transient and unrelated to
+                        # the PR's own mergeability (no rebase or approval
+                        # is needed), so a short delay lets GitHub recompute
+                        # against the new base head, then we retry.
+                        if attempt < self.max_retries:
+                            retry_delay = 2.0 * (attempt + 1)
+                            self.log.info(
+                                f"Base branch moved under {pr_key} (concurrent "
+                                f"merge); waiting {retry_delay}s before retry "
+                                f"(attempt {attempt + 1}/{self.max_retries + 1})…"
+                            )
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        else:
+                            break
                     if "behind" in error_msg.lower() and self.fix_out_of_date:
                         # Allow retry for behind PRs
                         pass

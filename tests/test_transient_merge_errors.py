@@ -71,6 +71,24 @@ def _make_405_exception() -> httpx.HTTPStatusError:
     )
 
 
+def _make_405_base_modified_exception() -> Exception:
+    """Create a 405 carrying GitHub's "Base branch was modified" body.
+
+    This mirrors the enhanced error string produced by
+    ``merge_pull_request``/``_validate_merge_result``: the original 405
+    status line plus GitHub's response body, which is what the retry
+    classifier in ``_merge_pr_with_retry`` string-matches.
+    """
+    return Exception(
+        "Failed to merge PR #39 in org/repo. Error: Client error "
+        "'405 Method Not Allowed' for url "
+        "'https://api.github.com/repos/org/repo/pulls/39/merge'. "
+        "GitHub: Base branch was modified. Review and try the merge again. "
+        "(PR state: open, mergeable: True, mergeable_state: behind) "
+        "[PR branch is behind base branch]"
+    )
+
+
 def _make_502_exception() -> httpx.HTTPStatusError:
     """Create a realistic 502 HTTPStatusError."""
     request = httpx.Request(
@@ -304,6 +322,77 @@ class TestTransient405Retry:
 
         assert result is True
         assert client.merge_pull_request.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_405_base_branch_modified_retries_and_succeeds(self):
+        """A "Base branch was modified" 405 is a transient race: retry.
+
+        The PR is ``behind`` and ``fix_out_of_date`` is off, so without the
+        dedicated base-modified handling this 405 would fall through to the
+        terminal ``else: break`` and report a false failure.  The race
+        clears on retry (a sibling merge advanced the base), so the second
+        attempt succeeds.
+        """
+        pr = _make_pr_info(mergeable_state="behind", mergeable=True)
+
+        mgr, client = make_merge_manager(
+            merge_method="merge",
+            max_retries=2,
+            concurrency=1,
+            fix_out_of_date=False,
+        )
+        mgr._pr_merge_methods["org/repo"] = "merge"
+
+        client.merge_pull_request = AsyncMock(
+            side_effect=[_make_405_base_modified_exception(), True]
+        )
+        # Re-fetch before the retry shows the PR still open (not merged).
+        client.get = AsyncMock(
+            return_value={
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "state": "open",
+                "merged": False,
+            }
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await mgr._merge_pr_with_retry(pr, "org", "repo")
+
+        assert result is True
+        assert client.merge_pull_request.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_405_base_branch_modified_exhausts_retries(self):
+        """A persistent base-modified 405 gives up after max_retries."""
+        pr = _make_pr_info(mergeable_state="behind", mergeable=True)
+
+        mgr, client = make_merge_manager(
+            merge_method="merge",
+            max_retries=2,
+            concurrency=1,
+            fix_out_of_date=False,
+        )
+        mgr._pr_merge_methods["org/repo"] = "merge"
+
+        client.merge_pull_request = AsyncMock(
+            side_effect=_make_405_base_modified_exception()
+        )
+        client.get = AsyncMock(
+            return_value={
+                "mergeable": True,
+                "mergeable_state": "behind",
+                "state": "open",
+                "merged": False,
+            }
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await mgr._merge_pr_with_retry(pr, "org", "repo")
+
+        assert result is False
+        # Initial attempt + max_retries = 3 attempts total.
+        assert client.merge_pull_request.call_count == 3
 
 
 # -------------------------------------------------------------------
