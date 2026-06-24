@@ -20,6 +20,7 @@ from rich.console import Console
 from rich.table import Table
 
 from ._version import __version__
+from .bot_identity import is_automation_author
 from .close_manager import AsyncCloseManager, CloseResult
 from .error_codes import (
     DependamergeError,
@@ -81,6 +82,12 @@ from .url_parser import (
 
 # Constants
 MAX_RETRIES = 2
+
+# Default owner-wide global wait ceiling (seconds) for `--max-wait`.
+# 15 minutes balances giving dependabot's rebase + CI time to land
+# against not blocking the shell indefinitely.  0 disables waiting
+# (fire-and-forget).
+DEFAULT_MAX_WAIT = 900.0
 
 
 def version_callback(value: bool):
@@ -338,6 +345,11 @@ class _MergeContext:
     github2gerrit_mode: str
     include_human_prs: bool = False
     rebase_local: bool = True
+    # Owner-wide global wait ceiling (seconds).  Default 900 (15 min);
+    # 0 = fire-and-forget (arm auto-merge, report pending, never block).
+    # Applies to owner/user-wide runs; ignored for single-PR and
+    # single-repository merges.
+    max_wait: float = DEFAULT_MAX_WAIT
 
     # Derived / mutable state
     github_client: GitHubClient | None = None
@@ -809,6 +821,10 @@ def _run_parallel_merge(
             netrc_file=ctx.netrc_file,
             rebase_local=ctx.rebase_local,
             repo_scoped=repo_scoped,
+            # The owner-wide global wait ceiling applies to striped
+            # (owner/user-wide) runs; single-PR and single-repository
+            # merges keep the uncapped per-PR ``merge_timeout`` behaviour.
+            max_wait=ctx.max_wait if stripe else None,
         ) as merge_manager:
             if not preview:
                 prefix = "\n" if leading_blank else ""
@@ -1138,17 +1154,15 @@ def _handle_repo_merge(
         return
 
     # --- Classify PRs as automation vs human ---
-    # Use AUTOMATION_TOOLS substring matching (consistent with
-    # GitHubService.fetch_repo_open_prs and _is_automation_author).
-    # GraphQL returns authors without the "[bot]" suffix (e.g.
-    # "dependabot" not "dependabot[bot]"), so the exact-match
-    # GitHubClient.is_automation_author() would misclassify them.
+    # Delegated to the shared bot-identity predicate so REST and GraphQL
+    # login forms (e.g. "dependabot[bot]" vs "dependabot") classify
+    # identically.
     def _is_auto(author: str | None) -> bool:
-        author_lower = (author or "").lower()
-        return any(tool in author_lower for tool in AUTOMATION_TOOLS)
+        return is_automation_author(author)
 
     automation_prs: list[PullRequestInfo] = []
     human_prs: list[PullRequestInfo] = []
+
     for pr in repo_prs:
         if _is_auto(pr.author):
             automation_prs.append(pr)
@@ -1363,6 +1377,38 @@ def _execute_repo_confirmed_merge(
     _print_failed_pr_details(real_results)
 
 
+def _owner_merge_order(
+    prs: list[PullRequestInfo],
+) -> list[PullRequestInfo]:
+    """Order owner-wide PRs for striped merging.
+
+    Sorts so that:
+
+    - Repositories with the most in-scope PRs come first.  These take the
+      longest to drain (each merge can make the next sibling ``behind`` /
+      ``dirty`` and trigger a rebase + CI wait), so starting them earliest
+      gives them the most wall-clock head start under the striped
+      scheduler's concurrent per-repository workers.
+    - Within a repository, PRs ascend by number, i.e. in the order the
+      automation raised them (oldest first).  Merging the oldest first
+      minimises the rebase churn imposed on the newer siblings.
+
+    Ties between equally-sized repositories break on repository name so
+    the order (and the grouped listing derived from it) is deterministic.
+    """
+    counts: dict[str, int] = {}
+    for pr in prs:
+        counts[pr.repository_full_name] = counts.get(pr.repository_full_name, 0) + 1
+    return sorted(
+        prs,
+        key=lambda p: (
+            -counts[p.repository_full_name],
+            p.repository_full_name,
+            p.number,
+        ),
+    )
+
+
 def _print_prs_grouped_by_repo(
     prs: list[PullRequestInfo],
 ) -> None:
@@ -1370,14 +1416,16 @@ def _print_prs_grouped_by_repo(
 
     Emits a header per repository followed by its PRs indented beneath,
     so a large owner-wide list stays scannable.  Repositories are listed
-    in sorted order; PRs within a repository are ordered by number.
+    in the order they first appear in ``prs`` (the caller passes them in
+    merge order via :func:`_owner_merge_order`, so the listing mirrors the
+    sequence in which they will be merged); PRs within a repository are
+    shown in the supplied order.
     """
     by_repo: dict[str, list[PullRequestInfo]] = {}
     for pr in prs:
         by_repo.setdefault(pr.repository_full_name, []).append(pr)
 
-    for repo in sorted(by_repo):
-        repo_prs = sorted(by_repo[repo], key=lambda p: p.number)
+    for repo, repo_prs in by_repo.items():
         console.print(f"\n📁 {repo} ({len(repo_prs)} PR(s))")
         for pr in repo_prs:
             console.print(f"  #{pr.number} {pr.title} (by {pr.author})")
@@ -1477,6 +1525,11 @@ def _handle_org_merge(
         console.print(f"❌ No open {label}PRs found in {parsed_org.owner}")
         return
 
+    # Order for striped merging: repositories with the most PRs first,
+    # ascending PR number within each repository (see _owner_merge_order).
+    # Both the grouped listing and the merge list derive from this order.
+    owner_prs = _owner_merge_order(owner_prs)
+
     # --- Token permission check (reuse existing helper) ---
     # Deferred from before enumeration: the helper needs a concrete repo
     # to probe, so point it at the first in-scope PR's repository as a
@@ -1488,11 +1541,9 @@ def _handle_org_merge(
     _check_merge_permissions(ctx)
 
     # --- Classify PRs as automation vs human ---
-    # Substring matching is consistent with
-    # GitHubService._is_automation_author / fetch_owner_open_prs.
+    # Delegated to the shared bot-identity predicate (see _handle_repo_merge).
     def _is_auto(author: str | None) -> bool:
-        author_lower = (author or "").lower()
-        return any(tool in author_lower for tool in AUTOMATION_TOOLS)
+        return is_automation_author(author)
 
     automation_prs: list[PullRequestInfo] = []
     human_prs: list[PullRequestInfo] = []
@@ -1985,6 +2036,18 @@ def merge(
             f"{DEFAULT_MERGE_TIMEOUT:.0f}"
         ),
     ),
+    max_wait: float = typer.Option(
+        DEFAULT_MAX_WAIT,
+        "--max-wait",
+        help=(
+            "Owner/user-wide runs only: global wall-clock ceiling in "
+            "seconds for the whole batch. The run returns once every PR "
+            "has merged or this elapses (anything still in flight keeps "
+            "auto-merge armed and is reported as pending). 0 = "
+            "fire-and-forget (arm auto-merge and return immediately, "
+            f"never block). Default: {DEFAULT_MAX_WAIT:.0f}"
+        ),
+    ),
     show_progress: bool = typer.Option(
         True, "--progress/--no-progress", help="Show real-time progress updates"
     ),
@@ -2203,6 +2266,7 @@ def merge(
     if parsed_org is not None:
         org_ctx = _MergeContext(
             pr_url=parsed_org.original_url,
+            max_wait=max_wait,
             no_confirm=no_confirm,
             similarity_threshold=similarity_threshold,
             merge_method=merge_method,
@@ -2270,6 +2334,7 @@ def merge(
     if parsed_repo is not None:
         repo_ctx = _MergeContext(
             pr_url=parsed_repo.original_url,
+            max_wait=max_wait,
             no_confirm=no_confirm,
             similarity_threshold=similarity_threshold,
             merge_method=merge_method,
@@ -2337,6 +2402,7 @@ def merge(
     assert parsed_url is not None
     ctx = _MergeContext(
         pr_url=parsed_url.original_url,
+        max_wait=max_wait,
         no_confirm=no_confirm,
         similarity_threshold=similarity_threshold,
         merge_method=merge_method,

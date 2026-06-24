@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import urlparse
 
+from .bot_identity import is_automation_author
 from .models import (
     FileChange,
     OrganizationScanResult,
@@ -266,15 +267,12 @@ class GitHubClient:
             return False
 
     def is_automation_author(self, author: str) -> bool:
-        """Check if the author is a known automation tool."""
-        automation_authors = {
-            "dependabot[bot]",
-            "pre-commit-ci[bot]",
-            "renovate[bot]",
-            "github-actions[bot]",
-            "allcontributors[bot]",
-        }
-        return author in automation_authors
+        """Check if the author is a known automation tool.
+
+        Delegates to the shared :func:`bot_identity.is_automation_author`
+        so REST and GraphQL login forms are classified identically.
+        """
+        return is_automation_author(author)
 
     def get_pr_status_details(self, pr_info: PullRequestInfo) -> str:
         """Get detailed status information for a PR."""

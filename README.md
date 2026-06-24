@@ -179,6 +179,14 @@ or user account in one command.
   structurally avoids the data-replication races that otherwise arise
   when two same-repository PRs land back-to-back — without injected
   delays or random retries
+- **Drain Ordering**: Orders repositories with the most PRs first (they
+  take longest to drain), and merges PRs oldest-number-first within a
+  repository to match the order dependabot expects to rebase
+- **Self-Rebase Awareness**: Detects when dependabot has begun rebasing a
+  sibling PR (the "Dependabot is rebasing this PR" banner), holds that PR
+  in a background wait, and lets auto-merge land it rather than failing it
+  or firing a redundant rebase macro. A global `--max-wait` ceiling bounds
+  the whole run
 - **Resilient Enumeration**: The run reports and skips a transient
   failure scanning one repository, then continues with the repositories
   it scanned
@@ -698,6 +706,15 @@ dependamerge merge https://github.com/owner/repo/pull/123 \
   for detailed documentation
 - `--token TEXT`: GitHub token (alternative to GITHUB_TOKEN env var)
 - `--override TEXT`: SHA hash for extra security validation
+
+**Owner-Wide Options:**
+
+- `--max-wait SECONDS`: Global wall-clock ceiling for an owner-wide run
+  (default: 900, 15 minutes). Clamps every per-PR auto-merge wait so the
+  run cannot hang on slow CI. Set `--max-wait 0` for fire-and-forget:
+  approve, arm auto-merge, report each PR as pending, and return at once
+  without blocking (GitHub completes the merges after the tool exits).
+  Applies to owner-wide runs; single-PR and single-repo modes ignore it.
 
 **Gerrit Environment Variables:**
 

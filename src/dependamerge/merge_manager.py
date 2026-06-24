@@ -19,6 +19,7 @@ from urllib.parse import quote
 from rich.console import Console
 
 from . import rebase
+from .bot_identity import is_dependabot
 from .copilot_handler import CopilotCommentHandler
 from .gerrit import (
     GerritAuthError,
@@ -139,6 +140,7 @@ class AsyncMergeManager:
         netrc_file: Path | None = None,
         rebase_local: bool = True,
         repo_scoped: bool = False,
+        max_wait: float | None = None,
     ):
         self.token = token
         self.default_merge_method = merge_method
@@ -162,15 +164,33 @@ class AsyncMergeManager:
         # the legacy REST-only path (simpler but loses signature
         # verification on signed branches).
         self.rebase_local = rebase_local
-        # When True, the batch targets a single repository, so a merge
-        # by one worker can make a sibling PR ``dirty`` / ``behind``
-        # between the up-front fetch and this worker's dispatch.  In
-        # that mode we refresh each PR's live merge state immediately
-        # before dispatching the merge (see
-        # ``_refresh_pr_mergeability``).  Left False for org-wide runs,
-        # where PRs target different repositories and the snapshot is
-        # not invalidated by our own merges.
+        # When True, a worker refreshes its PR's live merge state just
+        # before dispatching, because a sibling merge can make a PR
+        # ``dirty`` / ``behind`` between the up-front fetch and this
+        # worker's dispatch (see ``_refresh_pr_mergeability``).  Enabled
+        # both for single-repository batches and for owner-wide striped
+        # runs, where each repository's PRs are serialised so an earlier
+        # merge can invalidate a later sibling.  Left False only for
+        # similar-PR runs spread across unrelated repositories, where our
+        # own merges do not invalidate the snapshot.
         self._repo_scoped = repo_scoped
+        # Owner-wide global wait ceiling (seconds), or ``None`` for
+        # repository / similar-PR runs which keep the legacy per-PR
+        # ``merge_timeout`` behaviour with no overall cap.  Semantics:
+        #   * ``None``  — no global ceiling (per-PR ``merge_timeout``
+        #                 governs each wait independently).
+        #   * ``> 0``   — a wall-clock ceiling for the whole run; every
+        #                 per-PR wait deadline is clamped to it, so the
+        #                 run cannot block past this bound.  Anything
+        #                 still in flight when it elapses keeps auto-merge
+        #                 armed and is reported AUTO_MERGE_PENDING.
+        #   * ``0``     — fire-and-forget: never block.  Approve, arm
+        #                 auto-merge, report AUTO_MERGE_PENDING, move on.
+        # ``_run_deadline`` (the resolved monotonic ceiling) and
+        # ``_no_wait`` (the ``0`` case) are set when a run starts.
+        self._max_wait = max_wait
+        self._run_deadline: float | None = None
+        self._no_wait: bool = max_wait is not None and max_wait <= 0
         self.log = logging.getLogger(__name__)
 
         # Centralised merge-operation timing
@@ -384,6 +404,18 @@ class AsyncMergeManager:
         """
         if not pr_list:
             return []
+
+        # Resolve the owner-wide global wait ceiling for this run.  A
+        # positive ``max_wait`` becomes a monotonic wall-clock deadline
+        # that every per-PR wait is clamped to (see
+        # ``_wait_for_auto_merge``); ``0`` (``_no_wait``) skips waiting
+        # entirely; ``None`` leaves each per-PR ``merge_timeout``
+        # uncapped (repository / similar-PR runs).  Reset first so a
+        # reused manager instance never carries a stale deadline from a
+        # previous run into this one.
+        self._run_deadline = None
+        if self._max_wait is not None and self._max_wait > 0:
+            self._run_deadline = asyncio.get_running_loop().time() + self._max_wait
 
         if self.preview_mode:
             self.log.info(f"🔍 PREVIEW: Would merge {len(pr_list)} PRs")
@@ -1764,7 +1796,7 @@ class AsyncMergeManager:
                     #      recovery via ``_trigger_stale_precommit_ci``
                     #      (which posts ``pre-commit.ci run``).
                     recreated_pr = None
-                    if pr_info.author == "dependabot[bot]" and not self.preview_mode:
+                    if is_dependabot(pr_info.author) and not self.preview_mode:
                         reason_lower = failure_reason.lower()
                         # Branch protection *and* repository rulesets can
                         # both block a dependabot PR for reasons recreation
@@ -3340,7 +3372,7 @@ class AsyncMergeManager:
         repo_owner, repo_name = pr_info.repository_full_name.split("/", 1)
 
         # 1. Only applies to dependabot PRs
-        if pr_info.author != "dependabot[bot]":
+        if not is_dependabot(pr_info.author):
             return None
 
         # 2. Check whether the branch requires signed commits
@@ -3487,7 +3519,7 @@ class AsyncMergeManager:
                             if not isinstance(pr_data, dict):
                                 continue
                             pr_author = pr_data.get("user", {}).get("login", "")
-                            if pr_author != "dependabot[bot]":
+                            if not is_dependabot(pr_author):
                                 continue
 
                             new_number = pr_data.get("number")
@@ -4344,12 +4376,24 @@ class AsyncMergeManager:
         if self._github_client is None:
             return False, False
 
+        # Fire-and-forget (``max_wait == 0``): never block.  Returning
+        # "not closed" lets callers fall through to the auto-merge-pending
+        # path (Step 6 / the conflict handler arms auto-merge and reports
+        # AUTO_MERGE_PENDING).  Auto-merge is armed by the caller before
+        # this point, so GitHub still completes the merge later.
+        if self._no_wait:
+            return False, False
+
         pr_key = f"{owner}/{repo}#{pr_info.number}"
         loop = asyncio.get_running_loop()
         # Drive the wait off a monotonic deadline so the total is
         # bounded even if a single iteration over-sleeps slightly.
         if deadline is None:
             deadline = loop.time() + self._merge_timeout
+        # Clamp to the owner-wide global ceiling (when set) so no single
+        # PR's wait can push the whole run past ``max_wait``.
+        if self._run_deadline is not None:
+            deadline = min(deadline, self._run_deadline)
         # Local alias so the type checker can narrow
         # ``self._github_client`` across the await boundary.
         wait_client = self._github_client
@@ -4535,6 +4579,19 @@ class AsyncMergeManager:
             self._console.print(f"🛑 Closed without merging: {pr_info.html_url}")
         return result
 
+    def _dependabot_is_rebasing(self, body: str | None) -> bool:
+        """Return True when a PR body shows dependabot mid-self-rebase.
+
+        Dependabot writes a notice into the PR body while it rebases the
+        branch on its own (after the base moved).  Detecting it lets the
+        conflict handler wait for the in-progress rebase instead of
+        sending a redundant ``@dependabot rebase`` macro.
+        """
+        if not body:
+            return False
+        lowered = body.lower()
+        return "dependabot is rebasing" in lowered or "is rebasing this pr" in lowered
+
     async def _handle_merge_conflict(
         self,
         pr_info: PullRequestInfo,
@@ -4561,7 +4618,7 @@ class AsyncMergeManager:
         # conflicted lockfile, and a blind force-push would only break
         # the approval chain (this org forbids self-merge of pushed
         # commits).  Report the conflict and fail fast.
-        if pr_info.author != "dependabot[bot]":
+        if not is_dependabot(pr_info.author):
             log_and_print(
                 self.log,
                 self._console,
@@ -4574,26 +4631,71 @@ class AsyncMergeManager:
                 self.progress_tracker.merge_failure()
             return result
 
-        # Dependabot: request a rebase (regenerates the lockfile +
-        # signs the commit).
-        log_and_print(
-            self.log,
-            self._console,
-            f"🔄 Requesting dependabot rebase: {pr_info.html_url}",
-            level="info",
-        )
-        if not await self._request_dependabot_rebase(pr_info, owner, repo):
+        # Detect whether dependabot is already self-rebasing this PR.
+        # When its base branch moves (e.g. a sibling PR merged), it
+        # rebases the branch on its own and writes a marker into the PR
+        # body while it does.  In that window we must not send a
+        # duplicate ``@dependabot rebase`` macro: the in-progress rebase
+        # will clear the conflict, so we wait for it rather than poke it.
+        already_rebasing = self._dependabot_is_rebasing(pr_info.body)
+
+        # Fire-and-forget (``max_wait == 0``): ask dependabot to rebase
+        # (unless it already is), arm auto-merge, and report pending
+        # without blocking this repository's serial worker.  Approval is
+        # best-effort here — a subsequent dependabot force-push dismisses
+        # it when the branch enables "dismiss stale reviews", which is the
+        # documented trade-off of not waiting to approve the rebased head.
+        if self._no_wait:
+            if not already_rebasing:
+                await self._request_dependabot_rebase(pr_info, owner, repo)
+            try:
+                await self._approve_pr(owner, repo, pr_info.number)
+            except Exception as exc:
+                self.log.debug(
+                    "no-wait approve failed for %s/%s#%s: %s",
+                    owner,
+                    repo,
+                    pr_info.number,
+                    exc,
+                )
+            await self._enable_auto_merge_for_pr(pr_info, owner, repo)
+            result.status = MergeStatus.AUTO_MERGE_PENDING
             log_and_print(
                 self.log,
                 self._console,
-                f"🔀 Merge conflict: {pr_info.html_url}",
+                f"⏳ Auto-merge armed (no-wait): {pr_info.html_url}",
                 level="info",
             )
-            result.status = MergeStatus.FAILED
-            result.error = "merge conflicts"
-            if self.progress_tracker:
-                self.progress_tracker.merge_failure()
             return result
+
+        # Dependabot: request a rebase (regenerates the lockfile +
+        # signs the commit) unless it is already rebasing on its own.
+        if already_rebasing:
+            log_and_print(
+                self.log,
+                self._console,
+                f"🔄 Dependabot already rebasing: {pr_info.html_url}",
+                level="info",
+            )
+        else:
+            log_and_print(
+                self.log,
+                self._console,
+                f"🔄 Requesting dependabot rebase: {pr_info.html_url}",
+                level="info",
+            )
+            if not await self._request_dependabot_rebase(pr_info, owner, repo):
+                log_and_print(
+                    self.log,
+                    self._console,
+                    f"🔀 Merge conflict: {pr_info.html_url}",
+                    level="info",
+                )
+                result.status = MergeStatus.FAILED
+                result.error = "merge conflicts"
+                if self.progress_tracker:
+                    self.progress_tracker.merge_failure()
+                return result
 
         # Share a single ``merge_timeout`` budget across both wait
         # phases (waiting for the rebase, then for checks).
@@ -4751,7 +4853,7 @@ class AsyncMergeManager:
         Sets ``result`` to ``FAILED`` and returns it.
         """
         stuck_reported = False
-        if pr_info.author != "dependabot[bot]" and not self.preview_mode:
+        if not is_dependabot(pr_info.author) and not self.preview_mode:
             try:
                 detection = await self._detect_stuck_required_check(pr_info)
             except Exception as exc:

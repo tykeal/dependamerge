@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Any
 
+from .bot_identity import canonical_bot_login, is_automation_author
 from .github_async import (
     GitHubAsync,
     GraphQLError,
@@ -653,7 +654,10 @@ class GitHubService:
             repository=repo_full_name,
             pr_number=int(pr.get("number", 0)),
             title=pr.get("title") or "",
-            author=((pr.get("author") or {}).get("login") or "unknown"),
+            author=canonical_bot_login(
+                (pr.get("author") or {}).get("login"),
+                (pr.get("author") or {}).get("__typename"),
+            ),
             url=pr.get("url") or "",
             reasons=reasons,
             copilot_comments_count=len(copilot_comments),
@@ -684,7 +688,10 @@ class GitHubService:
             node_id=pr.get("id"),  # GraphQL node ID for mutations
             title=pr.get("title") or "",
             body=(pr.get("body") or None),
-            author=((pr.get("author") or {}).get("login") or "unknown"),
+            author=canonical_bot_login(
+                (pr.get("author") or {}).get("login"),
+                (pr.get("author") or {}).get("__typename"),
+            ),
             head_sha=pr.get("headRefOid") or "",
             base_branch=pr.get("baseRefName") or "",
             head_branch=pr.get("headRefName") or "",
@@ -1647,9 +1654,12 @@ class GitHubService:
         return stats
 
     def _is_automation_author(self, author: str) -> bool:
-        """Check if author is an automation tool."""
-        author_lower = author.lower()
-        return any(tool in author_lower for tool in AUTOMATION_TOOLS)
+        """Check if author is an automation tool.
+
+        Delegates to the shared :func:`bot_identity.is_automation_author`
+        so REST and GraphQL login forms are classified identically.
+        """
+        return is_automation_author(author)
 
     def _affects_action_files(self, files: list[dict[str, Any]]) -> bool:
         """Check if files include action definition or implementation files."""

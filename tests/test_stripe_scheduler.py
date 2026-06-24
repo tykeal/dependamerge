@@ -240,3 +240,34 @@ async def test_striped_handles_duplicate_work_item_objects():
     assert all(r.status is MergeStatus.MERGED for r in results)
     # The repository's three (identical) PRs were each dispatched.
     assert len(recorder.dispatch_order) == 3
+
+
+@pytest.mark.asyncio
+async def test_run_deadline_reset_between_runs_on_reused_manager():
+    """A reused manager must not carry a stale ``_run_deadline``.
+
+    A previous owner-wide run with ``max_wait`` sets ``_run_deadline``.
+    A subsequent run without a ceiling (``max_wait=None``) must clear it
+    so its per-PR waits are not clamped (or instantly expired) by the
+    earlier run's deadline.
+    """
+    pr_list: list[PRPair] = [(_make_pr(1, "owner/a"), None)]
+
+    # First run with a wall-clock ceiling sets a deadline.
+    mgr = AsyncMergeManager(
+        token="test_token",
+        concurrency=5,
+        preview_mode=True,
+        max_wait=900.0,
+    )
+    mgr._merge_single_pr = _Recorder()  # type: ignore[assignment]
+    await mgr.merge_prs_parallel(pr_list, stripe=True)
+    assert mgr._run_deadline is not None
+
+    # Simulate the manager being reconfigured for an uncapped run.
+    mgr._max_wait = None
+    mgr._merge_single_pr = _Recorder()  # type: ignore[assignment]
+    await mgr.merge_prs_parallel(pr_list, stripe=True)
+
+    # The stale deadline from the first run was cleared.
+    assert mgr._run_deadline is None

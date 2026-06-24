@@ -109,7 +109,7 @@ query($org: String!, $reposCursor: String) {
             body
             url
             isDraft
-            author { login }
+            author { __typename login }
             mergeable
             mergeStateStatus
             baseRefName
@@ -199,7 +199,7 @@ query($owner: String!, $name: String!, $prsCursor: String, $prsPageSize: Int!, $
         body
         url
         isDraft
-        author { login }
+        author { __typename login }
         mergeable
         mergeStateStatus
         baseRefName

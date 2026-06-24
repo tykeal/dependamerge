@@ -13,12 +13,10 @@ This module provides functionality to:
 import logging
 from typing import Any
 
+from .bot_identity import is_copilot
 from .models import PullRequestInfo, ReviewInfo
 
 logger = logging.getLogger(__name__)
-
-# Known Copilot author identifiers
-COPILOT_AUTHORS = {"Copilot", "github-copilot", "copilot[bot]", "github-copilot[bot]"}
 
 # Common Copilot comment patterns that are often safe to dismiss
 COMMON_COPILOT_PATTERNS = [
@@ -59,13 +57,9 @@ class CopilotCommentHandler:
         if not review.user:
             return False
 
-        # Check if author matches known Copilot identifiers
-        author_lower = review.user.lower()
-        for copilot_author in COPILOT_AUTHORS:
-            if copilot_author.lower() in author_lower:
-                return True
-
-        return False
+        # Route author matching through the shared identity predicate so
+        # every Copilot login form (REST and GraphQL) is recognised.
+        return is_copilot(review.user)
 
     def get_copilot_reviews(self, pr_info: PullRequestInfo) -> list[ReviewInfo]:
         """
@@ -321,11 +315,7 @@ class CopilotCommentHandler:
 
         for comment in comments:
             author = comment.get("author", {})
-            if author and author.get("login") in [
-                "github-copilot[bot]",
-                "copilot",
-                "copilot-pull-request-reviewer",
-            ]:
+            if author and is_copilot(author.get("login")):
                 return True
 
             # Also check comment body for Copilot patterns
@@ -670,12 +660,9 @@ class CopilotCommentHandler:
             copilot_comments = []
 
             for comment in all_comments:
-                author = comment.get("user", {}).get("login", "").lower()
+                author = comment.get("user", {}).get("login", "")
                 # Check if comment is from Copilot
-                if any(
-                    copilot_author.lower() in author
-                    for copilot_author in COPILOT_AUTHORS
-                ):
+                if is_copilot(author):
                     copilot_comments.append(comment)
                     if self.debug:
                         self.log.info(

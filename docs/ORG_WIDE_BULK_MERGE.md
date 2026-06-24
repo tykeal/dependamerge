@@ -161,8 +161,9 @@ Implementation reuse:
   body is **factored out of `fetch_repo_open_prs` into a shared private
   helper**, so `fetch_repo_open_prs` and `fetch_owner_open_prs` share one
   implementation with no duplicated node-to-`PullRequestInfo` logic.
-- Automation classification stays in the single shared `AUTOMATION_TOOLS`
-  substring check already used by both repo mode and `fetch_repo_open_prs`.
+- Automation classification stays in the single shared bot-identity
+  predicate (`bot_identity.is_automation_author`) used by both repo mode
+  and `fetch_repo_open_prs`.
 
 ### Resilience
 
@@ -201,6 +202,75 @@ No sleeps and no random retries — the single-flight + round-robin
 ordering is the avoidance mechanism. This complements, and sits above,
 the existing `_get_merge_dispatch_lock(owner, repo)`, which serialises
 the final `merge_pull_request` API call alone.
+
+### Merge ordering
+
+Before the scheduler runs, the tool orders the flat PR list with the key
+`(-pr_count_for_repo, repo_full_name, pr_number)`:
+
+- **Repositories with the most in-scope PRs come first.** A repo with a
+  long PR queue takes the longest to drain (each merge can leave the next
+  sibling `behind` or `dirty` and trigger a rebase plus a CI wait), so
+  starting it earliest gives it the most wall-clock head start.
+- **Ascending PR number within a repo.** Dependabot raises PRs in number
+  order; merging the oldest first matches the order dependabot expects to
+  rebase, which reduces the chance a later PR invalidates an earlier one.
+
+The grouped listing and the merge list both derive from this order, so
+the preview mirrors the sequence the tool will follow.
+
+## Wait model and dependabot self-rebase
+
+When a sibling PR merges, dependabot frequently rebases the remaining
+open PRs in that repo on its own. While it does, it rewrites the PR body
+to include a "Dependabot is rebasing this PR" banner, then re-runs CI.
+A PR caught mid-rebase is transiently `dirty`/`behind` and would fail a
+naive immediate merge.
+
+The owner-wide path handles this structurally:
+
+1. **Detect the in-progress rebase.** `_dependabot_is_rebasing(body)`
+   recognises the banner so the conflict handler does not fire a
+   redundant `@dependabot rebase` macro on a PR that is already rebasing.
+2. **Approve and arm auto-merge**, then let the striped per-repo worker
+   wait for the merge to land in the background while other repos
+   progress. Because one serial worker owns each repo, the next sibling
+   does not start until the current PR settles.
+3. **Bound the whole run** with `--max-wait`.
+
+### The `--max-wait` flag
+
+`--max-wait SECONDS` sets a global wall-clock ceiling on an owner-wide
+run (default **900s**, 15 minutes). It clamps every per-PR auto-merge
+wait so the run cannot hang indefinitely waiting on slow CI across a
+large owner.
+
+- `--max-wait 0` opts into pure fire-and-forget: the tool approves each
+  PR, arms auto-merge, reports `AUTO_MERGE_PENDING`, and returns at once
+  without blocking. Use this when GitHub should finish the merges after
+  the tool exits.
+- The flag applies to owner-wide (`stripe=True`) runs. The single-PR and
+  single-repo modes ignore it.
+
+## Identity handling
+
+GitHub reports the same App actor under two login forms: REST returns the
+suffixed `dependabot[bot]`, GraphQL returns the bare `dependabot`. A
+login-equality gate written for one form misclassifies the
+other. The owner-wide path surfaced this because its enumeration runs
+through GraphQL.
+
+All bot/automation/Copilot identity logic routes through one shared
+module, `bot_identity`:
+
+- `canonical_bot_login(login, __typename)` normalises a GraphQL `Bot`
+  actor to the REST form at the data boundary, so the rest of the
+  codebase sees one canonical login.
+- `normalize_bot_login`, `is_dependabot`, `is_copilot`, and
+  `is_automation_author` compare logins irrespective of the `[bot]`
+  suffix, so a stray non-canonical value cannot disable identity-specific
+  handling (dependabot rebase/recreate, Copilot review dismissal,
+  automation classification).
 
 ### Placement
 
@@ -298,7 +368,7 @@ parity** and no org-specific special-casing.
 | ---------------------------- | ------------------------------------------------------- |
 | Repo fan-out / pagination    | `scan_organization` structure, `_iter_org_repositories` |
 | Per-repo PR fetch + filter   | shared helper extracted from `fetch_repo_open_prs`      |
-| Automation classification    | `AUTOMATION_TOOLS` substring check                      |
+| Automation classification    | `bot_identity.is_automation_author` predicate           |
 | Per-repo merge serialisation | `_get_merge_dispatch_lock`                              |
 | Live mergeability refresh    | `repo_scoped` path in `AsyncMergeManager`               |
 | Merge orchestration          | `_run_parallel_merge` / `merge_prs_parallel`            |
