@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import logging
 import math
 import os
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import quote
 
 from rich.console import Console
 
@@ -226,6 +228,25 @@ class AsyncMergeManager:
         self._org_settings_locks: dict[str, asyncio.Lock] = {}
         self._org_settings_locks_lock = asyncio.Lock()
 
+        # Cache for "does this branch mandate an approving review before
+        # any merge" detection, keyed by "owner/repo@branch".  The answer
+        # is fixed for the lifetime of a run (rulesets don't change
+        # mid-merge), so the resolved verdict is reused for every PR
+        # targeting the same repo+branch.
+        self._branch_approval_cache: dict[str, bool] = {}
+        self._branch_approval_locks: dict[str, asyncio.Lock] = {}
+        self._branch_approval_locks_lock = asyncio.Lock()
+
+        # Cache for the organization-level approval requirement, enumerated
+        # once per org from its repository rulesets.  Value is the list of
+        # approval-mandating rulesets (each ``{"name", "conditions"}``),
+        # ``[]`` when the org mandates none, or ``None`` when enumeration
+        # failed (e.g. the token cannot read org rulesets) so callers know
+        # to consult the authoritative per-repo endpoint instead.
+        self._org_approval_cache: dict[str, list[dict[str, Any]] | None] = {}
+        self._org_approval_locks: dict[str, asyncio.Lock] = {}
+        self._org_approval_locks_lock = asyncio.Lock()
+
         # Track last merge exception per PR for better error reporting
         self._last_merge_exception: dict[str, Exception] = {}
 
@@ -354,6 +375,13 @@ class AsyncMergeManager:
             self.log.info(f"🔍 PREVIEW: Would merge {len(pr_list)} PRs")
         else:
             self.log.debug(f"Starting parallel merge of {len(pr_list)} PRs")
+            # Enumerate the org's approval requirement once, up-front, so
+            # the "organization mandates an approving review" line is shown
+            # before merging begins rather than mid-run.  All PRs in a run
+            # share the same org owner; the result is cached and reused by
+            # the per-PR proactive-approval check.
+            owner = pr_list[0][0].repository_full_name.split("/", 1)[0]
+            await self._org_approval_rulesets(owner)
 
         # Create tasks for all PRs
         tasks = []
@@ -1009,7 +1037,7 @@ class AsyncMergeManager:
                     log_and_print(
                         self.log,
                         self._console,
-                        (f"⏭️  Skipped: {pr_info.html_url} [already merged externally]"),
+                        (f"⏭️ Skipped: {pr_info.html_url} [already merged externally]"),
                         level="info",
                     )
                     return result
@@ -1129,7 +1157,7 @@ class AsyncMergeManager:
                     # Only log during preview evaluation to avoid duplicate messages
                     if self.preview_mode:
                         self.log.warning(
-                            f"⚠️  Overriding blocking reviews for {pr_info.repository_full_name}#{pr_info.number} (--force=all)"
+                            f"⚠️ Overriding blocking reviews for {pr_info.repository_full_name}#{pr_info.number} (--force=all)"
                         )
 
             # Step 0.5: If the PR is blocked, check for stale pre-commit.ci
@@ -1192,11 +1220,19 @@ class AsyncMergeManager:
                         pass
                 except Exception as e:
                     self.log.warning(
-                        f"⚠️  Failed to process Copilot items for PR {pr_info.number}: {e}"
+                        f"⚠️ Failed to process Copilot items for PR {pr_info.number}: {e}"
                     )
                     copilot_processing_successful = False
 
-            # Step 3: Only approve if Copilot processing was successful
+            # Step 3: Gate on Copilot processing, but DO NOT approve
+            # up-front. Approval is now performed on demand (approve-on-
+            # demand): either just before arming auto-merge (see
+            # _enable_auto_merge_with_approval) or after a direct merge is
+            # rejected specifically for a missing review (see
+            # _approve_and_retry_if_review_required). This avoids approving
+            # PRs that did not actually need our review, while the Copilot
+            # gate below still prevents acting on a PR with unresolved
+            # Copilot feedback.
             if not copilot_processing_successful:
                 result.status = MergeStatus.FAILED
                 result.error = "Copilot review processing incomplete - not approving to avoid pollution"
@@ -1205,32 +1241,6 @@ class AsyncMergeManager:
                     markup=False,
                 )
                 return result
-
-            result.status = MergeStatus.APPROVING
-
-            if self.progress_tracker:
-                self.progress_tracker.update_operation(
-                    f"Approving PR {pr_info.number} in {pr_info.repository_full_name}"
-                )
-
-            if not self.preview_mode:
-                approval_added = await self._approve_pr(
-                    repo_owner, repo_name, pr_info.number
-                )
-                if approval_added:
-                    # Track that we just approved this PR so that the merge
-                    # retry logic knows a propagation delay may be needed.
-                    pr_key = f"{repo_owner}/{repo_name}#{pr_info.number}"
-                    self._recently_approved.add(pr_key)
-
-                    # Give GitHub time to propagate the approval to branch
-                    # protection evaluation before attempting the merge.
-                    if self._post_approval_delay > 0:
-                        self.log.debug(
-                            f"Waiting {self._post_approval_delay}s for approval propagation on {pr_key}"
-                        )
-                        await asyncio.sleep(self._post_approval_delay)
-            result.status = MergeStatus.APPROVED
 
             # Step 5: Handle rebase if needed before merge.
             #
@@ -1249,7 +1259,7 @@ class AsyncMergeManager:
                     log=self.log,
                     console=self._console,
                     rebased_prs=self._rebased_prs,
-                    enable_auto_merge=self._enable_auto_merge_for_pr,
+                    enable_auto_merge=self._enable_auto_merge_with_approval,
                 )
                 outcome = await rebase.perform_step5_rebase(
                     ctx=rebase_ctx,
@@ -1373,7 +1383,10 @@ class AsyncMergeManager:
 
             if should_wait:
                 if pr_key_for_wait not in self._auto_merge_enabled:
-                    auto_ok_pre = await self._enable_auto_merge_for_pr(
+                    # Approve-on-demand: arming auto-merge implies we want
+                    # the PR to merge once checks pass, so approve the
+                    # current head first (idempotent) before enabling.
+                    auto_ok_pre = await self._enable_auto_merge_with_approval(
                         pr_info, repo_owner, repo_name
                     )
                     if auto_ok_pre:
@@ -1449,7 +1462,7 @@ class AsyncMergeManager:
                     if self.progress_tracker:
                         self.progress_tracker.merge_success()
                     self._console.print(
-                        f"⚠️  Rebase/merge: {pr_info.html_url} [behind base branch]",
+                        f"⚠️ Rebase/merge: {pr_info.html_url} [behind base branch]",
                         markup=False,
                     )
                 elif pr_info.mergeable_state == "dirty":
@@ -1569,6 +1582,18 @@ class AsyncMergeManager:
                 if auto_merge_pending_checks:
                     merged = None  # Sentinel: auto-merge pending
                 else:
+                    # Proactive approval: some organizations mandate an
+                    # approving review via a repository ruleset before
+                    # *any* merge is allowed.  When this PR's base branch
+                    # is governed that way a merge-first attempt is
+                    # guaranteed to be rejected, so approve the current
+                    # head up-front and skip the doomed round-trip plus
+                    # reactive recovery.  See the helper for details; on
+                    # any lookup failure it no-ops and the reactive
+                    # approve-on-demand path still covers us.
+                    await self._approve_if_review_mandated(
+                        pr_info, repo_owner, repo_name, pr_key
+                    )
                     # Serialise the actual merge dispatch per repo so
                     # back-to-back merges don't race GitHub's branch
                     # protection propagation.  Workers on the same
@@ -1624,6 +1649,17 @@ class AsyncMergeManager:
                             return await self._handle_merge_conflict(
                                 pr_info, repo_owner, repo_name, result
                             )
+
+                    # Approve-on-demand (merge-path trigger): if the
+                    # direct merge was rejected solely because our review
+                    # is missing, approve the current head and retry once.
+                    # Returns True only if the retry merged the PR; any
+                    # other failure is left for the classifier below.
+                    if not merged:
+                        if await self._approve_and_retry_if_review_required(
+                            pr_info, repo_owner, repo_name
+                        ):
+                            merged = True
 
                 if merged is None:
                     # Auto-merge is active — PR will merge asynchronously.
@@ -1684,7 +1720,7 @@ class AsyncMergeManager:
                             self.log,
                             self._console,
                             (
-                                f"⏭️  Skipped: {pr_info.html_url} "
+                                f"⏭️ Skipped: {pr_info.html_url} "
                                 "[already merged externally]"
                             ),
                             level="info",
@@ -1718,7 +1754,17 @@ class AsyncMergeManager:
                     #      (which posts ``pre-commit.ci run``).
                     recreated_pr = None
                     if pr_info.author == "dependabot[bot]" and not self.preview_mode:
-                        should_recreate = "branch protection" in failure_reason.lower()
+                        reason_lower = failure_reason.lower()
+                        # Branch protection *and* repository rulesets can
+                        # both block a dependabot PR for reasons recreation
+                        # resolves (most commonly an unsigned-commit /
+                        # required-signature rule).  Treat them alike so the
+                        # recreate path is not silently skipped on repos that
+                        # have migrated from classic protection to rulesets.
+                        should_recreate = (
+                            "branch protection" in reason_lower
+                            or "ruleset" in reason_lower
+                        )
                         if not should_recreate:
                             try:
                                 (
@@ -2049,7 +2095,7 @@ class AsyncMergeManager:
         for review in pr_info.reviews:
             if review.state == "CHANGES_REQUESTED":
                 self.log.info(
-                    f"⚠️  PR {pr_info.number} has changes requested by {review.user} - will not override human feedback"
+                    f"⚠️ PR {pr_info.number} has changes requested by {review.user} - will not override human feedback"
                 )
                 return True
         return False
@@ -2275,6 +2321,204 @@ class AsyncMergeManager:
         )
         return True
 
+    async def _ensure_pr_approved(
+        self, pr_info: PullRequestInfo, owner: str, repo: str
+    ) -> bool:
+        """Approve the current PR head on demand and track the approval.
+
+        Thin wrapper around :meth:`_approve_pr` that also records the PR
+        in ``_recently_approved`` and applies the post-approval
+        propagation delay, exactly as the (now removed) up-front Step 3
+        approval used to.  :meth:`_approve_pr` is idempotent — it no-ops
+        when the current user already has an active ``APPROVED`` review on
+        the current head — so this is safe to call unconditionally at any
+        approve-on-demand trigger.
+
+        Returns:
+            True if a *new* approval was submitted, False if the PR was
+            already approved (or approval was declined).
+        """
+        approved = await self._approve_pr(owner, repo, pr_info.number)
+        if approved:
+            pr_key = f"{owner}/{repo}#{pr_info.number}"
+            self._recently_approved.add(pr_key)
+            # Give GitHub time to propagate the approval to the branch
+            # protection evaluation before a merge is attempted.
+            if self._post_approval_delay > 0:
+                self.log.debug(
+                    f"Waiting {self._post_approval_delay}s for approval "
+                    f"propagation on {pr_key}"
+                )
+                await asyncio.sleep(self._post_approval_delay)
+        return approved
+
+    async def _enable_auto_merge_with_approval(
+        self, pr_info: PullRequestInfo, owner: str, repo: str
+    ) -> bool:
+        """Approve the current head (if needed) then enable auto-merge.
+
+        Enabling auto-merge is a commitment to let GitHub complete the
+        merge as soon as branch protection is satisfied, so the current
+        head must already carry our approval — otherwise auto-merge would
+        wait forever on a missing review.  This is the *de-facto*
+        approve-on-demand trigger for the auto-merge path: when we enable
+        auto-merge on a PR whose current version we have not approved, we
+        approve it as part of arming auto-merge.
+
+        Approval failures other than typed permission errors are logged
+        and swallowed so a transient approval hiccup does not prevent us
+        from at least arming auto-merge; the permission error is
+        propagated so the caller's dedicated handler can report it.
+
+        Used at the Step 5.5 auto-merge enable point and as the rebase
+        module's auto-merge callback (which fires *after* the rebase, so
+        we approve the rebased head rather than a soon-to-be-dismissed
+        pre-rebase commit).
+        """
+        if not self.preview_mode:
+            try:
+                await self._ensure_pr_approved(pr_info, owner, repo)
+            except GitHubPermissionError:
+                # Surface token permission problems to the caller's
+                # dedicated handler rather than masking them here.
+                raise
+            except Exception as exc:
+                self.log.warning(
+                    "Could not approve %s/%s#%s before enabling auto-merge: %s",
+                    owner,
+                    repo,
+                    pr_info.number,
+                    exc,
+                )
+        return await self._enable_auto_merge_for_pr(pr_info, owner, repo)
+
+    async def _approve_and_retry_if_review_required(
+        self, pr_info: PullRequestInfo, owner: str, repo: str
+    ) -> bool:
+        """Approve-on-demand recovery after a failed direct merge.
+
+        This is the merge-path approve-on-demand trigger: rather than
+        approving every PR up-front, we attempt the merge first and only
+        approve when GitHub rejects it *specifically* because our review
+        is missing.  This avoids approving PRs that did not need it (e.g.
+        a PR that fails for an unrelated reason).
+
+        Called only after a direct merge attempt returned ``False``.  It
+        consults :meth:`analyze_block_reason`; if (and only if) the PR is
+        blocked pending approval and we have not already approved it this
+        run, it approves the current head and retries the merge once.
+
+        Returns:
+            True if the approve-then-retry merged the PR, False otherwise
+            (including when the failure was not approval-related, so the
+            caller can proceed to its normal failure handling).
+        """
+        if self.preview_mode or self._github_client is None:
+            return False
+
+        pr_key = f"{owner}/{repo}#{pr_info.number}"
+        if pr_key in self._recently_approved:
+            # We already approved this PR this run; the retry machinery in
+            # _merge_pr_with_retry has already had its post-approval
+            # propagation retry, so a missing approval is not the cause.
+            return False
+
+        # Prefer GitHub's own merge-rejection body over the heuristic
+        # block-reason classifier.  When the merge endpoint refuses the
+        # merge it states the *authoritative* reason in the response body
+        # (captured in the stored exception), e.g. "Repository rule
+        # violations found Waiting on required approvals from <team>".
+        # The heuristic ``analyze_block_reason`` only reports a single,
+        # highest-priority reason and ranks the missing-approval condition
+        # below required-status checks, so an unrelated or false-positive
+        # "missing required status" (e.g. a DCO check GitHub does not
+        # actually gate the merge on) masks the real cause and the
+        # approve-on-demand recovery never fires.  Trust GitHub first.
+        #
+        # This authoritative check runs *regardless* of mergeable_state:
+        # that field lags and is blind to repository rulesets, so GitHub
+        # can reject a merge for a missing required approval even while the
+        # cached state is not ``blocked``.  Gating it behind a ``blocked``
+        # state would strand exactly the PRs this recovery exists to save.
+        last_exception = self._last_merge_exception.get(pr_key)
+        if last_exception is not None and self._merge_error_indicates_missing_approval(
+            str(last_exception)
+        ):
+            self.log.debug(
+                "Merge for %s was rejected by GitHub pending required "
+                "approval; approving on demand and retrying",
+                pr_key,
+            )
+            approved = await self._ensure_pr_approved(pr_info, owner, repo)
+            if not approved:
+                return False
+            return await self._merge_pr_with_retry(pr_info, owner, repo)
+
+        # Fall back to the heuristic block-reason classifier only when the
+        # cached state actually shows the PR as ``blocked``.  A missing
+        # review manifests as that state; a merge that fails from any other
+        # state (e.g. a transient 405 on a ``clean`` PR) without an
+        # authoritative approval signal above is not an approval problem,
+        # so don't probe or approve it — let the caller's classifier
+        # handle it.
+        if pr_info.mergeable_state != "blocked":
+            return False
+
+        try:
+            block_reason = await self._github_client.analyze_block_reason(
+                owner, repo, pr_info.number, pr_info.head_sha
+            )
+        except Exception as exc:
+            self.log.debug(
+                "approve-on-demand block-reason check failed for %s: %s",
+                pr_key,
+                exc,
+            )
+            return False
+
+        if not block_reason or "requires approval" not in block_reason.lower():
+            # The merge failed for some reason other than a missing
+            # review — do not approve; let the caller classify and report.
+            return False
+
+        self.log.debug(
+            "Merge for %s was blocked pending approval; approving on "
+            "demand and retrying",
+            pr_key,
+        )
+        approved = await self._ensure_pr_approved(pr_info, owner, repo)
+        if not approved:
+            return False
+        return await self._merge_pr_with_retry(pr_info, owner, repo)
+
+    @staticmethod
+    def _merge_error_indicates_missing_approval(error_text: str) -> bool:
+        """Detect a missing-required-approval signal in a merge error body.
+
+        GitHub's merge endpoint reports the authoritative rejection reason
+        in its response body, which is preserved in the exception text
+        raised by ``merge_pull_request``.  A merge blocked solely because
+        our approving review is missing is recoverable: we can approve the
+        head and retry.  This recognises the phrasings GitHub uses for
+        both repository rulesets and classic branch protection, e.g.:
+
+        - "Waiting on required approvals from <team>" (ruleset)
+        - "At least 1 approving review is required by reviewers with
+          write access." (branch protection)
+        - "Required review ... review required"
+
+        It deliberately does *not* match "changes requested" wording,
+        which an approval cannot clear.
+        """
+        if not error_text:
+            return False
+        text = error_text.lower()
+        return (
+            "required approval" in text
+            or "approving review" in text
+            or "review required" in text
+        )
+
     async def _check_merge_requirements(
         self, pr_info: PullRequestInfo
     ) -> tuple[bool, str]:
@@ -2320,7 +2564,7 @@ class AsyncMergeManager:
                             # Only log during preview evaluation to avoid duplicate messages
                             if self.preview_mode:
                                 self.log.warning(
-                                    f"⚠️  Bypassing code owner review requirement for {repo_owner}/{repo_name}#{pr_info.number} (--force={self.force_level})"
+                                    f"⚠️ Bypassing code owner review requirement for {repo_owner}/{repo_name}#{pr_info.number} (--force={self.force_level})"
                                 )
                             return (
                                 True,
@@ -2336,62 +2580,70 @@ class AsyncMergeManager:
             # Don't fail the merge attempt if we can't check protection rules
             pass
 
-        # Test merge capability to detect hidden branch protection rules
-        try:
-            # Use pre-determined merge method for this repository
-            cache_key = f"{repo_owner}/{repo_name}"
-            merge_method = self._pr_merge_methods.get(
-                cache_key, self.default_merge_method
-            )
+        # Predictive merge probe. This is a *best-effort* dry-run verdict
+        # only: GitHub's mergeable_state can lag, and repository rulesets
+        # are invisible to it, so it must never gate the real merge. Run it
+        # only in preview mode to render the evaluation; the execution path
+        # is attempt-first and lets the actual merge response be
+        # authoritative (Step 6 + _merge_pr_with_retry).
+        if self.preview_mode:
+            try:
+                # Use pre-determined merge method for this repository
+                cache_key = f"{repo_owner}/{repo_name}"
+                merge_method = self._pr_merge_methods.get(
+                    cache_key, self.default_merge_method
+                )
 
-            # Attempt a test merge to detect hidden branch protection rules
-            test_result = await self._test_merge_capability(
-                repo_owner, repo_name, pr_info.number, merge_method
-            )
-            if not test_result[0]:
-                # Check if we should bypass protection rules
-                if self.force_level in ["code-owners", "protection-rules", "all"]:
-                    # Check if user has permissions to bypass before attempting
-                    if self._github_client:
-                        self.log.debug(
-                            f"Checking bypass permissions for {repo_owner}/{repo_name} with force_level={self.force_level}"
-                        )
-                        (
-                            can_bypass,
-                            bypass_reason,
-                        ) = await self._github_client.check_user_can_bypass_protection(
-                            repo_owner, repo_name, self.force_level
-                        )
-                        self.log.debug(
-                            f"Bypass check result: can_bypass={can_bypass}, reason={bypass_reason}"
-                        )
-                        if not can_bypass:
-                            self.log.warning(
-                                f"Cannot bypass branch protection for {repo_owner}/{repo_name}#{pr_info.number}: {bypass_reason}"
+                # Predict the outcome to detect hidden branch protection rules
+                test_result = await self._predict_merge_outcome(
+                    repo_owner, repo_name, pr_info.number, merge_method
+                )
+                if not test_result[0]:
+                    # Check if we should bypass protection rules
+                    if self.force_level in [
+                        "code-owners",
+                        "protection-rules",
+                        "all",
+                    ]:
+                        # Check bypass permissions before reporting success
+                        if self._github_client:
+                            self.log.debug(
+                                f"Checking bypass permissions for {repo_owner}/{repo_name} with force_level={self.force_level}"
                             )
-                            return (
-                                False,
-                                f"cannot bypass branch protection: {bypass_reason}",
+                            (
+                                can_bypass,
+                                bypass_reason,
+                            ) = await self._github_client.check_user_can_bypass_protection(
+                                repo_owner, repo_name, self.force_level
                             )
+                            self.log.debug(
+                                f"Bypass check result: can_bypass={can_bypass}, reason={bypass_reason}"
+                            )
+                            if not can_bypass:
+                                self.log.warning(
+                                    f"Cannot bypass branch protection for {repo_owner}/{repo_name}#{pr_info.number}: {bypass_reason}"
+                                )
+                                return (
+                                    False,
+                                    f"cannot bypass branch protection: {bypass_reason}",
+                                )
 
-                    # Only log during preview evaluation to avoid duplicate messages
-                    if self.preview_mode:
                         self.log.warning(
-                            f"⚠️  Bypassing branch protection check for {repo_owner}/{repo_name}#{pr_info.number}: {test_result[1]} (--force={self.force_level})"
+                            f"⚠️ Bypassing branch protection check for {repo_owner}/{repo_name}#{pr_info.number}: {test_result[1]} (--force={self.force_level})"
                         )
-                    # When bypassing, return early to allow merge to proceed
-                    return (
-                        True,
-                        f"branch protection check bypassed (--force={self.force_level})",
-                    )
-                else:
-                    return False, test_result[1]
+                        # When bypassing, return early to allow merge
+                        return (
+                            True,
+                            f"branch protection check bypassed (--force={self.force_level})",
+                        )
+                    else:
+                        return False, test_result[1]
 
-        except Exception as e:
-            # If we can't test merge, continue with other checks
-            self.log.debug(
-                f"Could not test merge capability for {repo_owner}/{repo_name}#{pr_info.number}: {e}"
-            )
+            except Exception as e:
+                # If we can't predict the outcome, continue with other checks
+                self.log.debug(
+                    f"Could not predict merge outcome for {repo_owner}/{repo_name}#{pr_info.number}: {e}"
+                )
 
         # Additional checks based on PR state
         if pr_info.mergeable_state == "blocked":
@@ -2415,7 +2667,7 @@ class AsyncMergeManager:
                     # Only log during preview evaluation to avoid duplicate messages
                     if self.preview_mode:
                         self.log.warning(
-                            f"⚠️  Bypassing failing status checks for {repo_owner}/{repo_name}#{pr_info.number} (--force=all)"
+                            f"⚠️ Bypassing failing status checks for {repo_owner}/{repo_name}#{pr_info.number} (--force=all)"
                         )
                     return True, "PR blocked but forcing merge attempt (--force=all)"
                 else:
@@ -2437,7 +2689,7 @@ class AsyncMergeManager:
             if not self.fix_out_of_date:
                 if self.force_level == "all":
                     self.log.warning(
-                        f"⚠️  Attempting merge despite being behind for {repo_owner}/{repo_name}#{pr_info.number} (--force=all)"
+                        f"⚠️ Attempting merge despite being behind for {repo_owner}/{repo_name}#{pr_info.number} (--force=all)"
                     )
                     return True, "PR behind but forcing merge attempt (--force=all)"
                 else:
@@ -2465,7 +2717,7 @@ class AsyncMergeManager:
         elif pr_info.mergeable_state == "dirty":
             if self.force_level == "all":
                 self.log.warning(
-                    f"⚠️  Attempting merge despite conflicts for {repo_owner}/{repo_name}#{pr_info.number} (--force=all)"
+                    f"⚠️ Attempting merge despite conflicts for {repo_owner}/{repo_name}#{pr_info.number} (--force=all)"
                 )
                 return True, "PR has conflicts but forcing merge attempt (--force=all)"
             else:
@@ -2567,10 +2819,7 @@ class AsyncMergeManager:
                     # from the tz-aware ``now``.  Either way, degrade to
                     # ``None`` (fail closed) rather than abort the run.
                     pending_age = None
-            if (
-                pending_age is None
-                or pending_age < PRECOMMIT_CI_STUCK_PENDING_SECONDS
-            ):
+            if pending_age is None or pending_age < PRECOMMIT_CI_STUCK_PENDING_SECONDS:
                 # Still within the normal window (or no timestamp to
                 # judge by) — leave the run to finish.
                 return False
@@ -4001,9 +4250,7 @@ class AsyncMergeManager:
                         pr_info.head_sha = refreshed_head
                     if refreshed_wait.get("state") == "closed":
                         closed_during_wait = True
-                        merged_during_wait = bool(
-                            refreshed_wait.get("merged", False)
-                        )
+                        merged_during_wait = bool(refreshed_wait.get("merged", False))
                         pr_info.state = "closed"
                         break
                 # A PR that becomes immediately mergeable while still
@@ -4118,9 +4365,7 @@ class AsyncMergeManager:
             result.error = "PR closed without merging during conflict rebase"
             if self.progress_tracker:
                 self.progress_tracker.merge_failure()
-            self._console.print(
-                f"🛑 Closed without merging: {pr_info.html_url}"
-            )
+            self._console.print(f"🛑 Closed without merging: {pr_info.html_url}")
         return result
 
     async def _handle_merge_conflict(
@@ -4361,8 +4606,11 @@ class AsyncMergeManager:
                 # Arm auto-merge when the PR is otherwise mergeable
                 # (not dirty) so it lands automatically once the stuck
                 # check is re-triggered, without a second review round.
+                # Approve the current head first (approve-on-demand): the
+                # PR is no longer approved up-front, so auto-merge would
+                # otherwise wait forever on a missing review.
                 if pr_info.mergeable_state != "dirty":
-                    await self._enable_auto_merge_for_pr(pr_info, owner, repo)
+                    await self._enable_auto_merge_with_approval(pr_info, owner, repo)
                 result.error = f"stuck check: {stuck_check}"
                 stuck_reported = True
 
@@ -4414,12 +4662,30 @@ class AsyncMergeManager:
                 detail = detail.split(" (PR state:", 1)[0].strip()
                 if detail:
                     return detail[:300]
-            # Check for workflow scope error - be very specific to avoid false positives
-            # Only match the exact error message pattern we raise in github_async.py
-            if "Missing 'workflow' scope" in error_msg:
+            # Workflow-scope failures surface in several phrasings: the
+            # PermissionError messages we raise ("Missing 'workflow' scope",
+            # "Missing workflow permissions") and GitHub's own response body
+            # ("refusing to allow ... without `workflow` scope").  Match all
+            # of them, but require the word "workflow" so unrelated 403s do
+            # not get mislabelled as a scope problem.
+            error_lower = error_msg.lower()
+            if "workflow" in error_lower and (
+                "missing 'workflow' scope" in error_lower
+                or "missing workflow permissions" in error_lower
+                or "refusing to allow" in error_lower
+            ):
                 return "missing 'workflow' token scope"
+            # The token already had the 'workflow' scope but GitHub still
+            # refused the workflow-file update — a ruleset or SSO problem,
+            # not a scope problem.  Report it as such rather than telling the
+            # user to add a scope they already hold.
+            elif "blocked by something other than token scope" in error_lower:
+                return (
+                    "workflow update blocked by repository ruleset or SSO "
+                    "(token already has 'workflow' scope)"
+                )
             # Check for other permission errors
-            elif "403" in error_msg and "forbidden" in error_msg.lower():
+            elif "403" in error_msg and "forbidden" in error_lower:
                 return "insufficient permissions"
             # Surface transient HTTP errors (502, 405 etc.) accurately instead
             # of falling through to infer a reason from mergeable_state, which
@@ -4463,6 +4729,10 @@ class AsyncMergeManager:
                     return "human reviewer requested changes"
                 elif "Copilot" in detailed_reason:
                     return detailed_reason.replace("Blocked by ", "").lower()
+                elif "ruleset" in detailed_reason.lower():
+                    return "repository ruleset prevents merge"
+                elif "undetermined reason" in detailed_reason.lower():
+                    return "blocked for an undetermined reason"
                 elif "branch protection" in detailed_reason.lower():
                     return "branch protection rules prevent merge"
                 else:
@@ -4661,14 +4931,369 @@ class AsyncMergeManager:
                 self._org_settings_cache[owner] = None
                 return None
 
-    async def _test_merge_capability(
+    @staticmethod
+    def _rules_require_approval(rules: Any) -> bool:
+        """Return True if any effective branch rule mandates an approval.
+
+        ``rules`` is the JSON body returned by
+        ``GET /repos/{owner}/{repo}/rules/branches/{branch}`` — a flat
+        list of the rules that *actually apply* to the branch, with all
+        ruleset conditions (repository include/exclude, ref matching)
+        already evaluated server-side and org- and repo-level rulesets
+        already merged.  We treat a branch as requiring an approval when a
+        ``pull_request`` rule asks for at least one approving review.
+
+        This is intentionally org-agnostic: it keys off the rule *type*
+        and its ``required_approving_review_count`` parameter, never the
+        ruleset's name, so it works for any organization's naming.
+        """
+        if not isinstance(rules, list):
+            return False
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            if rule.get("type") != "pull_request":
+                continue
+            params = rule.get("parameters")
+            if not isinstance(params, dict):
+                # A pull_request rule with no readable parameters still
+                # signals that reviews are governed here; treat the
+                # presence of the rule as requiring approval rather than
+                # risk a doomed merge-first attempt.
+                return True
+            count = params.get("required_approving_review_count")
+            if isinstance(count, int) and count >= 1:
+                return True
+        return False
+
+    async def _approve_if_review_mandated(
+        self, pr_info: PullRequestInfo, owner: str, repo: str, pr_key: str
+    ) -> None:
+        """Approve up-front when the base branch mandates a review to merge.
+
+        No-ops in preview mode, when the PR was already approved this run,
+        or when the base branch carries no required-approval rule.  This
+        is the proactive counterpart to
+        :meth:`_approve_and_retry_if_review_required`: detecting the
+        requirement (org-agnostically, from the branch's effective rules)
+        before dispatch avoids a guaranteed-to-fail merge attempt for
+        organizations that gate every merge on an approving review.
+        """
+        if self.preview_mode or pr_key in self._recently_approved:
+            return
+        if await self._branch_requires_approval(owner, repo, pr_info.base_branch):
+            await self._ensure_pr_approved(pr_info, owner, repo)
+
+    async def _org_approval_rulesets(self, org: str) -> list[dict[str, Any]] | None:
+        """Enumerate active org rulesets that mandate an approving review.
+
+        Queried **once per org** and cached for the run — the approval
+        requirement originates from a single organization ruleset, so it
+        is wasteful to rediscover it per repository.  Returns one entry
+        per approval-mandating ruleset (``{"name", "conditions"}``), ``[]``
+        when the org mandates none, or ``None`` when enumeration failed
+        (e.g. the token cannot read org rulesets) so the caller can fall
+        back to the authoritative per-repo endpoint.
+
+        The first time an org is found to gate merges on a review a single
+        user-facing line is emitted, so the requirement is visible at the
+        point of detection rather than buried in debug logs.
+        """
+        if org in self._org_approval_cache:
+            return self._org_approval_cache[org]
+
+        async with self._org_approval_locks_lock:
+            if org not in self._org_approval_locks:
+                self._org_approval_locks[org] = asyncio.Lock()
+            org_lock = self._org_approval_locks[org]
+
+        async with org_lock:
+            # Re-check after acquiring the per-org lock (another task may
+            # have populated the cache while we waited).
+            if org in self._org_approval_cache:
+                return self._org_approval_cache[org]
+
+            if not self._github_client:
+                return None
+
+            result: list[dict[str, Any]] = []
+            try:
+                # The list endpoint is paginated (default page size 30),
+                # so an org with many rulesets could otherwise silently
+                # drop an approval-mandating one.  Walk every page.
+                page = 1
+                per_page = 100
+                while True:
+                    rulesets = await self._github_client.get(
+                        f"/orgs/{org}/rulesets?per_page={per_page}&page={page}"
+                    )
+                    if not isinstance(rulesets, list) or not rulesets:
+                        break
+                    for rs in rulesets:
+                        if not isinstance(rs, dict):
+                            continue
+                        # Only active branch rulesets gate merges;
+                        # "evaluate" and "disabled" rulesets do not block,
+                        # and tag rulesets are irrelevant to PR merges.
+                        if rs.get("enforcement") != "active":
+                            continue
+                        if rs.get("target", "branch") != "branch":
+                            continue
+                        rid = rs.get("id")
+                        if rid is None:
+                            continue
+                        detail = await self._github_client.get(
+                            f"/orgs/{org}/rulesets/{rid}"
+                        )
+                        if not isinstance(detail, dict):
+                            continue
+                        if self._rules_require_approval(detail.get("rules")):
+                            result.append(
+                                {
+                                    "name": rs.get("name", ""),
+                                    "conditions": detail.get("conditions") or {},
+                                }
+                            )
+                    if len(rulesets) < per_page:
+                        break
+                    page += 1
+            except Exception as e:
+                # Enumeration failed (often a permission/SSO problem).
+                # Cache ``None`` so callers consult the per-repo endpoint
+                # rather than silently skipping proactive approval.
+                self.log.debug(f"Could not enumerate org rulesets for {org}: {e}")
+                self._org_approval_cache[org] = None
+                return None
+
+            self._org_approval_cache[org] = result
+            if result:
+                names = ", ".join(r["name"] for r in result if r.get("name")) or (
+                    "unnamed ruleset"
+                )
+                log_and_print(
+                    self.log,
+                    self._console,
+                    "🔐 Organization requires approving reviews before merging\n"
+                    f"Ruleset: {names}",
+                    level="info",
+                )
+            return result
+
+    @staticmethod
+    def _ruleset_name_matches(
+        name: str, include: list[Any], exclude: list[Any]
+    ) -> bool:
+        """Evaluate a ruleset ``repository_name`` condition against a repo.
+
+        ``include``/``exclude`` are fnmatch-style globs; the sentinel
+        ``~ALL`` matches every repository.  A repo is in scope when it
+        matches an include pattern and no exclude pattern.
+        """
+
+        def match_any(patterns: list[Any]) -> bool:
+            for pat in patterns:
+                if pat == "~ALL":
+                    return True
+                if isinstance(pat, str) and fnmatch.fnmatch(name, pat):
+                    return True
+            return False
+
+        if exclude and match_any(exclude):
+            return False
+        if not include:
+            return False
+        return match_any(include)
+
+    @staticmethod
+    def _ruleset_ref_matches(
+        branch: str, include: list[Any], exclude: list[Any]
+    ) -> bool | None:
+        """Evaluate a ruleset ``ref_name`` condition against a branch.
+
+        Returns ``True``/``False`` when it can be decided locally, or
+        ``None`` when it cannot (so the caller consults the authoritative
+        per-repo endpoint).  ``~ALL`` matches any branch.  ``~DEFAULT_BRANCH``
+        is treated as in scope: confirming it would need an extra per-repo
+        default-branch lookup, and the automation PRs this gates target
+        the default branch — a spurious approval on a non-default-base PR
+        (which we were about to merge anyway) is harmless.
+        """
+        ref = f"refs/heads/{branch}"
+
+        def match_any(patterns: list[Any]) -> bool:
+            for pat in patterns:
+                if pat in ("~ALL", "~DEFAULT_BRANCH"):
+                    return True
+                if isinstance(pat, str) and (
+                    fnmatch.fnmatch(ref, pat) or fnmatch.fnmatch(branch, pat)
+                ):
+                    return True
+            return False
+
+        if exclude and match_any(exclude):
+            return False
+        if not include:
+            # An empty include is unusual; defer to the authoritative
+            # endpoint rather than guess.
+            return None
+        return match_any(include)
+
+    def _ruleset_condition_applies(
+        self, conditions: Any, repo: str, branch: str
+    ) -> bool | None:
+        """Whether a ruleset's ``conditions`` select ``repo@branch``.
+
+        Returns ``True``/``False`` when the verdict is decidable from the
+        ``repository_name`` and ``ref_name`` conditions, or ``None`` when
+        the ruleset uses a condition type we do not evaluate locally
+        (e.g. ``repository_id`` or ``repository_property``) so the caller
+        falls back to GitHub's authoritative per-repo evaluation.
+        """
+        if not isinstance(conditions, dict):
+            return None
+        # Any condition type beyond the two we evaluate means we cannot be
+        # sure locally — signal the caller to ask GitHub directly.
+        if any(key not in ("repository_name", "ref_name") for key in conditions):
+            return None
+
+        repo_cond = conditions.get("repository_name")
+        if isinstance(repo_cond, dict):
+            if not self._ruleset_name_matches(
+                repo,
+                repo_cond.get("include") or [],
+                repo_cond.get("exclude") or [],
+            ):
+                return False
+
+        ref_cond = conditions.get("ref_name")
+        if isinstance(ref_cond, dict):
+            ref_applies = self._ruleset_ref_matches(
+                branch,
+                ref_cond.get("include") or [],
+                ref_cond.get("exclude") or [],
+            )
+            if ref_applies is not True:
+                # False or None (undecidable) — propagate so an undecidable
+                # ref falls back to the authoritative endpoint.
+                return ref_applies
+
+        return True
+
+    async def _branch_requires_approval(
+        self, owner: str, repo: str, branch: str
+    ) -> bool:
+        """Whether ``owner/repo@branch`` mandates an approving review to merge.
+
+        Some organizations enforce a repository ruleset that requires at
+        least one approving review before *any* merge is permitted (the
+        ``lfreleng-actions`` "Base Protections" ruleset is one example).
+        Under "merge first, approve on demand" every such PR would incur a
+        guaranteed-to-fail merge attempt before we approve and retry.
+        Detecting the requirement up-front lets us approve proactively and
+        skip that doomed round-trip.
+
+        Detection is **org-first**: the org's rulesets are enumerated once
+        (see :meth:`_org_approval_rulesets`) and their conditions are
+        evaluated locally, so a whole org-wide run needs a single ruleset
+        query rather than one effective-rules call per repository.  Only
+        when a ruleset uses a condition we cannot evaluate locally, or org
+        enumeration was not possible, do we fall back to GitHub's
+        authoritative per-repo ``rules/branches`` endpoint.  The resolved
+        verdict is cached per repo+branch.
+        """
+        cache_key = f"{owner}/{repo}@{branch}"
+        if cache_key in self._branch_approval_cache:
+            return self._branch_approval_cache[cache_key]
+
+        async with self._branch_approval_locks_lock:
+            if cache_key not in self._branch_approval_locks:
+                self._branch_approval_locks[cache_key] = asyncio.Lock()
+            branch_lock = self._branch_approval_locks[cache_key]
+
+        async with branch_lock:
+            # Re-check after acquiring the per-branch lock (another task
+            # may have populated the cache while we waited).
+            if cache_key in self._branch_approval_cache:
+                return self._branch_approval_cache[cache_key]
+
+            rulesets = await self._org_approval_rulesets(owner)
+
+            requires = False
+            # ``None`` means org enumeration failed; consult the per-repo
+            # endpoint.  An empty list means the org mandates no approval
+            # (repo-level rulesets, if any, are covered by the reactive
+            # approve-on-demand safety net).
+            need_authoritative = rulesets is None
+            for rs in rulesets or []:
+                applies = self._ruleset_condition_applies(
+                    rs.get("conditions"), repo, branch
+                )
+                if applies is True:
+                    requires = True
+                    break
+                if applies is None:
+                    need_authoritative = True
+
+            if not requires and need_authoritative:
+                requires = await self._effective_branch_requires_approval(
+                    owner, repo, branch
+                )
+
+            self._branch_approval_cache[cache_key] = requires
+            if requires:
+                self.log.debug(
+                    "Branch %s requires an approving review before merge; "
+                    "approving proactively",
+                    cache_key,
+                )
+            return requires
+
+    async def _effective_branch_requires_approval(
+        self, owner: str, repo: str, branch: str
+    ) -> bool:
+        """Authoritative per-repo fallback for the approval requirement.
+
+        Uses ``GET /repos/{owner}/{repo}/rules/branches/{branch}`` which
+        returns the *effective* rules for the branch — every applicable
+        org- and repo-level ruleset, with all conditions already evaluated
+        by GitHub.  Used only when the org-first path cannot decide (an
+        unrecognised condition type, or org enumeration was unavailable).
+        On any error returns ``False`` so the reactive approve-on-demand
+        path remains the safety net rather than blocking the merge.
+        """
+        if not self._github_client:
+            return False
+        try:
+            # Branch names can contain "/" (e.g. "release/v1"); encode the
+            # whole segment so it routes to the right endpoint rather than
+            # 404ing and being mistaken for "no rules".
+            rules = await self._github_client.get(
+                f"/repos/{owner}/{repo}/rules/branches/{quote(branch, safe='')}"
+            )
+            return self._rules_require_approval(rules)
+        except Exception as e:
+            self.log.debug(
+                f"Could not read effective branch rules for {owner}/{repo}@{branch}: {e}"
+            )
+            return False
+
+    async def _predict_merge_outcome(
         self, owner: str, repo: str, pr_number: int, merge_method: str
     ) -> tuple[bool, str]:
-        """
-        Test if a PR can be merged by validating merge requirements.
+        """Best-effort, read-only prediction of whether a PR would merge.
 
-        This helps detect branch protection rules that aren't visible through the API,
-        such as organization-level restrictions.
+        This is a **preview-only** probe used to render the dry-run
+        evaluation.  It inspects the PR's ``mergeable`` / ``mergeable_state``
+        and, for ``blocked`` PRs, consults :meth:`analyze_block_reason` to
+        produce a one-line verdict.
+
+        It deliberately has **no authority over the real merge**: GitHub's
+        ``mergeable_state`` can lag the true state, and repository rulesets
+        are invisible to this code path, so a confident "would block"
+        verdict here can still be wrong.  The execution path therefore does
+        not gate on this prediction — it attempts the merge and treats
+        GitHub's actual response (Step 6 and ``_merge_pr_with_retry``) as
+        authoritative.  Only the preview path calls this method.
 
         Args:
             owner: Repository owner
@@ -4772,7 +5397,7 @@ class AsyncMergeManager:
         except Exception as e:
             error_msg = str(e)
             self.log.debug(
-                f"Exception in _test_merge_capability for {owner}/{repo}#{pr_number}: {error_msg}"
+                f"Exception in _predict_merge_outcome for {owner}/{repo}#{pr_number}: {error_msg}"
             )
 
             # Look for specific DCO-related errors in the GitHub API response

@@ -540,7 +540,7 @@ class TestReportMergeFailure:
             ),
             patch.object(
                 mgr,
-                "_enable_auto_merge_for_pr",
+                "_enable_auto_merge_with_approval",
                 new_callable=AsyncMock,
                 return_value=True,
             ) as mock_enable,

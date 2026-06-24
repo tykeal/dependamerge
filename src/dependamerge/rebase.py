@@ -651,7 +651,7 @@ async def _run_local_path(
     log_and_print(
         ctx.log,
         ctx.console,
-        f"🛡️  Local rebase: {pr_info.html_url} [{local_reason}]",
+        f"🛡️ Local rebase: {pr_info.html_url} [{local_reason}]",
         level="debug",
     )
     try:
@@ -705,7 +705,7 @@ async def _run_local_path(
         log_and_print(
             ctx.log,
             ctx.console,
-            f"🛡️  Local rebase failed; deferring to auto-merge: {pr_info.html_url}",
+            f"🛡️ Local rebase failed; deferring to auto-merge: {pr_info.html_url}",
             level="debug",
         )
 
@@ -950,7 +950,7 @@ def _log_post_rebase_status(
         log_and_print(
             ctx.log,
             ctx.console,
-            f"⚠️  Rebased: {pr_info.html_url} [still behind after rebase]",
+            f"⚠️ Rebased: {pr_info.html_url} [still behind after rebase]",
             level="debug",
         )
     elif state == "blocked":
@@ -964,6 +964,6 @@ def _log_post_rebase_status(
         log_and_print(
             ctx.log,
             ctx.console,
-            f"ℹ️  Rebased: {pr_info.html_url}",
+            f"ℹ️ Rebased: {pr_info.html_url}",
             level="debug",
         )

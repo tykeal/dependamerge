@@ -740,9 +740,9 @@ class GitHubService:
 
                         if body_score < 0.6:
                             if target_pr.body is None:
-                                debug_console.print("      ⚠️  Target PR has no body")
+                                debug_console.print("      ⚠️ Target PR has no body")
                             elif source_pr.body is None:
-                                debug_console.print("      ⚠️  Source PR has no body")
+                                debug_console.print("      ⚠️ Source PR has no body")
                             else:
                                 debug_console.print(
                                     f"      📄 Body comparison failed (score: {body_score:.3f})"

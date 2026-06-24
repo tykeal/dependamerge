@@ -194,7 +194,7 @@ class CopilotCommentHandler:
         # Skip COMMENTED reviews as they cannot be dismissed via GitHub API
         if review_state == "COMMENTED":
             self.log.info(
-                f"⏭️  Skipping COMMENTED Copilot review {review_id} (GitHub API limitation)"
+                f"⏭️ Skipping COMMENTED Copilot review {review_id} (GitHub API limitation)"
             )
             return True  # Return True as this is expected behavior, not a failure
 
@@ -235,7 +235,7 @@ class CopilotCommentHandler:
                     for error in errors
                 ):
                     self.log.info(
-                        f"⏭️  Cannot dismiss COMMENTED review {review_id} - this is a GitHub API limitation"
+                        f"⏭️ Cannot dismiss COMMENTED review {review_id} - this is a GitHub API limitation"
                     )
                     return True  # Treat as success since this is expected
                 else:
@@ -248,7 +248,7 @@ class CopilotCommentHandler:
             # Check if the error message contains the "commented review" limitation
             if "Can not dismiss a commented pull request review" in str(e):
                 self.log.info(
-                    f"⏭️  Cannot dismiss COMMENTED review {review_id} - this is a GitHub API limitation"
+                    f"⏭️ Cannot dismiss COMMENTED review {review_id} - this is a GitHub API limitation"
                 )
                 return True  # Treat as success since this is expected
             else:
@@ -479,7 +479,7 @@ class CopilotCommentHandler:
 
         if not copilot_threads:
             self.log.warning(
-                f"⚠️  Failed to resolve comment/review thread {review_id} in {owner}/{repo}#{pr_number} (no resolvable Copilot threads)"
+                f"⚠️ Failed to resolve comment/review thread {review_id} in {owner}/{repo}#{pr_number} (no resolvable Copilot threads)"
             )
             return 0, len(all_threads)
 
@@ -686,7 +686,7 @@ class CopilotCommentHandler:
 
         except Exception as e:
             self.log.warning(
-                f"⚠️  Could not fetch review comments for PR {pr_number}: {e}"
+                f"⚠️ Could not fetch review comments for PR {pr_number}: {e}"
             )
             return []
 
@@ -710,7 +710,7 @@ class CopilotCommentHandler:
             # Individual comment resolution is now handled via GraphQL thread resolution
             # This method is deprecated in favor of resolve_copilot_threads_for_commented_review
             self.log.info(
-                f"ℹ️  Individual comment {comment.get('id')} handled via comprehensive thread resolution"
+                f"ℹ️ Individual comment {comment.get('id')} handled via comprehensive thread resolution"
             )
             return True
 

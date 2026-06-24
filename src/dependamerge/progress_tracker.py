@@ -250,7 +250,7 @@ class ProgressTracker:
             text.append("\n   📊 PRs analyzed: ", style="dim")
             text.append(str(self.total_prs_analyzed), style="bold")
             if self.unmergeable_prs_found > 0:
-                text.append(" | ⚠️  Unmergeable: ", style="dim")
+                text.append(" | ⚠️ Unmergeable: ", style="dim")
                 text.append(str(self.unmergeable_prs_found), style="bold yellow")
 
         # Metrics line (concurrency / requests-per-second)
@@ -279,7 +279,7 @@ class ProgressTracker:
 
         # Elapsed time
         elapsed = datetime.now() - self.start_time
-        text.append(f"\n   ⏱️  Elapsed: {self._format_duration(elapsed)}", style="dim")
+        text.append(f"\n   ⏱️ Elapsed: {self._format_duration(elapsed)}", style="dim")
 
         return text
 
@@ -496,7 +496,7 @@ class MergeProgressTracker(ProgressTracker):
         # Merge stats
         stats_parts: list[str] = []
         if self.similar_prs_found > 0:
-            stats_parts.append(f"Similar: {self.similar_prs_found}")
+            stats_parts.append(f"🔁 Similar: {self.similar_prs_found}")
         if self.prs_merged > 0:
             stats_parts.append(f"✅ Merged: {self.prs_merged}")
         if self.prs_closed > 0:
@@ -504,10 +504,10 @@ class MergeProgressTracker(ProgressTracker):
         if self.prs_failed > 0:
             stats_parts.append(f"❌ Failed: {self.prs_failed}")
         if self.prs_skipped > 0:
-            stats_parts.append(f"⏭️  Skipped: {self.prs_skipped}")
+            stats_parts.append(f"⏭️ Skipped: {self.prs_skipped}")
 
         if stats_parts:
-            text.append(f"\n   📊 {' | '.join(stats_parts)}", style="dim")
+            text.append(f"\n   {' | '.join(stats_parts)}", style="dim")
 
         # Metrics line
         if self.metrics_concurrency is not None or self.metrics_rps is not None:
@@ -528,7 +528,7 @@ class MergeProgressTracker(ProgressTracker):
 
         # Elapsed time
         elapsed = datetime.now() - self.start_time
-        text.append(f"\n   ⏱️  Elapsed: {self._format_duration(elapsed)}", style="dim")
+        text.append(f"\n   ⏱️ Elapsed: {self._format_duration(elapsed)}", style="dim")
 
         return text
 

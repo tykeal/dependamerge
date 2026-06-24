@@ -663,12 +663,16 @@ class TestMergeSinglePrRecreateIntegration:
         mgr, client = _make_manager()  # typed mock client pattern (see conftest.py)
         pr = _make_pr_info(mergeable=True, mergeable_state="blocked")
 
-        # Make the PR pass initial checks but fail the merge
+        # Make the PR pass initial checks but fail the merge.
+        # Use a non-approval block reason (an unsigned-commit /
+        # required-signature branch protection failure): a "requires
+        # approval" reason would instead be resolved by the approve-on-
+        # demand merge retry, not the recreate path under test here.
         client.get_branch_protection = AsyncMock(return_value={})
         client.analyze_block_reason = AsyncMock(
-            return_value="Blocked by branch protection (requires approval)"
+            return_value="Blocked by branch protection"
         )
-        # get() calls during _test_merge_capability etc.
+        # get() calls during _predict_merge_outcome etc.
         client.get = AsyncMock(
             return_value={
                 "mergeable": True,

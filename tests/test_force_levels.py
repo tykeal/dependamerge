@@ -454,7 +454,7 @@ class TestForceLogging:
 
         mock_github = mocker.AsyncMock()
 
-        # Mock the specific API call that _test_merge_capability makes
+        # Mock the specific API call that _predict_merge_outcome makes
         def mock_get_side_effect(url):
             if "/pulls/" in url:
                 return {
@@ -479,8 +479,9 @@ class TestForceLogging:
         ) as manager:
             manager._github_client = mock_github
 
-            # Test the bypass directly since _check_merge_requirements doesn't always call _test_merge_capability
-            result = await manager._test_merge_capability(
+            # Test the bypass directly since _check_merge_requirements
+            # only predicts the outcome in preview mode
+            result = await manager._predict_merge_outcome(
                 "test-org", "test-repo", 123, "merge"
             )
 
