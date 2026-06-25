@@ -72,6 +72,34 @@ class ParsedUrl:
 
 
 @dataclass(frozen=True)
+class ParsedOrgUrl:
+    """
+    Parsed organization/owner URL (not a specific repo or PR).
+
+    Represents an owner-wide scope, e.g. ``https://github.com/owner``.
+    The owner may be either a GitHub organization or a personal user
+    account; the two are indistinguishable from the URL alone and are
+    disambiguated at runtime when enumerating repositories.
+
+    Attributes:
+        source: The code review platform (GitHub only for now).
+        host: The hostname of the server.
+        owner: The organization or user login.
+        original_url: The original URL that was parsed.
+    """
+
+    source: ChangeSource
+    host: str
+    owner: str
+    original_url: str
+
+    @property
+    def is_github(self) -> bool:
+        """Check if this URL is from GitHub."""
+        return self.source == ChangeSource.GITHUB
+
+
+@dataclass(frozen=True)
 class ParsedRepoUrl:
     """
     Parsed repository URL (not a specific PR/change).
@@ -438,13 +466,146 @@ def parse_repo_url(url: str) -> ParsedRepoUrl:
     )
 
 
+def parse_org_url(url: str) -> ParsedOrgUrl:
+    """
+    Parse a GitHub organization/owner URL (not a specific repo or PR).
+
+    Supports the following owner-wide forms (trailing slashes are
+    cosmetic and ignored):
+        https://github.com/owner
+        https://github.com/owner/
+        https://github.com/orgs/owner
+        https://github.com/orgs/owner/repositories
+
+    The owner may be an organization or a personal user account; the two
+    are indistinguishable here and are disambiguated at runtime when the
+    repositories are enumerated.
+
+    Args:
+        url: The URL to parse.
+
+    Returns:
+        A ParsedOrgUrl instance with the extracted owner.
+
+    Raises:
+        UrlParseError: If the URL is not recognised as an owner-wide URL.
+    """
+    url = url.strip()
+    if not url:
+        raise UrlParseError("URL cannot be empty")
+
+    # Ensure URL has a scheme
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    try:
+        parsed = urlparse(url)
+    except Exception as exc:
+        raise UrlParseError(f"Invalid URL format: {exc}") from exc
+
+    if not parsed.hostname:
+        raise UrlParseError("URL must include a hostname")
+
+    host = parsed.hostname.lower()
+    path = parsed.path.rstrip("/")
+
+    # SECURITY: Only github.com and actual subdomains of github.com are
+    # accepted.  GitHub Enterprise Server (GHE) uses arbitrary hostnames
+    # that cannot be reliably distinguished from non-GitHub hosts without
+    # explicit configuration.  This github.com-only guard is the single
+    # choke point to relax when GHE owner-wide support is enabled (see
+    # derive_api_urls() and the GHE tracking issue) — do NOT scatter
+    # additional host checks elsewhere.
+    if not _host_matches(host, "github.com"):
+        raise UrlParseError(
+            f"Owner-wide URL parsing is only supported for github.com "
+            f"hosts (got host: {host}). GitHub Enterprise support is not "
+            f"yet enabled — use a direct PR URL for non-github.com hosts."
+        )
+
+    parts = [p for p in path.split("/") if p]
+
+    # Normalise the canonical GitHub org forms:
+    #   /orgs/owner               -> owner
+    #   /orgs/owner/repositories  -> owner
+    if parts and parts[0] == "orgs":
+        rest = parts[1:]
+        if rest and rest[-1] == "repositories":
+            rest = rest[:-1]
+        if len(rest) != 1:
+            raise UrlParseError(
+                f"Invalid GitHub organization URL format. Expected: "
+                f"https://{host}/orgs/owner"
+            )
+        owner = rest[0]
+        return ParsedOrgUrl(
+            source=ChangeSource.GITHUB,
+            host=host,
+            owner=owner,
+            original_url=url,
+        )
+
+    # Bare owner form: exactly one path segment.
+    if len(parts) != 1:
+        raise UrlParseError(
+            f"Invalid GitHub owner URL format. Expected: "
+            f"https://{host}/owner (an organization or user login)"
+        )
+
+    owner = parts[0]
+    return ParsedOrgUrl(
+        source=ChangeSource.GITHUB,
+        host=host,
+        owner=owner,
+        original_url=url,
+    )
+
+
+def derive_api_urls(host: str) -> tuple[str, str]:
+    """Derive the (REST, GraphQL) API base URLs for a GitHub host.
+
+    This is the single place that encodes the dotcom-vs-GHE base-URL
+    rule.  github.com (and its subdomains) use the dedicated
+    ``api.github.com`` host, while GitHub Enterprise Server installs
+    serve the API from ``https://HOST/api/v3`` (REST) and
+    ``https://HOST/api/graphql`` (GraphQL).
+
+    GHE is not yet wired through the service/client constructors (the
+    URL parsers still reject non-github.com hosts), but centralising
+    the derivation here means enabling GHE later is a matter of relaxing
+    that single guard and threading the returned URLs through — see the
+    GHE tracking issue.
+
+    Args:
+        host: The hostname (e.g. ``github.com`` or ``ghe.example.com``).
+
+    Returns:
+        A ``(api_url, graphql_url)`` tuple.
+
+    Raises:
+        ValueError: If ``host`` is empty or whitespace-only, which would
+            otherwise yield a subtly broken base URL such as
+            ``https:///api/v3``.
+    """
+    host = (host or "").strip().lower()
+    if not host:
+        raise ValueError("derive_api_urls requires a non-empty host")
+    if _host_matches(host, "github.com"):
+        return ("https://api.github.com", "https://api.github.com/graphql")
+    # GitHub Enterprise Server base URLs.
+    return (f"https://{host}/api/v3", f"https://{host}/api/graphql")
+
+
 __all__ = [
     "ChangeSource",
+    "ParsedOrgUrl",
     "ParsedRepoUrl",
     "ParsedUrl",
     "UrlParseError",
     "_host_matches",
+    "derive_api_urls",
     "detect_source",
     "parse_change_url",
+    "parse_org_url",
     "parse_repo_url",
 ]

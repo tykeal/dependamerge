@@ -314,10 +314,15 @@ class FixOrchestrator:
                     # Attempt to abort any in-progress rebase and record failure
                     try:
                         rebase_abort(cwd=workspace)
-                    except Exception:
+                    except Exception as abort_err:
                         # Cleanup abort is best-effort; the failure is
-                        # already recorded below regardless.
-                        pass
+                        # already recorded below regardless.  Surface it
+                        # through the orchestrator logger so an unexpected
+                        # cleanup failure remains discoverable.
+                        self._log(
+                            f"{ctx.base_repo_full_name}#{ctx.pr_number}: "
+                            f"rebase --abort cleanup failed: {abort_err}"
+                        )
                     results.append(
                         FixResult(
                             selection=sel,
@@ -619,10 +624,22 @@ class InteractiveResolver:
             )
             return
 
-        # If the editor is VS Code ('code'), ensure we wait for window close (-w)
-        # Heuristic: if command contains 'code', add '-w' if not present
+        # If the editor is VS Code, ensure we wait for the window to close
+        # (-w) so the rebase does not continue before the user has saved
+        # their conflict resolutions.
+        #
+        # Match on the launcher's program name (basename without a Windows
+        # extension) against the known VS Code commands rather than a naive
+        # substring test: a plain ``"code" in cmd_parts[0]`` would also fire
+        # on unrelated binaries such as ``encode``, ``xcode`` or ``mycode``,
+        # while still missing path-qualified launchers like ``/usr/bin/code``.
         cmd_parts = shlex.split(editor_cmd)
-        if cmd_parts and "code" in cmd_parts[0] and "-w" not in cmd_parts:
+        prog = (
+            Path(cmd_parts[0]).name.lower().removesuffix(".cmd").removesuffix(".exe")
+            if cmd_parts
+            else ""
+        )
+        if prog in ("code", "code-insiders") and "-w" not in cmd_parts:
             cmd_parts.append("-w")
 
         if paths:

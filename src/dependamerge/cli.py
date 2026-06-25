@@ -20,6 +20,7 @@ from rich.console import Console
 from rich.table import Table
 
 from ._version import __version__
+from .bot_identity import is_automation_author
 from .close_manager import AsyncCloseManager, CloseResult
 from .error_codes import (
     DependamergeError,
@@ -70,15 +71,23 @@ from .progress_tracker import MergeProgressTracker, ProgressTracker
 from .resolve_conflicts import FixOptions, FixOrchestrator, PRSelection
 from .system_utils import get_default_workers
 from .url_parser import (
+    ParsedOrgUrl,
     ParsedRepoUrl,
     ParsedUrl,
     UrlParseError,
     parse_change_url,
+    parse_org_url,
     parse_repo_url,
 )
 
 # Constants
 MAX_RETRIES = 2
+
+# Default owner-wide global wait ceiling (seconds) for `--max-wait`.
+# 15 minutes balances giving dependabot's rebase + CI time to land
+# against not blocking the shell indefinitely.  0 disables waiting
+# (fire-and-forget).
+DEFAULT_MAX_WAIT = 900.0
 
 
 def version_callback(value: bool):
@@ -336,6 +345,11 @@ class _MergeContext:
     github2gerrit_mode: str
     include_human_prs: bool = False
     rebase_local: bool = True
+    # Owner-wide global wait ceiling (seconds).  Default 900 (15 min);
+    # 0 = fire-and-forget (arm auto-merge, report pending, never block).
+    # Applies to owner/user-wide runs; ignored for single-PR and
+    # single-repository merges.
+    max_wait: float = DEFAULT_MAX_WAIT
 
     # Derived / mutable state
     github_client: GitHubClient | None = None
@@ -754,6 +768,7 @@ def _run_parallel_merge(
     concurrency: int = 10,
     leading_blank: bool = True,
     repo_scoped: bool = False,
+    stripe: bool = False,
 ) -> list[MergeResult]:
     """Execute a parallel merge (preview or real) and return results.
 
@@ -774,11 +789,19 @@ def _run_parallel_merge(
             preceding similar-PR list.  Callers pass False when no
             list was printed (e.g. no similar PRs were found) so the
             output stays compact.
-        repo_scoped: When True, all PRs target a single repository, so
-            each worker refreshes its PR's live merge state just before
-            dispatching the merge (a sibling merge can make a PR
-            ``dirty`` / ``behind`` mid-batch).  Left False for org-wide
-            runs.  See ``AsyncMergeManager._refresh_pr_mergeability``.
+        repo_scoped: When True, each worker refreshes its PR's live
+            merge state just before dispatching the merge, because a
+            sibling merge in the same repository can make a PR ``dirty``
+            / ``behind`` mid-batch.  Enabled for both repo-scoped merges
+            (all PRs in one repository) and owner-wide striped merges
+            (which interleave repositories but serialise PRs within each
+            repository).  See
+            ``AsyncMergeManager._refresh_pr_mergeability``.
+        stripe: When True, the merge is scheduled with the striped
+            scheduler (one serial worker per repository, distinct repos
+            concurrent) so owner-wide batches never stack two merges on
+            the same repository at once.  See
+            ``AsyncMergeManager._run_striped``.
     """
 
     async def _do_merge():
@@ -798,13 +821,19 @@ def _run_parallel_merge(
             netrc_file=ctx.netrc_file,
             rebase_local=ctx.rebase_local,
             repo_scoped=repo_scoped,
+            # The owner-wide global wait ceiling applies to striped
+            # (owner/user-wide) runs; single-PR and single-repository
+            # merges keep the uncapped per-PR ``merge_timeout`` behaviour.
+            max_wait=ctx.max_wait if stripe else None,
         ) as merge_manager:
             if not preview:
                 prefix = "\n" if leading_blank else ""
                 console.print(
                     f"{prefix}🚀 Merging {len(prs_to_merge)} pull requests..."
                 )
-            return await merge_manager.merge_prs_parallel(prs_to_merge)
+            return await merge_manager.merge_prs_parallel(
+                prs_to_merge, stripe=stripe
+            )
 
     return asyncio.run(_do_merge())
 
@@ -1124,18 +1153,27 @@ def _handle_repo_merge(
         console.print(f"❌ No open {label}PRs found in {parsed_repo.project}")
         return
 
+    # --- Order PRs oldest-first (ascending PR number) ---
+    # The GraphQL fetch returns PRs newest-first (CREATED_AT DESC), but
+    # merging within a repository must drain oldest-first.  Merging the
+    # newest PR ahead of an older sibling leaves the older one behind the
+    # base branch, forcing automation (e.g. dependabot) into an avoidable
+    # rebase-and-revalidate cycle that can block the batch.  Sorting here
+    # mirrors the within-repository key applied owner-wide by
+    # ``_owner_merge_order`` so both schemes sequence a repository's PRs
+    # identically; the preview list below is derived from this order too.
+    repo_prs = _repo_merge_order(repo_prs)
+
     # --- Classify PRs as automation vs human ---
-    # Use AUTOMATION_TOOLS substring matching (consistent with
-    # GitHubService.fetch_repo_open_prs and _is_automation_author).
-    # GraphQL returns authors without the "[bot]" suffix (e.g.
-    # "dependabot" not "dependabot[bot]"), so the exact-match
-    # GitHubClient.is_automation_author() would misclassify them.
+    # Delegated to the shared bot-identity predicate so REST and GraphQL
+    # login forms (e.g. "dependabot[bot]" vs "dependabot") classify
+    # identically.
     def _is_auto(author: str | None) -> bool:
-        author_lower = (author or "").lower()
-        return any(tool in author_lower for tool in AUTOMATION_TOOLS)
+        return is_automation_author(author)
 
     automation_prs: list[PullRequestInfo] = []
     human_prs: list[PullRequestInfo] = []
+
     for pr in repo_prs:
         if _is_auto(pr.author):
             automation_prs.append(pr)
@@ -1321,6 +1359,410 @@ def _execute_repo_confirmed_merge(
             # Single-repo batch — refresh live merge state before each
             # dispatch (a sibling merge can introduce a conflict).
             repo_scoped=True,
+        )
+    finally:
+        if ctx.show_progress and ctx.progress_tracker:
+            ctx.progress_tracker.stop()
+
+    final_merged = sum(1 for r in real_results if r.status.value == "merged")
+    final_failed = sum(1 for r in real_results if r.status.value == "failed")
+    final_skipped = sum(1 for r in real_results if r.status.value == "skipped")
+    final_blocked = sum(1 for r in real_results if r.status.value == "blocked")
+    final_auto_merge = sum(
+        1 for r in real_results if r.status.value == "auto_merge_pending"
+    )
+    parts = [f"{final_merged} merged"]
+    if final_auto_merge > 0:
+        parts.append(f"{final_auto_merge} auto-merge pending")
+    parts.append(f"{final_failed} failed")
+    if final_skipped > 0:
+        parts.append(f"{final_skipped} skipped")
+    console.print(f"\n🚀 Final Results: {', '.join(parts)}")
+    if final_skipped > 0:
+        console.print(f"⏭️ Skipped {final_skipped} PRs")
+    if final_blocked > 0:
+        console.print(f"🛑 Blocked {final_blocked} PRs")
+    if final_auto_merge > 0:
+        console.print(f"⏳ Auto-merge pending for {final_auto_merge} PRs")
+
+    _print_failed_pr_details(real_results)
+
+
+def _repo_merge_order(
+    prs: list[PullRequestInfo],
+) -> list[PullRequestInfo]:
+    """Order a single repository's PRs for oldest-first merging.
+
+    Sorts ascending by PR number, i.e. in the order the automation raised
+    them (oldest first).  Merging the oldest PR first minimises the rebase
+    churn imposed on the newer siblings: each merge advances the base
+    branch, so a newer sibling merged ahead of an older one would leave
+    the older PR ``behind`` and trigger an avoidable rebase + CI wait.
+
+    This is the single-repository analogue of the within-repository key
+    used owner-wide by :func:`_owner_merge_order`, keeping both schemes'
+    intra-repository sequencing identical.
+    """
+    return sorted(prs, key=lambda p: p.number)
+
+
+def _owner_merge_order(
+    prs: list[PullRequestInfo],
+) -> list[PullRequestInfo]:
+    """Order owner-wide PRs for striped merging.
+
+    Sorts so that:
+
+    - Repositories with the most in-scope PRs come first.  These take the
+      longest to drain (each merge can make the next sibling ``behind`` /
+      ``dirty`` and trigger a rebase + CI wait), so starting them earliest
+      gives them the most wall-clock head start under the striped
+      scheduler's concurrent per-repository workers.
+    - Within a repository, PRs ascend by number, i.e. in the order the
+      automation raised them (oldest first).  Merging the oldest first
+      minimises the rebase churn imposed on the newer siblings.
+
+    Ties between equally-sized repositories break on repository name so
+    the order (and the grouped listing derived from it) is deterministic.
+    """
+    counts: dict[str, int] = {}
+    for pr in prs:
+        counts[pr.repository_full_name] = counts.get(pr.repository_full_name, 0) + 1
+    return sorted(
+        prs,
+        key=lambda p: (
+            -counts[p.repository_full_name],
+            p.repository_full_name,
+            p.number,
+        ),
+    )
+
+
+def _print_prs_grouped_by_repo(
+    prs: list[PullRequestInfo],
+) -> None:
+    """Print a PR list grouped by repository for owner-wide readability.
+
+    Emits a header per repository followed by its PRs indented beneath,
+    so a large owner-wide list stays scannable.  Repositories are listed
+    in the order they first appear in ``prs`` (the caller passes them in
+    merge order via :func:`_owner_merge_order`, so the listing mirrors the
+    sequence in which they will be merged); PRs within a repository are
+    shown in the supplied order.
+    """
+    by_repo: dict[str, list[PullRequestInfo]] = {}
+    for pr in prs:
+        by_repo.setdefault(pr.repository_full_name, []).append(pr)
+
+    for repo, repo_prs in by_repo.items():
+        console.print(f"\n📁 {repo} ({len(repo_prs)} PR(s))")
+        for pr in repo_prs:
+            console.print(f"  #{pr.number} {pr.title} (by {pr.author})")
+
+
+def _handle_org_merge(
+    parsed_org: ParsedOrgUrl,
+    ctx: _MergeContext,
+) -> None:
+    """Handle merge operation for an owner-scoped (org/user) URL.
+
+    Enumerates every in-scope automation PR across all of the owner's
+    non-archived, non-fork repositories, then bulk merges them with the
+    striped scheduler so no two merges stack on the same repository at
+    once.  The owner may be an organization or a personal user account;
+    the account type is detected at runtime during enumeration.
+
+    Args:
+        parsed_org: Parsed owner URL with the org/user login.
+        ctx: Shared merge context populated with CLI parameters.
+    """
+    from .github_service import GitHubService
+
+    # The host here is guaranteed to *match* github.com: ``parse_org_url``
+    # is the single github.com-only choke point (it rejects every other
+    # host, including GHE, before a ``ParsedOrgUrl`` can reach this
+    # handler).  "Matches" is deliberate — ``parse_org_url`` accepts
+    # github.com and its subdomains (e.g. ``api.github.com``) via
+    # ``_host_matches``, so this is not an exact ``== "github.com"``
+    # guarantee.  Enabling GHE (#343) means relaxing that one parser
+    # guard and threading ``derive_api_urls(host)`` through the service
+    # stack — deliberately not re-checked here so there is no second
+    # guard to drift out of sync.
+
+    # --- Initialise GitHub client & token ---
+    ctx.github_client = GitHubClient(ctx.token)
+    assert ctx.github_client.token is not None
+    ctx.token = ctx.github_client.token
+    ctx.owner = parsed_org.owner
+    ctx.repo_name = ""
+
+    console.print(
+        f"🔍 Owner mode: scanning {parsed_org.owner} for automation PRs..."
+    )
+
+    # NOTE: the token permission check is deferred until *after*
+    # enumeration (see below).  ``_check_merge_permissions`` probes a
+    # concrete repository, and ``check_token_permissions`` reports every
+    # operation as missing when no repo is supplied — running it here
+    # with an empty ``ctx.repo_name`` would abort every owner-wide run
+    # unconditionally.
+
+    # --- Progress tracker (enumeration phase: repos fraction) ---
+    if ctx.show_progress:
+        ctx.progress_tracker = MergeProgressTracker(
+            parsed_org.owner,
+            operation_label="Scanning repositories for automation PRs",
+            operation_icon="🔍",
+        )
+        ctx.progress_tracker.start()
+
+    # --- Enumerate automation PRs across the owner ---
+    only_automation = not ctx.include_human_prs
+
+    async def _fetch_prs() -> tuple[list[PullRequestInfo], list[str]]:
+        svc = GitHubService(
+            token=ctx.token,
+            progress_tracker=ctx.progress_tracker,
+        )
+        try:
+            return await svc.fetch_owner_open_prs(
+                parsed_org.owner,
+                only_automation=only_automation,
+            )
+        finally:
+            await svc.close()
+
+    try:
+        owner_prs, scan_errors = asyncio.run(_fetch_prs())
+    except Exception:
+        if ctx.progress_tracker:
+            ctx.progress_tracker.stop()
+        raise
+
+    if ctx.progress_tracker:
+        ctx.progress_tracker.stop()
+
+    # --- Surface per-repository scan failures (run continues) ---
+    if scan_errors:
+        error_count = len(scan_errors)
+        repo_noun = "repository" if error_count == 1 else "repositories"
+        console.print(
+            f"\n⚠️ {error_count} {repo_noun} could not be scanned:"
+        )
+        for err in scan_errors:
+            console.print(f"   - {err}")
+
+    if not owner_prs:
+        label = "automation " if only_automation else ""
+        console.print(f"❌ No open {label}PRs found in {parsed_org.owner}")
+        return
+
+    # Order for striped merging: repositories with the most PRs first,
+    # ascending PR number within each repository (see _owner_merge_order).
+    # Both the grouped listing and the merge list derive from this order.
+    owner_prs = _owner_merge_order(owner_prs)
+
+    # --- Token permission check (reuse existing helper) ---
+    # Deferred from before enumeration: the helper needs a concrete repo
+    # to probe, so point it at the first in-scope PR's repository as a
+    # representative sample.  The common failure modes (expired/invalid
+    # token, no write access) fail identically on any repo; genuine
+    # per-repo permission variance with fine-grained tokens is caught at
+    # merge time by the scheduler's per-repository error isolation.
+    ctx.repo_name = owner_prs[0].repository_full_name.split("/", 1)[-1]
+    _check_merge_permissions(ctx)
+
+    # --- Classify PRs as automation vs human ---
+    # Delegated to the shared bot-identity predicate (see _handle_repo_merge).
+    def _is_auto(author: str | None) -> bool:
+        return is_automation_author(author)
+
+    automation_prs: list[PullRequestInfo] = []
+    human_prs: list[PullRequestInfo] = []
+    for pr in owner_prs:
+        if _is_auto(pr.author):
+            automation_prs.append(pr)
+        else:
+            human_prs.append(pr)
+
+    distinct_repos = {pr.repository_full_name for pr in owner_prs}
+    repo_count = len(distinct_repos)
+    repo_noun = "repository" if repo_count == 1 else "repositories"
+    console.print(
+        f"\n📊 Found {len(owner_prs)} open PR(s) across "
+        f"{repo_count} {repo_noun} in {parsed_org.owner}"
+    )
+    if automation_prs:
+        console.print(f"🤖 Automation PRs: {len(automation_prs)}")
+    if human_prs:
+        console.print(f"👤 Human PRs: {len(human_prs)}")
+
+    # Grouped-by-repository listing keeps a large owner-wide list scannable.
+    _print_prs_grouped_by_repo(owner_prs)
+
+    # --- Human PR confirmation gate ---
+    needs_human_confirm = bool(human_prs) and not ctx.no_confirm
+    if needs_human_confirm:
+        console.print(
+            "\n⚠️ Human-authored PRs across the entire owner "
+            f"'{parsed_org.owner}' are included in this merge operation."
+        )
+        console.print("   Review the list above carefully before proceeding.")
+        try:
+            user_input = (
+                typer.prompt(
+                    "Type 'yes' to include human PRs, or press Enter to skip them",
+                    default="",
+                    show_default=False,
+                )
+                .strip()
+                .lower()
+            )
+            if user_input != "yes":
+                console.print("ℹ️ Excluding human PRs from merge.")
+                owner_prs = automation_prs
+                if not owner_prs:
+                    console.print("❌ No automation PRs remain to merge.")
+                    return
+        except (KeyboardInterrupt, EOFError, typer.Abort):
+            console.print("\n❌ Merge cancelled by user.")
+            return
+
+    # --- Build the merge list (ComparisonResult is None for owner mode) ---
+    all_prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]] = [
+        (pr, None) for pr in owner_prs
+    ]
+
+    # Global concurrency 10, bounded by the distinct-repo count: the
+    # striped scheduler runs at most one PR per repo, so more workers
+    # than repositories cannot help.
+    final_distinct_repos = {pr.repository_full_name for pr in owner_prs}
+    concurrency = min(10, len(final_distinct_repos)) or 1
+
+    # --- Preview / merge using the striped scheduler ---
+    if ctx.show_progress:
+        ctx.progress_tracker = MergeProgressTracker(
+            parsed_org.owner,
+            operation_label="Merging PRs",
+            operation_icon="▶️",
+        )
+        ctx.progress_tracker.set_total_prs(len(all_prs_to_merge))
+        ctx.progress_tracker.start()
+
+    try:
+        merge_results = _run_parallel_merge(
+            ctx,
+            all_prs_to_merge,
+            preview=not ctx.no_confirm,
+            concurrency=concurrency,
+            # Owner-wide batches mix many repositories and often contain
+            # multiple PRs per repository; stripe to avoid stacking and
+            # repo_scoped to refresh live merge state before each dispatch.
+            repo_scoped=True,
+            stripe=True,
+        )
+    finally:
+        if ctx.show_progress and ctx.progress_tracker:
+            ctx.progress_tracker.stop()
+
+    if not merge_results:
+        console.print("❌ No PRs were processed")
+        return
+
+    merged_count = sum(1 for r in merge_results if r.status.value == "merged")
+
+    if not ctx.no_confirm:
+        _handle_org_preview_confirmation(
+            ctx,
+            parsed_org,
+            merge_results,
+            all_prs_to_merge,
+            merged_count,
+            len(merge_results),
+            concurrency,
+        )
+        return
+
+    _display_merge_results(merge_results, ctx.no_confirm)
+
+
+def _handle_org_preview_confirmation(
+    ctx: _MergeContext,
+    parsed_org: ParsedOrgUrl,
+    merge_results: list[MergeResult],
+    all_prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]],
+    merged_count: int,
+    total_to_merge: int,
+    concurrency: int,
+) -> None:
+    """Handle preview-then-confirm for owner-scoped merges.
+
+    Mirrors :func:`_handle_repo_preview_confirmation` but derives the
+    confirmation token from the owner login instead of a repository.
+    """
+    console.print(f"\nMergeable {merged_count}/{total_to_merge} PRs")
+
+    if merged_count == 0:
+        console.print("\n💡 No PRs are mergeable at this time.")
+        return
+
+    combined = f"org-merge:{parsed_org.owner}:{merged_count}"
+    confirm_hash = hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16]
+
+    console.print()
+    console.print(f"To proceed with merging enter: {confirm_hash}")
+
+    try:
+        user_input = typer.prompt(
+            "Enter the string above to continue (or press Enter to cancel)",
+            default="",
+            show_default=False,
+        ).strip()
+
+        if user_input == confirm_hash:
+            _execute_org_confirmed_merge(
+                ctx, merge_results, all_prs_to_merge, concurrency
+            )
+        elif user_input == "":
+            console.print("❌ Merge cancelled by user.")
+        else:
+            console.print("❌ Invalid input. Merge cancelled.")
+    except (KeyboardInterrupt, EOFError, typer.Abort):
+        console.print("\n❌ Merge cancelled by user.")
+
+
+def _execute_org_confirmed_merge(
+    ctx: _MergeContext,
+    preview_results: list[MergeResult],
+    all_prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]],
+    concurrency: int,
+) -> None:
+    """Run the real owner-wide merge after user confirmation."""
+    mergeable_prs = [
+        all_prs_to_merge[i]
+        for i, result in enumerate(preview_results)
+        if result.status.value == "merged"
+    ]
+    merged_count = len(mergeable_prs)
+    console.print(f"\n🔨 Merging {merged_count} mergeable pull requests...")
+
+    if ctx.show_progress:
+        ctx.progress_tracker = MergeProgressTracker(
+            ctx.owner,
+            operation_label="Merging PRs",
+            operation_icon="▶️",
+        )
+        ctx.progress_tracker.set_total_prs(len(mergeable_prs))
+        ctx.progress_tracker.start()
+
+    try:
+        real_results = _run_parallel_merge(
+            ctx,
+            mergeable_prs,
+            preview=False,
+            concurrency=concurrency,
+            repo_scoped=True,
+            stripe=True,
         )
     finally:
         if ctx.show_progress and ctx.progress_tracker:
@@ -1580,7 +2022,7 @@ def _handle_gerrit_merge(
 def merge(
     pr_url: str = typer.Argument(
         ...,
-        help="GitHub PR URL, repository URL, or Gerrit change URL",
+        help="GitHub PR URL, repository URL, owner/org URL, or Gerrit change URL",
     ),
     no_confirm: bool = typer.Option(
         False,
@@ -1624,6 +2066,18 @@ def merge(
             "Timeout in seconds for async merge operations (rebase, "
             "pre-commit.ci, recreate). Default: "
             f"{DEFAULT_MERGE_TIMEOUT:.0f}"
+        ),
+    ),
+    max_wait: float = typer.Option(
+        DEFAULT_MAX_WAIT,
+        "--max-wait",
+        help=(
+            "Owner/user-wide runs only: global wall-clock ceiling in "
+            "seconds for the whole batch. The run returns once every PR "
+            "has merged or this elapses (anything still in flight keeps "
+            "auto-merge armed and is reported as pending). 0 = "
+            "fire-and-forget (arm auto-merge and return immediately, "
+            f"never block). Default: {DEFAULT_MAX_WAIT:.0f}"
         ),
     ),
     show_progress: bool = typer.Option(
@@ -1722,6 +2176,23 @@ def merge(
       https://github.com/owner/repo/
       https://github.com/owner/repo/pulls
 
+    For GitHub owner (organization or user) URLs, this command will:
+
+    1. Enumerate every non-archived, non-fork repository owned by the
+       organization or user (forks are excluded)
+
+    2. Fetch their open automation PRs (unless --include-human-prs)
+
+    3. Bulk merge them with a striped scheduler that processes at most
+       one PR per repository at a time, spreading work across
+       repositories to avoid racing GitHub's mergeability propagation
+
+    Owner URL formats accepted:
+      https://github.com/owner
+      https://github.com/owner/
+      https://github.com/orgs/owner
+      https://github.com/orgs/owner/repositories
+
     For Gerrit changes, this command will:
 
     1. Analyze the provided change
@@ -1763,26 +2234,49 @@ def merge(
         verbose,
     )
 
+    # Reject negative --max-wait.  The documented contract is 0 =
+    # fire-and-forget and > 0 = wall-clock ceiling; a negative value has
+    # no defined meaning and would otherwise be silently coerced into a
+    # surprising "instant no-wait" run (max_wait <= 0).  Fail fast so the
+    # flag's behaviour stays aligned with its help text.  The isinstance
+    # guard tolerates direct Python calls to ``merge`` (e.g. in tests),
+    # where Typer's ``OptionInfo`` default object is passed unresolved.
+    if isinstance(max_wait, (int, float)) and max_wait < 0:
+        console.print(
+            "❌ Invalid --max-wait: must be 0 (fire-and-forget) or a "
+            "positive number of seconds"
+        )
+        raise typer.Exit(1)
+
     # --- Parse URL and route to the appropriate handler ---
-    # Try as a specific PR/change URL first
+    # Try as a specific PR/change URL first, then an owner-wide URL
+    # (bare owner / orgs/owner), then a single repository URL.
     parsed_url: ParsedUrl | None = None
     parsed_repo: ParsedRepoUrl | None = None
+    parsed_org: ParsedOrgUrl | None = None
     change_err: UrlParseError | None = None
     try:
         parsed_url = parse_change_url(pr_url)
     except UrlParseError as e:
         change_err = e
-        # Not a PR URL — try as a repository URL
+        # Not a PR URL — try owner-wide before repository.  parse_org_url
+        # is strict (only a bare owner or the canonical orgs/owner forms),
+        # so a two-segment owner/repo URL falls through to parse_repo_url.
+        # Trying owner-wide first is required so /orgs/owner is not
+        # mis-parsed by parse_repo_url as owner="orgs", repo="owner".
         try:
-            parsed_repo = parse_repo_url(pr_url)
-        except UrlParseError as repo_err:
-            # Show the most relevant error: if the URL targets a
-            # non-github.com host the original parse_change_url error
-            # gives host-appropriate guidance (e.g. Gerrit tips),
-            # whereas parse_repo_url only talks about github.com.
-            from .url_parser import _host_matches
-
+            parsed_org = parse_org_url(pr_url)
+        except UrlParseError as org_err:
+            # Not an owner URL — try as a repository URL
             try:
+                parsed_repo = parse_repo_url(pr_url)
+            except UrlParseError as repo_err:
+                # Show the most relevant error: if the URL targets a
+                # non-github.com host the original parse_change_url error
+                # gives host-appropriate guidance (e.g. Gerrit tips),
+                # whereas parse_repo_url only talks about github.com.
+                from .url_parser import _host_matches
+
                 # Prepend scheme if missing so urlparse can extract the
                 # hostname.  Without a scheme, schemeless URLs like
                 # "gerrit.example.org/..." are parsed as a path with no
@@ -1790,14 +2284,28 @@ def merge(
                 _norm = pr_url
                 if not _norm.startswith(("http://", "https://")):
                     _norm = "https://" + _norm
-                host = urlparse(_norm).hostname or ""
-            except Exception:
-                host = ""
-            if host and not _host_matches(host.lower(), "github.com"):
-                console.print(f"❌ Invalid URL: {change_err}")
-            else:
-                console.print(f"❌ Invalid URL: {repo_err}")
-            raise typer.Exit(1) from None
+                try:
+                    host = urlparse(_norm).hostname or ""
+                except Exception:
+                    host = ""
+                if host and not _host_matches(host.lower(), "github.com"):
+                    # Non-github host.  An owner-shaped path (``/orgs/owner``
+                    # or a single bare segment) most likely means the user
+                    # aimed an owner-wide URL at a non-github host (e.g.
+                    # GHE), so surface parse_org_url's actionable rejection
+                    # ("Owner-wide URL parsing is only supported for
+                    # github.com … use a direct PR URL") instead of the
+                    # generic parse_change_url "cannot determine platform"
+                    # message.  Any other shape (including Gerrit-style
+                    # URLs) keeps the platform-agnostic guidance.
+                    segs = [s for s in urlparse(_norm).path.split("/") if s]
+                    if segs and (segs[0] == "orgs" or len(segs) == 1):
+                        console.print(f"❌ Invalid URL: {org_err}")
+                    else:
+                        console.print(f"❌ Invalid URL: {change_err}")
+                else:
+                    console.print(f"❌ Invalid URL: {repo_err}")
+                raise typer.Exit(1) from None
 
     # --- Route: Gerrit change ---
     if parsed_url is not None and parsed_url.is_gerrit:
@@ -1813,10 +2321,79 @@ def merge(
         )
         return
 
+    # --- Route: GitHub owner (org/user) bulk merge ---
+    if parsed_org is not None:
+        org_ctx = _MergeContext(
+            pr_url=parsed_org.original_url,
+            max_wait=max_wait,
+            no_confirm=no_confirm,
+            similarity_threshold=similarity_threshold,
+            merge_method=merge_method,
+            token=token,
+            override=override,
+            no_fix=no_fix,
+            merge_timeout=merge_timeout,
+            show_progress=show_progress,
+            debug_matching=debug_matching,
+            dismiss_copilot=dismiss_copilot,
+            force=force,
+            verbose=verbose,
+            no_netrc=no_netrc,
+            netrc_file=netrc_file,
+            netrc_optional=netrc_optional,
+            github2gerrit_mode=github2gerrit_mode,
+            include_human_prs=include_human_prs,
+            rebase_local=rebase_local,
+        )
+        try:
+            _handle_org_merge(parsed_org, org_ctx)
+        except DependamergeError as exc:
+            if org_ctx.progress_tracker:
+                org_ctx.progress_tracker.stop()
+            exc.display_and_exit()
+        except (KeyboardInterrupt, SystemExit):
+            if org_ctx.progress_tracker:
+                org_ctx.progress_tracker.stop()
+            raise
+        except typer.Exit:
+            if org_ctx.progress_tracker:
+                org_ctx.progress_tracker.stop()
+            raise
+        except (
+            GitError,
+            RateLimitError,
+            SecondaryRateLimitError,
+            GraphQLError,
+        ) as exc:
+            if org_ctx.progress_tracker:
+                org_ctx.progress_tracker.stop()
+            if isinstance(exc, GitError):
+                converted_error = convert_git_error(exc)
+            else:
+                converted_error = convert_github_api_error(exc)
+            converted_error.display_and_exit()
+        except Exception as e:
+            if org_ctx.progress_tracker:
+                org_ctx.progress_tracker.stop()
+            if is_github_api_permission_error(e):
+                exit_for_github_api_error(exception=e)
+            elif is_network_error(e):
+                converted_error = convert_network_error(e)
+                converted_error.display_and_exit()
+            else:
+                exit_with_error(
+                    ExitCode.GENERAL_ERROR,
+                    message="❌ Error during owner-wide merge operation",
+                    details=str(e),
+                    exception=e,
+                )
+        return
+
     # --- Route: GitHub repository (bulk per-repo merge) ---
     if parsed_repo is not None:
         repo_ctx = _MergeContext(
             pr_url=parsed_repo.original_url,
+            max_wait=max_wait,
             no_confirm=no_confirm,
             similarity_threshold=similarity_threshold,
             merge_method=merge_method,
@@ -1884,6 +2461,7 @@ def merge(
     assert parsed_url is not None
     ctx = _MergeContext(
         pr_url=parsed_url.original_url,
+        max_wait=max_wait,
         no_confirm=no_confirm,
         similarity_threshold=similarity_threshold,
         merge_method=merge_method,

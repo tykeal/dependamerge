@@ -16,6 +16,7 @@ Notes:
 
 __all__ = [
     "ORG_REPOS_ONLY",
+    "USER_REPOS_ONLY",
     "ORG_REPOS_WITH_OPEN_PRS",
     "REPO_OPEN_PRS_PAGE",
     "ENABLE_AUTO_MERGE",
@@ -28,6 +29,10 @@ __all__ = [
 # totalCount is provided by the GitHub GraphQL API for free on connection
 # objects, so the first page immediately reveals the org-wide repo total
 # without requiring a separate counting pass.
+#
+# ``isFork`` is included so owner-wide bulk operations can exclude fork
+# repositories without a second round-trip; existing consumers that only
+# read ``nameWithOwner`` / ``isArchived`` simply ignore the extra field.
 ORG_REPOS_ONLY = """
 query($org: String!, $reposCursor: String) {
   organization(login: $org) {
@@ -40,6 +45,33 @@ query($org: String!, $reposCursor: String) {
       nodes {
         nameWithOwner
         isArchived
+        isFork
+      }
+    }
+  }
+}
+"""
+
+# User-account counterpart of ORG_REPOS_ONLY.  The ``repositories``
+# connection exists on both ``Organization`` and ``User``, so this query
+# is structurally identical apart from the ``user(login:)`` root.  It is
+# used as a runtime fallback when an owner login is not an organization
+# (the ``organization`` field returns null).  The ``$org`` variable name
+# is retained for call-site uniformity even though it carries a user
+# login here.
+USER_REPOS_ONLY = """
+query($org: String!, $reposCursor: String) {
+  user(login: $org) {
+    repositories(first: 100, after: $reposCursor, orderBy: { field: NAME, direction: ASC }) {
+      totalCount
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        nameWithOwner
+        isArchived
+        isFork
       }
     }
   }
@@ -77,7 +109,7 @@ query($org: String!, $reposCursor: String) {
             body
             url
             isDraft
-            author { login }
+            author { __typename login }
             mergeable
             mergeStateStatus
             baseRefName
@@ -167,7 +199,7 @@ query($owner: String!, $name: String!, $prsCursor: String, $prsPageSize: Int!, $
         body
         url
         isDraft
-        author { login }
+        author { __typename login }
         mergeable
         mergeStateStatus
         baseRefName

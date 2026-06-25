@@ -59,18 +59,21 @@ class TestResolveDefaultBranch:
         async with GitHubAsync(token="t") as api:
             api.get = AsyncMock(return_value={"default_branch": "master"})  # type: ignore[method-assign]
             assert await api._resolve_default_branch("owner", "repo") == "master"
+            api.get.assert_awaited_once_with("/repos/owner/repo")
 
     @pytest.mark.asyncio
     async def test_returns_none_when_field_absent(self) -> None:
         async with GitHubAsync(token="t") as api:
             api.get = AsyncMock(return_value={})  # type: ignore[method-assign]
             assert await api._resolve_default_branch("owner", "repo") is None
+            api.get.assert_awaited_once_with("/repos/owner/repo")
 
     @pytest.mark.asyncio
     async def test_returns_none_on_error(self) -> None:
         async with GitHubAsync(token="t") as api:
             api.get = AsyncMock(side_effect=RuntimeError("403 Forbidden"))  # type: ignore[method-assign]
             assert await api._resolve_default_branch("owner", "repo") is None
+            api.get.assert_awaited_once_with("/repos/owner/repo")
 
 
 class TestAnalyzeBlockReasonBaseBranch:
@@ -78,7 +81,12 @@ class TestAnalyzeBlockReasonBaseBranch:
     async def test_uses_pr_base_ref_not_assumed_main(self) -> None:
         """The PR's own base ref (e.g. master) drives guard detection."""
         async with GitHubAsync(token="t") as api:
-            api.get = _block_reason_router(pr_data={"base": {"ref": "master"}})  # type: ignore[method-assign]
+            # Wrap the router in an AsyncMock so the call list can be
+            # inspected: a readable PR base ref must satisfy resolution
+            # without falling back to a repository-metadata lookup.
+            api.get = AsyncMock(  # type: ignore[method-assign]
+                side_effect=_block_reason_router(pr_data={"base": {"ref": "master"}})
+            )
             api.get_required_status_checks = AsyncMock(return_value=[])  # type: ignore[method-assign]
 
             with patch.object(
@@ -94,6 +102,14 @@ class TestAnalyzeBlockReasonBaseBranch:
             api.get_required_status_checks.assert_awaited_once_with(
                 "owner", "repo", "master"
             )
+            # The base ref came straight from the PR, so the repository
+            # default-branch fallback must not have been triggered.
+            repo_meta_calls = [
+                call
+                for call in api.get.await_args_list
+                if call.args == ("/repos/owner/repo",)
+            ]
+            assert not repo_meta_calls
 
     @pytest.mark.asyncio
     async def test_falls_back_to_repo_default_branch(self) -> None:

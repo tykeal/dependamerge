@@ -30,7 +30,14 @@ def _make_pr_info(
     number: int = 39,
     repo: str = "org/repo",
 ) -> PullRequestInfo:
-    """Create a PullRequestInfo fixture with sensible defaults."""
+    """Create a PullRequestInfo fixture modelling a pre-commit.ci PR.
+
+    The title/author/branch defaults deliberately describe a
+    ``pre-commit-ci[bot]`` autoupdate PR — the canonical automation PR
+    this module exercises.  Tests whose behaviour depends on author or
+    title should pass those values explicitly rather than relying on
+    these fixture defaults.
+    """
     return PullRequestInfo(
         number=number,
         title="Chore: pre-commit autoupdate",
@@ -52,7 +59,14 @@ def _make_pr_info(
 
 
 def _make_405_exception() -> httpx.HTTPStatusError:
-    """Create a realistic 405 HTTPStatusError."""
+    """Create a realistic 405 HTTPStatusError with no response body.
+
+    The empty body is deliberate: these tests exercise the retry
+    classifier in ``_merge_pr_with_retry``, which keys off the HTTP
+    *status line* ("405 Method Not Allowed") only.  The body-parsing
+    path that surfaces GitHub's ``message`` field is covered separately
+    by ``_make_405_with_body`` / ``TestMergeApiBodyCapture``.
+    """
     request = httpx.Request(
         "PUT",
         "https://api.github.com/repos/org/repo/pulls/39/merge",
@@ -166,6 +180,35 @@ class TestFailureSummaryHTTPErrors:
         # state-based analysis for blocked PRs
         assert "transient 405" not in summary.lower()
 
+    def test_405_with_github_body_surfaces_detail(self):
+        """A 405 carrying GitHub's response body surfaces that detail.
+
+        End-to-end counterpart to ``TestMergeApiBodyCapture`` (which
+        checks the transport layer): ``merge_pull_request`` embeds
+        GitHub's explanation after a ``GitHub: `` marker, and
+        ``_get_failure_summary`` must surface that actionable reason
+        ahead of the state-based inference that a ``blocked`` PR would
+        otherwise yield ("branch protection rules prevent merge").
+        """
+        mgr = self._make_manager()
+        pr = _make_pr_info(mergeable_state="blocked", mergeable=True)
+
+        mgr._last_merge_exception["org/repo#39"] = Exception(
+            "Failed to merge PR #39 in org/repo. Error: Client error "
+            "'405 Method Not Allowed' for url '.../merge'. "
+            "GitHub: Required workflows 'Autolabeler' are not satisfied "
+            "(PR state: open, mergeable: True, mergeable_state: blocked)"
+        )
+
+        summary = mgr._get_failure_summary(pr)
+
+        assert "Required workflows" in summary
+        assert "are not satisfied" in summary
+        # The marker detail must win over generic block-state inference.
+        assert "branch protection" not in summary.lower()
+        # The appended PR-state context must be trimmed off.
+        assert "PR state:" not in summary
+
     def test_502_reports_bad_gateway(self):
         """A 502 error should be reported as Bad Gateway."""
         mgr = self._make_manager()
@@ -240,6 +283,9 @@ class TestTransient405Retry:
 
         assert result is True
         assert client.merge_pull_request.call_count == 2
+        # The first attempt's 405 must be recorded for failure reporting,
+        # even though the retry ultimately succeeded.
+        assert "org/repo#39" in mgr._last_merge_exception
 
     @pytest.mark.asyncio
     async def test_405_on_clean_pr_retries_and_still_fails(self):
@@ -327,11 +373,13 @@ class TestTransient405Retry:
     async def test_405_base_branch_modified_retries_and_succeeds(self):
         """A "Base branch was modified" 405 is a transient race: retry.
 
-        The PR is ``behind`` and ``fix_out_of_date`` is off, so without the
-        dedicated base-modified handling this 405 would fall through to the
-        terminal ``else: break`` and report a false failure.  The race
-        clears on retry (a sibling merge advanced the base), so the second
-        attempt succeeds.
+        The PR is ``behind`` and ``fix_out_of_date`` is off.  The dedicated
+        "base branch was modified" branch in ``_merge_pr_with_retry``
+        recognises this as a transient race and retries via ``continue``
+        (up to ``max_retries``); without it the 405 would instead fall
+        through to the terminal ``else: break`` taken by behind/no-fix PRs
+        and report a false failure.  The race clears on retry (a sibling
+        merge advanced the base), so the second attempt succeeds.
         """
         pr = _make_pr_info(mergeable_state="behind", mergeable=True)
 

@@ -49,6 +49,11 @@ DEFAULT_GERRIT_PORT: int = 29418
 #   • are case-insensitive on the key name (``(?i)``)
 #   • tolerate optional horizontal whitespace around ``=``
 #   • strip trailing whitespace / ``\r`` so Windows line endings are handled
+#
+# The trailing ``[ \t\r]*$`` component on every pattern is what absorbs
+# a Windows ``\r`` (and any trailing spaces/tabs) before the line
+# anchor, so values parsed from CRLF-terminated files do not retain a
+# stray carriage return.
 # ───────────────────────────────────────────────────────────────────────
 
 _HOST_RE = re.compile(r"(?mi)^host[ \t]*=[ \t]*(.+?)[ \t\r]*$")

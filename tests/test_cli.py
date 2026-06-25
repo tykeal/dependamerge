@@ -168,6 +168,30 @@ class TestCLI:
         assert result.exit_code == 1
         assert "❌ Invalid URL:" in result.stdout
 
+    def test_merge_command_rejects_negative_max_wait(self):
+        """Negative --max-wait must fail fast before any URL routing.
+
+        Regression for the Copilot finding: ``--max-wait`` documents
+        ``0`` (fire-and-forget) and ``> 0`` (wall-clock ceiling), but a
+        negative value was silently accepted and coerced into a
+        surprising instant no-wait run (``max_wait <= 0``).  The command
+        now rejects negatives with exit code 1.
+        """
+        result = self.runner.invoke(
+            app,
+            [
+                "merge",
+                "https://github.com/owner/repo/pull/22",
+                "--token",
+                "test_token",
+                "--max-wait",
+                "-1",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Invalid --max-wait" in result.stdout
+
     @patch("dependamerge.cli.GitHubClient")
     def test_merge_command_non_automation_pr(self, mock_client_class):
         mock_client = Mock()

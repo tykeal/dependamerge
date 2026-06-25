@@ -449,6 +449,79 @@ class TestHandleMergeConflict:
         # The failure is handled before auto-merge is even attempted.
         mock_enable.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_no_wait_auto_merge_armed_reports_pending(self) -> None:
+        """Fire-and-forget with auto-merge available -> AUTO_MERGE_PENDING."""
+        mgr, _client = make_merge_manager(max_wait=0)
+        assert mgr._no_wait is True
+        pr = _make_pr()
+
+        with (
+            patch.object(
+                mgr,
+                "_request_dependabot_rebase",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(mgr, "_approve_pr", new_callable=AsyncMock, return_value=True),
+            patch.object(
+                mgr,
+                "_enable_auto_merge_for_pr",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                mgr, "_wait_for_auto_merge", new_callable=AsyncMock
+            ) as mock_wait,
+        ):
+            result = await mgr._handle_merge_conflict(
+                pr, "lfreleng-actions", "lftools-uv", _result(pr)
+            )
+
+        assert result.status == MergeStatus.AUTO_MERGE_PENDING
+        # Fire-and-forget never blocks on the wait loop.
+        mock_wait.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_wait_auto_merge_unavailable_reports_blocked(self) -> None:
+        """Fire-and-forget with auto-merge unavailable -> BLOCKED.
+
+        Regression for the Copilot finding: in the ``max_wait == 0``
+        path the return of ``_enable_auto_merge_for_pr`` was ignored, so
+        a PR that could not arm auto-merge was still reported as
+        AUTO_MERGE_PENDING even though GitHub would never merge it.
+        """
+        mgr, _client = make_merge_manager(max_wait=0)
+        assert mgr._no_wait is True
+        pr = _make_pr()
+
+        with (
+            patch.object(
+                mgr,
+                "_request_dependabot_rebase",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(mgr, "_approve_pr", new_callable=AsyncMock, return_value=True),
+            patch.object(
+                mgr,
+                "_enable_auto_merge_for_pr",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                mgr, "_wait_for_auto_merge", new_callable=AsyncMock
+            ) as mock_wait,
+        ):
+            result = await mgr._handle_merge_conflict(
+                pr, "lfreleng-actions", "lftools-uv", _result(pr)
+            )
+
+        # Must NOT be AUTO_MERGE_PENDING (auto-merge was never armed).
+        assert result.status == MergeStatus.BLOCKED
+        assert "auto-merge unavailable" in (result.error or "")
+        mock_wait.assert_not_called()
+
 
 class TestConflictRoutingFromMergeSinglePr:
     """``_merge_single_pr`` routes ``dirty`` PRs to the conflict handler."""

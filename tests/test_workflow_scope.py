@@ -24,10 +24,15 @@ from dependamerge.github_async import GitHubAsync
 from dependamerge.github_async import PermissionError as GitHubPermissionError
 from dependamerge.models import FileChange, PullRequestInfo
 
+# Test-only dummy token. Centralised in a constant to make clear it is a
+# fixture value, not a real credential, and to keep that intent obvious if
+# more call sites are added.
+_TEST_TOKEN = "test_token"
+
 
 def _make_api() -> GitHubAsync:
     """Construct a client with a dummy token (no network is performed)."""
-    return GitHubAsync(token="test_token")
+    return GitHubAsync(token=_TEST_TOKEN)
 
 
 class _FakeWorkflowResponse:

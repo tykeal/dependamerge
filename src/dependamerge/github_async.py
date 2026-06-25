@@ -25,6 +25,8 @@ from tenacity import (
     wait_random_exponential,
 )
 
+from .bot_identity import is_copilot
+
 __all__ = [
     "GitHubAsync",
     "RateLimitError",
@@ -879,6 +881,8 @@ class GitHubAsync:
             if isinstance(body, dict) and isinstance(body.get("message"), str):
                 return " ".join(body["message"].split())
         except Exception:
+            # Response body was not JSON (or .json() failed); fall through
+            # to the raw-text extraction below rather than failing here.
             pass
         try:
             raw = getattr(response, "text", "") or ""
@@ -1874,7 +1878,7 @@ class GitHubAsync:
                     if state == "APPROVED":
                         approved = True
                     elif state == "CHANGES_REQUESTED":
-                        if author == "github-copilot[bot]":
+                        if is_copilot(author):
                             unresolved_copilot_reviews += 1
                         else:
                             human_changes_requested = True
@@ -1892,7 +1896,7 @@ class GitHubAsync:
                         continue
                     author = comment.get("user", {}).get("login", "")
                     # Count unresolved Copilot comments (those without replies dismissing them)
-                    if author == "github-copilot[bot]":
+                    if is_copilot(author):
                         # Simple heuristic: if comment doesn't have "DISMISSED" or similar resolution text
                         body = comment.get("body", "").lower()
                         if "dismissed" not in body and "resolved" not in body:

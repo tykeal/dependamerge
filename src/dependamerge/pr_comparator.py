@@ -4,6 +4,7 @@
 import re
 from difflib import SequenceMatcher
 
+from .bot_identity import normalize_bot_login
 from .models import ComparisonResult, FileChange, PullRequestInfo
 
 
@@ -304,18 +305,12 @@ class PRComparator:
     def _normalize_author(self, author: str | None) -> str:
         """Normalize author name to handle differences between REST and GraphQL APIs.
 
-        GitHub's REST API returns 'dependabot[bot]' while GraphQL returns 'dependabot'.
-        This method normalizes both to the same format for comparison.
+        GitHub's REST API returns 'dependabot[bot]' while GraphQL returns
+        'dependabot'.  Delegates to the shared
+        :func:`bot_identity.normalize_bot_login` so author comparison uses
+        the same canonical form as the rest of the codebase.
         """
-        if not author:
-            return ""
-
-        # Remove [bot] suffix if present to normalize bot names
-        normalized = author.lower()
-        if normalized.endswith("[bot]"):
-            normalized = normalized[:-5]  # Remove "[bot]"
-
-        return normalized
+        return normalize_bot_login(author)
 
     def _is_precommit_body(self, body: str | None) -> bool:
         """Check if body contains pre-commit specific patterns."""
