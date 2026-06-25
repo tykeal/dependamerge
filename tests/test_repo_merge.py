@@ -719,3 +719,33 @@ class TestRepoConfirmationHash:
         h1 = hashlib.sha256(c1.encode("utf-8")).hexdigest()[:16]
         h2 = hashlib.sha256(c2.encode("utf-8")).hexdigest()[:16]
         assert h1 != h2
+
+
+class TestRepoMergeOrder:
+    """Verify repository-scoped PRs are sequenced oldest-first."""
+
+    def test_orders_ascending_by_number(self):
+        """PRs fetched newest-first are reordered oldest-first."""
+        from dependamerge.cli import _repo_merge_order
+
+        # GraphQL returns CREATED_AT DESC (newest first); simulate that.
+        prs = [_make_pr(7), _make_pr(3), _make_pr(5), _make_pr(1)]
+        ordered = _repo_merge_order(prs)
+        assert [p.number for p in ordered] == [1, 3, 5, 7]
+
+    def test_is_stable_and_non_mutating(self):
+        """Input list is not mutated and already-sorted input is preserved."""
+        from dependamerge.cli import _repo_merge_order
+
+        prs = [_make_pr(1), _make_pr(2), _make_pr(3)]
+        ordered = _repo_merge_order(prs)
+        assert [p.number for p in ordered] == [1, 2, 3]
+        # Original list order is left untouched.
+        assert [p.number for p in prs] == [1, 2, 3]
+        assert ordered is not prs
+
+    def test_empty_list(self):
+        """An empty list orders to an empty list."""
+        from dependamerge.cli import _repo_merge_order
+
+        assert _repo_merge_order([]) == []

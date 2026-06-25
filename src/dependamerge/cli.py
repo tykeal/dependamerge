@@ -1153,6 +1153,17 @@ def _handle_repo_merge(
         console.print(f"❌ No open {label}PRs found in {parsed_repo.project}")
         return
 
+    # --- Order PRs oldest-first (ascending PR number) ---
+    # The GraphQL fetch returns PRs newest-first (CREATED_AT DESC), but
+    # merging within a repository must drain oldest-first.  Merging the
+    # newest PR ahead of an older sibling leaves the older one behind the
+    # base branch, forcing automation (e.g. dependabot) into an avoidable
+    # rebase-and-revalidate cycle that can block the batch.  Sorting here
+    # mirrors the within-repository key applied owner-wide by
+    # ``_owner_merge_order`` so both schemes sequence a repository's PRs
+    # identically; the preview list below is derived from this order too.
+    repo_prs = _repo_merge_order(repo_prs)
+
     # --- Classify PRs as automation vs human ---
     # Delegated to the shared bot-identity predicate so REST and GraphQL
     # login forms (e.g. "dependabot[bot]" vs "dependabot") classify
@@ -1375,6 +1386,24 @@ def _execute_repo_confirmed_merge(
         console.print(f"⏳ Auto-merge pending for {final_auto_merge} PRs")
 
     _print_failed_pr_details(real_results)
+
+
+def _repo_merge_order(
+    prs: list[PullRequestInfo],
+) -> list[PullRequestInfo]:
+    """Order a single repository's PRs for oldest-first merging.
+
+    Sorts ascending by PR number, i.e. in the order the automation raised
+    them (oldest first).  Merging the oldest PR first minimises the rebase
+    churn imposed on the newer siblings: each merge advances the base
+    branch, so a newer sibling merged ahead of an older one would leave
+    the older PR ``behind`` and trigger an avoidable rebase + CI wait.
+
+    This is the single-repository analogue of the within-repository key
+    used owner-wide by :func:`_owner_merge_order`, keeping both schemes'
+    intra-repository sequencing identical.
+    """
+    return sorted(prs, key=lambda p: p.number)
 
 
 def _owner_merge_order(
