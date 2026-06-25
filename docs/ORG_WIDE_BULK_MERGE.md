@@ -186,22 +186,28 @@ handful of PRs from one repo at once, thrashing the refresh/retry path.
 The avoidance strategy is **structural, not timing-based**:
 
 1. **Group** the flat PR list by `repository_full_name`.
-2. **Round-robin interleave** across repos when building the work queue
-   so consecutive items target different repos: `repoA#1, repoB#1,
-   repoC#1, repoA#2, repoB#2, …`. This maximises the gap between two
-   merges in the same repo.
-3. **One in-flight PR per repo at a time.** While a repo's PR moves
-   through approve → rebase → merge → post-merge settle, no other PR from
-   that repo starts; workers pick up PRs from other repos instead.
-   Global concurrency stays bounded but spreads across distinct repos.
+2. **Run one serial worker per repository.** A single worker owns each
+   repository's PRs and processes them strictly one at a time, in order.
+   All workers run concurrently under a shared semaphore that bounds
+   global concurrency, so progress spreads across distinct repos.
+3. **One in-flight PR per repo at a time.** Because a repo's PRs share a
+   single serial worker, while one PR moves through approve → rebase →
+   merge → post-merge settle, no other PR from that repo can start; the
+   semaphore admits PRs from *other* repos instead. (Any tendency for
+   consecutive admissions to alternate between repos — a round-robin
+   "striping" effect — emerges as a best-effort consequence of how
+   CPython wakes semaphore waiters; treat it as an optimisation, not a
+   guarantee, because correctness does not depend on it.)
 4. **Live mergeability refresh before dispatch** (`repo_scoped` semantics)
    so that when a repo's second PR starts, it re-reads state the first
    PR's merge may have invalidated.
 
-No sleeps and no random retries — the single-flight + round-robin
-ordering is the avoidance mechanism. This complements, and sits above,
-the existing `_get_merge_dispatch_lock(owner, repo)`, which serialises
-the final `merge_pull_request` API call alone.
+No sleeps and no random retries — the **single-flight-per-repository**
+invariant (each repo's serial worker) is the avoidance mechanism, and it
+holds regardless of the order in which the semaphore admits waiters. This
+complements, and sits above, the existing
+`_get_merge_dispatch_lock(owner, repo)`, which serialises the final
+`merge_pull_request` API call alone.
 
 ### Merge ordering
 

@@ -1478,13 +1478,16 @@ def _handle_org_merge(
     """
     from .github_service import GitHubService
 
-    # The host is guaranteed to be github.com here: ``parse_org_url`` is
-    # the single github.com-only choke point (it rejects every other
+    # The host here is guaranteed to *match* github.com: ``parse_org_url``
+    # is the single github.com-only choke point (it rejects every other
     # host, including GHE, before a ``ParsedOrgUrl`` can reach this
-    # handler).  Enabling GHE (#343) means relaxing that one parser guard
-    # and threading ``derive_api_urls(host)`` through the service stack —
-    # deliberately not re-checked here so there is no second guard to
-    # drift out of sync.
+    # handler).  "Matches" is deliberate — ``parse_org_url`` accepts
+    # github.com and its subdomains (e.g. ``api.github.com``) via
+    # ``_host_matches``, so this is not an exact ``== "github.com"``
+    # guarantee.  Enabling GHE (#343) means relaxing that one parser
+    # guard and threading ``derive_api_urls(host)`` through the service
+    # stack — deliberately not re-checked here so there is no second
+    # guard to drift out of sync.
 
     # --- Initialise GitHub client & token ---
     ctx.github_client = GitHubClient(ctx.token)
@@ -2231,6 +2234,20 @@ def merge(
         verbose,
     )
 
+    # Reject negative --max-wait.  The documented contract is 0 =
+    # fire-and-forget and > 0 = wall-clock ceiling; a negative value has
+    # no defined meaning and would otherwise be silently coerced into a
+    # surprising "instant no-wait" run (max_wait <= 0).  Fail fast so the
+    # flag's behaviour stays aligned with its help text.  The isinstance
+    # guard tolerates direct Python calls to ``merge`` (e.g. in tests),
+    # where Typer's ``OptionInfo`` default object is passed unresolved.
+    if isinstance(max_wait, (int, float)) and max_wait < 0:
+        console.print(
+            "❌ Invalid --max-wait: must be 0 (fire-and-forget) or a "
+            "positive number of seconds"
+        )
+        raise typer.Exit(1)
+
     # --- Parse URL and route to the appropriate handler ---
     # Try as a specific PR/change URL first, then an owner-wide URL
     # (bare owner / orgs/owner), then a single repository URL.
@@ -2249,7 +2266,7 @@ def merge(
         # mis-parsed by parse_repo_url as owner="orgs", repo="owner".
         try:
             parsed_org = parse_org_url(pr_url)
-        except UrlParseError:
+        except UrlParseError as org_err:
             # Not an owner URL — try as a repository URL
             try:
                 parsed_repo = parse_repo_url(pr_url)
@@ -2260,19 +2277,32 @@ def merge(
                 # whereas parse_repo_url only talks about github.com.
                 from .url_parser import _host_matches
 
+                # Prepend scheme if missing so urlparse can extract the
+                # hostname.  Without a scheme, schemeless URLs like
+                # "gerrit.example.org/..." are parsed as a path with no
+                # hostname, causing the wrong error to be shown.
+                _norm = pr_url
+                if not _norm.startswith(("http://", "https://")):
+                    _norm = "https://" + _norm
                 try:
-                    # Prepend scheme if missing so urlparse can extract the
-                    # hostname.  Without a scheme, schemeless URLs like
-                    # "gerrit.example.org/..." are parsed as a path with no
-                    # hostname, causing the wrong error to be shown.
-                    _norm = pr_url
-                    if not _norm.startswith(("http://", "https://")):
-                        _norm = "https://" + _norm
                     host = urlparse(_norm).hostname or ""
                 except Exception:
                     host = ""
                 if host and not _host_matches(host.lower(), "github.com"):
-                    console.print(f"❌ Invalid URL: {change_err}")
+                    # Non-github host.  An owner-shaped path (``/orgs/owner``
+                    # or a single bare segment) most likely means the user
+                    # aimed an owner-wide URL at a non-github host (e.g.
+                    # GHE), so surface parse_org_url's actionable rejection
+                    # ("Owner-wide URL parsing is only supported for
+                    # github.com … use a direct PR URL") instead of the
+                    # generic parse_change_url "cannot determine platform"
+                    # message.  Any other shape (including Gerrit-style
+                    # URLs) keeps the platform-agnostic guidance.
+                    segs = [s for s in urlparse(_norm).path.split("/") if s]
+                    if segs and (segs[0] == "orgs" or len(segs) == 1):
+                        console.print(f"❌ Invalid URL: {org_err}")
+                    else:
+                        console.print(f"❌ Invalid URL: {change_err}")
                 else:
                     console.print(f"❌ Invalid URL: {repo_err}")
                 raise typer.Exit(1) from None

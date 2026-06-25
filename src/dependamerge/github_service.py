@@ -455,8 +455,12 @@ class GitHubService:
         :meth:`_iter_org_repositories`).  Fork repositories are also
         skipped: owner-wide bulk merges target the owner's own
         automation PRs, not PRs on mirrored forks.  The progress total
-        is published from the first page's ``totalCount`` so the
-        percentage display is immediately accurate.
+        is published from the first page's ``totalCount``, which counts
+        *all* of the owner's repositories — including the archived and
+        fork repos this iterator filters out — so the denominator is
+        approximate and the percentage can finish below 100%.  It is
+        close enough for a progress bar, matching
+        :meth:`_iter_org_repositories`.
         """
         root_key, query = await self._resolve_owner_root(owner)
         cursor: str | None = None
@@ -1049,7 +1053,15 @@ class GitHubService:
                     raise
                 except Exception as e:
                     if self._progress:
+                        # Count the error *and* mark the repository as
+                        # processed.  Without the ``complete_repository``
+                        # call the per-repo counter would never advance
+                        # for a failed repo, leaving the progress fraction
+                        # stuck below 100% and the "Scanning <repo>"
+                        # label stale once the run finishes.  Passing 0
+                        # adds nothing to the unmergeable tally.
                         self._progress.add_error()
+                        self._progress.complete_repository(0)
                     return [], [f"Error scanning repository {repo_full_name}: {e}"]
 
         all_prs: list[PullRequestInfo] = []

@@ -410,10 +410,12 @@ class AsyncMergeManager:
         # that every per-PR wait is clamped to (see
         # ``_wait_for_auto_merge``); ``0`` (``_no_wait``) skips waiting
         # entirely; ``None`` leaves each per-PR ``merge_timeout``
-        # uncapped (repository / similar-PR runs).  Reset first so a
-        # reused manager instance never carries a stale deadline from a
-        # previous run into this one.
+        # uncapped (repository / similar-PR runs).  Reset both first so a
+        # reused manager instance never carries a stale deadline — or a
+        # stale ``_no_wait`` flag — from a previous run into this one
+        # (``_max_wait`` may differ between runs on the same instance).
         self._run_deadline = None
+        self._no_wait = self._max_wait is not None and self._max_wait <= 0
         if self._max_wait is not None and self._max_wait > 0:
             self._run_deadline = asyncio.get_running_loop().time() + self._max_wait
 
@@ -575,7 +577,10 @@ class AsyncMergeManager:
             for repo, items in grouped.items()
         ]
 
-        # Workers never raise (each PR is wrapped defensively above).
+        # Workers swallow every per-PR exception (each PR is wrapped
+        # defensively above), so the only thing they can propagate is
+        # ``asyncio.CancelledError`` on shutdown — which ``gather``
+        # re-raises to tear the whole run down.
         await asyncio.gather(*tasks)
 
         return [result_by_index[i] for i in range(len(pr_list))]
@@ -4658,14 +4663,32 @@ class AsyncMergeManager:
                     pr_info.number,
                     exc,
                 )
-            await self._enable_auto_merge_for_pr(pr_info, owner, repo)
-            result.status = MergeStatus.AUTO_MERGE_PENDING
-            log_and_print(
-                self.log,
-                self._console,
-                f"⏳ Auto-merge armed (no-wait): {pr_info.html_url}",
-                level="info",
-            )
+            auto_ok = await self._enable_auto_merge_for_pr(pr_info, owner, repo)
+            if auto_ok:
+                result.status = MergeStatus.AUTO_MERGE_PENDING
+                log_and_print(
+                    self.log,
+                    self._console,
+                    f"⏳ Auto-merge armed (no-wait): {pr_info.html_url}",
+                    level="info",
+                )
+            else:
+                # Auto-merge could not be armed (e.g. the repository has
+                # the feature disabled), so nothing will merge this PR
+                # later.  Report BLOCKED rather than a misleading
+                # AUTO_MERGE_PENDING: the PR is left approved and rebased
+                # but will not merge on its own.
+                result.status = MergeStatus.BLOCKED
+                result.error = (
+                    "auto-merge unavailable (no-wait); PR approved and "
+                    "rebase requested but not merged"
+                )
+                log_and_print(
+                    self.log,
+                    self._console,
+                    f"🛑 Auto-merge unavailable (no-wait): {pr_info.html_url}",
+                    level="warning",
+                )
             return result
 
         # Dependabot: request a rebase (regenerates the lockfile +

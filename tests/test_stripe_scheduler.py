@@ -271,3 +271,35 @@ async def test_run_deadline_reset_between_runs_on_reused_manager():
 
     # The stale deadline from the first run was cleared.
     assert mgr._run_deadline is None
+
+
+@pytest.mark.asyncio
+async def test_no_wait_flag_reset_between_runs_on_reused_manager():
+    """A reused manager must not carry a stale ``_no_wait`` flag.
+
+    ``_no_wait`` (the fire-and-forget ``max_wait == 0`` mode) is derived
+    from ``_max_wait`` in ``__init__`` but must be recomputed at the
+    start of every run: if the same instance is later reconfigured for a
+    blocking run (``max_wait=None`` or ``> 0``), a stale ``_no_wait=True``
+    would otherwise wrongly skip all waits.
+    """
+    pr_list: list[PRPair] = [(_make_pr(1, "owner/a"), None)]
+
+    # First run in fire-and-forget mode sets ``_no_wait`` True.
+    mgr = AsyncMergeManager(
+        token="test_token",
+        concurrency=5,
+        preview_mode=True,
+        max_wait=0,
+    )
+    mgr._merge_single_pr = _Recorder()  # type: ignore[assignment]
+    await mgr.merge_prs_parallel(pr_list, stripe=True)
+    assert mgr._no_wait is True
+
+    # Reconfigure for an uncapped (blocking) run.
+    mgr._max_wait = None
+    mgr._merge_single_pr = _Recorder()  # type: ignore[assignment]
+    await mgr.merge_prs_parallel(pr_list, stripe=True)
+
+    # The stale fire-and-forget flag from the first run was cleared.
+    assert mgr._no_wait is False

@@ -414,6 +414,41 @@ class TestMergeOrgUrl:
         assert result.exit_code == 0, f"CLI failed: {result.stdout}"
         mock_check_perms.assert_not_called()
 
+    def test_ghe_owner_url_surfaces_owner_wide_message(self):
+        # Regression: an owner-shaped URL on a non-github host (e.g. GHE)
+        # must surface parse_org_url's actionable "only supported for
+        # github.com … use a direct PR URL" rejection, not the generic
+        # parse_change_url "cannot determine platform" message.
+        result = self.runner.invoke(
+            app,
+            ["merge", "https://ghe.example.com/acme", "--token", "test_token"],
+        )
+
+        assert result.exit_code == 1
+        out = _strip_ansi(result.stdout)
+        assert "❌ Invalid URL:" in out
+        assert "Owner-wide" in out
+        assert "cannot determine platform" not in out.lower()
+
+    def test_ghe_non_owner_url_keeps_platform_guidance(self):
+        # A non-owner-shaped URL on a non-github host keeps the
+        # platform-agnostic parse_change_url guidance (which also covers
+        # Gerrit), rather than the owner-wide github.com-only message.
+        result = self.runner.invoke(
+            app,
+            [
+                "merge",
+                "https://gerrit.example.org/c/project/sub/extra",
+                "--token",
+                "test_token",
+            ],
+        )
+
+        assert result.exit_code == 1
+        out = _strip_ansi(result.stdout)
+        assert "❌ Invalid URL:" in out
+        assert "Owner-wide" not in out
+
 
 class TestOrgConfirmationHash:
     """The owner confirmation token is deterministic and scoped."""
@@ -486,6 +521,57 @@ class TestFetchOwnerOpenPrs:
         assert len(errors) == 1
         assert "acme/bad" in errors[0]
         assert "kaboom" in errors[0]
+
+    @pytest.mark.asyncio
+    async def test_per_repo_error_marks_repository_complete(self):
+        # Regression for the Copilot finding: on a per-repo error the
+        # error path called start_repository + add_error but never
+        # complete_repository, so the completed-repositories counter
+        # stalled (progress fraction stuck < 100%) and the current
+        # repo/operation stayed stale.  Both the good and the bad repo
+        # must now be marked complete.
+        completed: list[int] = []
+        errors_added = 0
+
+        class _Progress:
+            def start_repository(self, name):  # noqa: D401
+                pass
+
+            def update_operation(self, msg):
+                pass
+
+            def complete_repository(self, count):
+                completed.append(count)
+
+            def add_error(self):
+                nonlocal errors_added
+                errors_added += 1
+
+        svc = GitHubService(token="test_token")
+        svc._progress = _Progress()  # type: ignore[assignment]
+
+        async def fake_iter(owner):
+            for name in ("acme/good", "acme/bad"):
+                yield {"nameWithOwner": name}
+
+        async def fake_collect(owner, repo, *, only_automation):
+            if repo == "bad":
+                raise RuntimeError("kaboom")
+            return [_make_pr(1, repo=f"{owner}/{repo}")]
+
+        svc._iter_owner_repositories = fake_iter  # type: ignore[assignment]
+        svc._collect_repo_open_prs = fake_collect  # type: ignore[assignment]
+
+        prs, errors = await svc.fetch_owner_open_prs("acme")
+        await svc.close()
+
+        assert [pr.repository_full_name for pr in prs] == ["acme/good"]
+        assert len(errors) == 1
+        assert errors_added == 1
+        # Both repositories (success and failure) are marked complete, so
+        # the counter reaches the repository total; the failed repo adds
+        # 0 to the unmergeable tally.
+        assert sorted(completed) == [0, 1]
 
     @pytest.mark.asyncio
     async def test_rate_limit_propagates(self):
