@@ -37,11 +37,16 @@ jobs:
     runs-on: 'ubuntu-latest'
     timeout-minutes: 20
     permissions:
-      # Read-only: the dry-run paths never need write scopes.  The
-      # default GITHUB_TOKEN can read public org/user data, which is all
-      # the report commands and PR discovery require for public targets.
-      contents: read
-      pull-requests: read
+      # The dry-run paths never need write scopes; read access to
+      # repository contents is required to check out and run the suite.
+      contents: read  # Checkout and run the test suite (read-only).
+      # Read-only access to pull-request metadata lets the suite discover
+      # open automation PRs to preview in --dry-run mode.
+      pull-requests: read  # Discover open PRs to preview (read-only).
+    # Bind to a dedicated environment so the secrets referenced below are
+    # scoped to (and can be protected by) that environment rather than
+    # being read directly from repository scope (zizmor: secrets-outside-env).
+    environment: integration
     env:
       # Opt in to the integration suite (otherwise it self-deselects).
       DEPENDAMERGE_RUN_INTEGRATION: '1'
@@ -75,6 +80,11 @@ jobs:
       - name: 'Checkout repository'
         # yamllint disable-line rule:line-length
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
+        with:
+          # This job only reads the repository and runs tests; it never
+          # pushes.  Drop the persisted token so it cannot leak via the
+          # local git config or uploaded artifacts (zizmor: artipacked).
+          persist-credentials: false
 
       - name: 'Set up uv and Python'
         # yamllint disable-line rule:line-length
