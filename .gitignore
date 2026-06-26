@@ -4,6 +4,9 @@
 # Secrets
 .secrets.*
 
+# Local commit-message scratch files
+.commit-msg.tmp
+
 # Local node cache
 node_modules
 

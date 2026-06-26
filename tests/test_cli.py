@@ -911,3 +911,262 @@ class TestRestartMergeProgressTracker:
         # ``--no-progress`` keeps the tracker absent; the plain-text
         # ticker provides feedback instead.
         assert ctx.progress_tracker is None
+
+
+class TestMergeDryRun:
+    """``merge --dry-run`` previews without writing or checking scopes.
+
+    Dry run is the mode the CI test matrix uses: it must run under a
+    read-only token (so the write-permission pre-flight is skipped) and
+    must never execute a real merge (so ``_run_parallel_merge`` is always
+    asked for a preview).
+    """
+
+    def setup_method(self):
+        self.runner = CliRunner()
+
+    @patch("dependamerge.cli._run_parallel_merge")
+    @patch("dependamerge.cli._check_merge_permissions")
+    @patch("dependamerge.cli.GitHubClient")
+    @patch("dependamerge.cli.PRComparator")
+    @patch("dependamerge.github_service.GitHubService")
+    def test_dry_run_skips_permission_check_and_previews(
+        self,
+        mock_service_class,
+        mock_comparator_class,
+        mock_client_class,
+        mock_check,
+        mock_run_parallel,
+    ):
+        from dependamerge.merge_manager import MergeResult, MergeStatus
+
+        mock_client = Mock()
+        mock_client_class.return_value = mock_client
+        mock_comparator_class.return_value = Mock()
+        mock_service = Mock()
+        mock_service_class.return_value = mock_service
+
+        mock_client.parse_pr_url.return_value = ("owner", "repo", 22)
+        mock_client.is_automation_author.return_value = True
+        mock_client.get_pr_status_details.return_value = "Ready to merge"
+
+        source_pr = PullRequestInfo(
+            number=22,
+            title="Chore: Bump actions/checkout from 4 to 5",
+            body="Bumps actions/checkout",
+            author="dependabot[bot]",
+            head_sha="abc123",
+            base_branch="main",
+            head_branch="dependabot/github_actions/actions/checkout-5",
+            state="open",
+            mergeable=True,
+            mergeable_state="clean",
+            behind_by=0,
+            files_changed=[],
+            repository_full_name="owner/repo",
+            html_url="https://github.com/owner/repo/pull/22",
+        )
+        mock_client.get_pull_request_info.return_value = source_pr
+
+        async def mock_find_similar_prs(*args, **kwargs):
+            return []
+
+        async def mock_close():
+            return None
+
+        mock_service.find_similar_prs = mock_find_similar_prs
+        mock_service.close = mock_close
+
+        captured: dict[str, object] = {}
+
+        def _capture(ctx, prs, *, preview, **kwargs):
+            captured["preview"] = preview
+            return [MergeResult(pr_info=source_pr, status=MergeStatus.MERGED)]
+
+        mock_run_parallel.side_effect = _capture
+
+        result = self.runner.invoke(
+            app,
+            [
+                "merge",
+                "--dry-run",
+                "https://github.com/owner/repo/pull/22",
+                "--token",
+                "test_token",
+            ],
+        )
+
+        assert result.exit_code == 0, result.stdout
+        # The write-permission pre-flight must be skipped under dry run.
+        mock_check.assert_not_called()
+        # The merge must run in preview mode (no real merge).
+        assert captured.get("preview") is True
+        assert "Dry run" in result.stdout
+
+    @patch("dependamerge.cli._run_parallel_merge")
+    @patch("dependamerge.cli._check_merge_permissions")
+    @patch("dependamerge.cli.GitHubClient")
+    @patch("dependamerge.cli.PRComparator")
+    @patch("dependamerge.github_service.GitHubService")
+    def test_dry_run_forces_preview_even_with_no_confirm(
+        self,
+        mock_service_class,
+        mock_comparator_class,
+        mock_client_class,
+        mock_check,
+        mock_run_parallel,
+    ):
+        """``--dry-run --no-confirm`` must still preview, never merge."""
+        from dependamerge.merge_manager import MergeResult, MergeStatus
+
+        mock_client = Mock()
+        mock_client_class.return_value = mock_client
+        mock_comparator_class.return_value = Mock()
+        mock_service = Mock()
+        mock_service_class.return_value = mock_service
+
+        mock_client.parse_pr_url.return_value = ("owner", "repo", 22)
+        mock_client.is_automation_author.return_value = True
+        mock_client.get_pr_status_details.return_value = "Ready to merge"
+
+        source_pr = PullRequestInfo(
+            number=22,
+            title="Chore: Bump actions/checkout from 4 to 5",
+            body="Bumps actions/checkout",
+            author="dependabot[bot]",
+            head_sha="abc123",
+            base_branch="main",
+            head_branch="dependabot/github_actions/actions/checkout-5",
+            state="open",
+            mergeable=True,
+            mergeable_state="clean",
+            behind_by=0,
+            files_changed=[],
+            repository_full_name="owner/repo",
+            html_url="https://github.com/owner/repo/pull/22",
+        )
+        mock_client.get_pull_request_info.return_value = source_pr
+
+        async def mock_find_similar_prs(*args, **kwargs):
+            return []
+
+        async def mock_close():
+            return None
+
+        mock_service.find_similar_prs = mock_find_similar_prs
+        mock_service.close = mock_close
+
+        captured: dict[str, object] = {}
+
+        def _capture(ctx, prs, *, preview, **kwargs):
+            captured["preview"] = preview
+            return [MergeResult(pr_info=source_pr, status=MergeStatus.MERGED)]
+
+        mock_run_parallel.side_effect = _capture
+
+        result = self.runner.invoke(
+            app,
+            [
+                "merge",
+                "--dry-run",
+                "--no-confirm",
+                "https://github.com/owner/repo/pull/22",
+                "--token",
+                "test_token",
+            ],
+        )
+
+        assert result.exit_code == 0, result.stdout
+        mock_check.assert_not_called()
+        assert captured.get("preview") is True
+        assert "Dry run" in result.stdout
+
+
+class TestCloseDryRun:
+    """``close --dry-run`` previews without closing and without prompting."""
+
+    def setup_method(self):
+        self.runner = CliRunner()
+
+    @patch("dependamerge.cli.AsyncCloseManager")
+    @patch("dependamerge.cli.GitHubClient")
+    @patch("dependamerge.cli.PRComparator")
+    @patch("dependamerge.github_service.GitHubService")
+    def test_close_dry_run_previews_without_closing(
+        self,
+        mock_service_class,
+        mock_comparator_class,
+        mock_client_class,
+        mock_close_manager_class,
+    ):
+        from dependamerge.close_manager import CloseResult, CloseStatus
+
+        mock_client = Mock()
+        mock_client_class.return_value = mock_client
+        mock_client.token = "test_token"
+        mock_comparator_class.return_value = Mock()
+        mock_service = Mock()
+        mock_service_class.return_value = mock_service
+
+        mock_client.parse_pr_url.return_value = ("owner", "repo", 22)
+        mock_client.is_automation_author.return_value = True
+        mock_client.get_pr_status_details.return_value = "Ready to merge"
+
+        source_pr = PullRequestInfo(
+            number=22,
+            title="Chore: Bump actions/checkout from 4 to 5",
+            body="Bumps actions/checkout",
+            author="dependabot[bot]",
+            head_sha="abc123",
+            base_branch="main",
+            head_branch="dependabot/github_actions/actions/checkout-5",
+            state="open",
+            mergeable=True,
+            mergeable_state="clean",
+            behind_by=0,
+            files_changed=[],
+            repository_full_name="owner/repo",
+            html_url="https://github.com/owner/repo/pull/22",
+        )
+        mock_client.get_pull_request_info.return_value = source_pr
+
+        async def mock_find_similar_prs(*args, **kwargs):
+            return []
+
+        async def mock_close():
+            return None
+
+        mock_service.find_similar_prs = mock_find_similar_prs
+        mock_service.close = mock_close
+
+        captured: dict[str, object] = {}
+
+        # Stub the async context-manager close manager so we can assert
+        # it is only ever asked to *preview* (never to actually close).
+        close_manager = AsyncMock()
+        close_manager.close_prs_parallel = AsyncMock(
+            return_value=[CloseResult(pr_info=source_pr, status=CloseStatus.CLOSED)]
+        )
+
+        def _capture_close_manager(*args, **kwargs):
+            captured["preview_mode"] = kwargs.get("preview_mode")
+            return close_manager
+
+        mock_close_manager_class.side_effect = _capture_close_manager
+
+        result = self.runner.invoke(
+            app,
+            [
+                "close",
+                "--dry-run",
+                "--no-progress",
+                "https://github.com/owner/repo/pull/22",
+                "--token",
+                "test_token",
+            ],
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert "Dry run" in result.stdout
+        # The close manager must have been constructed in preview mode.
+        assert captured.get("preview_mode") is True

@@ -310,47 +310,29 @@ class GitHubService:
     # -------------------------------------------------
 
     async def _iter_org_repositories(self, org: str) -> AsyncIterator[dict[str, Any]]:
-        """Iterate non-archived repositories, setting the progress total on the first page.
+        """Iterate an owner's non-archived repositories (forks included).
 
-        The ``ORG_REPOS_ONLY`` query now returns ``totalCount`` on
-        the ``repositories`` connection, so the very first page
-        gives us an accurate denominator for the progress bar
-        without a separate counting pass.
+        Despite the historical name, this works for both organizations
+        and personal user accounts: the correct GraphQL root
+        (``organization`` vs ``user``) is resolved once at runtime via
+        :meth:`_resolve_owner_root`, so org-wide *read* operations
+        (``status``, ``blocked``, and ``close``'s similar-PR scan) no
+        longer fail with a ``NOT_FOUND`` error when handed a user
+        account.  This mirrors the owner-aware enumeration the merge
+        path already uses via :meth:`_iter_owner_repositories`.
 
-        This replaces the former two-method design
-        (``_count_org_repositories`` + old ``_iter_org_repositories``)
-        with a single GraphQL pagination pass, cutting API calls by
-        roughly one-third for org-wide operations.
+        Unlike :meth:`_iter_owner_repositories`, fork repositories are
+        *not* skipped here: the read-only reporting commands want a
+        complete picture of every repository the owner has, whereas the
+        bulk-merge path deliberately excludes forks.  The progress total
+        is published from the first page's ``totalCount``, which counts
+        *all* of the owner's repositories — including the archived repos
+        this iterator filters out — so the denominator is approximate and
+        the percentage can finish below 100%.  It is close enough for a
+        progress bar.
         """
-        cursor: str | None = None
-        total_set = False
-        while True:
-            variables = {"org": org, "reposCursor": cursor}
-            data = await self._api.graphql(ORG_REPOS_ONLY, variables)
-            repos = (
-                ((data or {}).get("organization") or {}).get("repositories") or {}
-            )
-
-            # On the first page, publish the total to the progress
-            # tracker so the percentage display is immediately
-            # accurate.  totalCount includes archived repos, but
-            # the denominator is close enough for a progress bar.
-            if not total_set:
-                total_count = repos.get("totalCount")
-                if total_count is not None and self._progress:
-                    self._progress.update_total_repositories(total_count)
-                total_set = True
-
-            nodes: list[dict[str, Any]] = repos.get("nodes", []) or []
-            for repo in nodes:
-                if repo.get("isArchived"):
-                    continue
-                yield repo
-
-            page_info = repos.get("pageInfo") or {}
-            if not page_info.get("hasNextPage"):
-                break
-            cursor = page_info.get("endCursor")
+        async for repo in self._iter_owner_repositories(org, skip_forks=False):
+            yield repo
 
     async def _iter_org_repositories_with_open_prs(
         self, org: str
@@ -443,24 +425,24 @@ class GitHubService:
         return "not_found" in msg and "organization" in msg
 
     async def _iter_owner_repositories(
-        self, owner: str
+        self, owner: str, *, skip_forks: bool = True
     ) -> AsyncIterator[dict[str, Any]]:
-        """Iterate an owner's non-archived, non-fork repositories.
+        """Iterate an owner's non-archived repositories.
 
         Works for both organizations and personal user accounts: the
         correct GraphQL root is resolved once via
         :meth:`_resolve_owner_root` and reused for every page.
 
-        Archived repositories are skipped (consistent with
-        :meth:`_iter_org_repositories`).  Fork repositories are also
-        skipped: owner-wide bulk merges target the owner's own
-        automation PRs, not PRs on mirrored forks.  The progress total
-        is published from the first page's ``totalCount``, which counts
+        Archived repositories are always skipped.  Fork repositories are
+        skipped by default (``skip_forks=True``): owner-wide bulk merges
+        target the owner's own automation PRs, not PRs on mirrored
+        forks.  Read-only reporting paths pass ``skip_forks=False`` to
+        include forks for a complete picture.  The progress total is
+        published from the first page's ``totalCount``, which counts
         *all* of the owner's repositories — including the archived and
-        fork repos this iterator filters out — so the denominator is
-        approximate and the percentage can finish below 100%.  It is
-        close enough for a progress bar, matching
-        :meth:`_iter_org_repositories`.
+        (when filtered) fork repos this iterator skips — so the
+        denominator is approximate and the percentage can finish below
+        100%.  It is close enough for a progress bar.
         """
         root_key, query = await self._resolve_owner_root(owner)
         cursor: str | None = None
@@ -481,7 +463,7 @@ class GitHubService:
             for repo in nodes:
                 if repo.get("isArchived"):
                     continue
-                if repo.get("isFork"):
+                if skip_forks and repo.get("isFork"):
                     continue
                 yield repo
 
@@ -728,9 +710,7 @@ class GitHubService:
             base_repo_clone_url=_clone_url_with_git_suffix(
                 (pr.get("baseRepository") or {}).get("url")
             ),
-            is_fork=_bool_or_none(
-                (pr.get("headRepository") or {}).get("isFork")
-            ),
+            is_fork=_bool_or_none((pr.get("headRepository") or {}).get("isFork")),
         )
 
     async def find_similar_prs(
@@ -990,9 +970,7 @@ class GitHubService:
 
         if self._progress:
             self._progress.start_repository(repo_full_name)
-            self._progress.update_operation(
-                f"Fetching open PRs from {repo_full_name}"
-            )
+            self._progress.update_operation(f"Fetching open PRs from {repo_full_name}")
 
         results = await self._collect_repo_open_prs(
             owner, repo, only_automation=only_automation

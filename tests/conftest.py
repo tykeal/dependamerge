@@ -73,10 +73,60 @@ See Also
 
 from __future__ import annotations
 
+import os
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+
 from dependamerge.merge_manager import AsyncMergeManager
+
+_RUN_INTEGRATION_ENV = "DEPENDAMERGE_RUN_INTEGRATION"
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register the ``--run-integration`` opt-in flag.
+
+    Live integration tests (see ``tests/integration``) hit real GitHub /
+    Gerrit servers.  They already self-skip when credentials are absent,
+    but they must not run as part of the ordinary unit-test suite even
+    when a token happens to be present in the environment, because they
+    are slow and network-dependent.  They run only when explicitly
+    requested via ``--run-integration`` or the
+    ``DEPENDAMERGE_RUN_INTEGRATION`` environment variable.
+    """
+    parser.addoption(
+        "--run-integration",
+        action="store_true",
+        default=False,
+        help="Run live GitHub/Gerrit integration tests (marked 'integration').",
+    )
+
+
+def _integration_enabled(config: pytest.Config) -> bool:
+    if config.getoption("--run-integration"):
+        return True
+    return os.environ.get(_RUN_INTEGRATION_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Skip ``integration`` tests unless explicitly opted in."""
+    if _integration_enabled(config):
+        return
+    skip_integration = pytest.mark.skip(
+        reason="integration tests disabled (pass --run-integration or set "
+        f"{_RUN_INTEGRATION_ENV}=1)"
+    )
+    for item in items:
+        if "integration" in item.keywords:
+            item.add_marker(skip_integration)
 
 
 def make_merge_manager(**overrides: Any) -> tuple[AsyncMergeManager, AsyncMock]:
