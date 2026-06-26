@@ -3628,7 +3628,7 @@ def _display_status_results(status_result, output_format: str):
     for tool in AUTOMATION_TOOLS:
         # Format tool names nicely
         if tool == "[bot]":
-            console.print("  • Any bot account")
+            console.print("  • Any other [bot] account")
         elif tool == "pre-commit":
             console.print("  • pre-commit.ci")
         elif tool == "github-actions":
