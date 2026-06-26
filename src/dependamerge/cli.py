@@ -711,10 +711,10 @@ def _scan_and_find_similar(ctx: _MergeContext) -> None:
     assert ctx.source_pr is not None
     assert ctx.comparator is not None
 
-    console.print(f"Checking organization: {ctx.owner}")
+    console.print(f"Checking owner: {ctx.owner}")
 
     # Start the progress tracker now — this is where the
-    # long-running org-wide scan begins.
+    # long-running owner-wide scan begins.
     if ctx.progress_tracker:
         ctx.progress_tracker.start()
 
@@ -777,7 +777,7 @@ def _scan_and_find_similar(ctx: _MergeContext) -> None:
         # Not a failure: the supplied PR is simply the only one to
         # merge.  Use a neutral "skip ahead" glyph rather than ❌ so
         # the output does not read like an error.
-        console.print("⏩ No similar PRs found in the organization")
+        console.print("⏩ No similar PRs found for this owner")
 
     for target_pr, comparison in ctx.all_similar_prs:
         console.print(f"  • {target_pr.repository_full_name} #{target_pr.number}")
@@ -2224,7 +2224,7 @@ def merge(
 
     1. Analyze the provided PR
 
-    2. Find similar PRs in the organization
+    2. Find similar PRs across the owner (organization or user account)
 
     3. Approve and merge matching PRs
 
@@ -2768,7 +2768,8 @@ def close(
     ),
 ):
     """
-    Bulk close pull requests across a GitHub organization.
+    Bulk close pull requests across a GitHub owner (organization or user
+    account).
 
     By default, runs in interactive mode showing what changes will apply,
     then prompts to proceed with closing. Use --no-confirm to close immediately.
@@ -2777,7 +2778,7 @@ def close(
 
     1. Analyze the provided PR
 
-    2. Find similar PRs in the organization
+    2. Find similar PRs across the owner (organization or user account)
 
     3. Close matching PRs
 
@@ -2882,11 +2883,11 @@ def close(
                 "Override SHA validated. Proceeding with non-automation PR close."
             )
 
-        # Find similar PRs in the organization
+        # Find similar PRs across the owner (organization or user)
         if progress_tracker:
             console.print()
         else:
-            console.print(f"\nChecking organization: {owner}")
+            console.print(f"\nChecking owner: {owner}")
 
         # Use GitHubService for async PR finding
         from .github_service import GitHubService
@@ -2937,7 +2938,7 @@ def close(
             # Not a failure: the supplied PR is simply the only one to
             # close.  Use a neutral glyph rather than ❌ so the output
             # does not read like an error.
-            console.print("⏩ No similar PRs found in the organization")
+            console.print("⏩ No similar PRs found for this owner")
 
         for target_pr, comparison in all_similar_prs:
             console.print(f"  • {target_pr.repository_full_name} #{target_pr.number}")
@@ -3172,7 +3173,8 @@ def status(
     3. Count open and merged pull requests
     4. Identify PRs affecting actions or workflows
 
-    Automation tools supported: dependabot, pre-commit.ci, GitHub Copilot
+    Automation tools supported: Dependabot, Renovate, pre-commit.ci,
+    GitHub Actions, GitHub Copilot, and any other [bot] account.
     """
     # Parse owner login from input (handles a bare login plus every
     # GitHub owner URL form, including /orgs/owner/repositories).

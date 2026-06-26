@@ -609,6 +609,10 @@ def parse_owner_arg(value: str) -> str:
     # "lfreleng-actions" and the historical "lfreleng-actions/" form keep
     # working.
     bare = value.rstrip("/")
+    if not bare:
+        # The input was only slashes (e.g. "////"); there is no login to
+        # extract, so treat it the same as an empty value.
+        raise UrlParseError("Owner name or URL cannot be empty")
     if "/" not in bare and "://" not in bare:
         return bare
 

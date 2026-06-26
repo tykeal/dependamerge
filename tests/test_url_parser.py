@@ -580,6 +580,11 @@ class TestParseOwnerArg:
     def test_bare_login_with_multiple_trailing_slashes(self):
         assert parse_owner_arg("lfreleng-actions//") == "lfreleng-actions"
 
+    def test_slashes_only_raises(self):
+        """Input consisting only of slashes has no login to extract."""
+        with pytest.raises(UrlParseError, match="cannot be empty"):
+            parse_owner_arg("////")
+
     def test_https_owner_url(self):
         assert (
             parse_owner_arg("https://github.com/lfreleng-actions") == "lfreleng-actions"

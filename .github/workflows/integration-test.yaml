@@ -45,22 +45,32 @@ jobs:
     env:
       # Opt in to the integration suite (otherwise it self-deselects).
       DEPENDAMERGE_RUN_INTEGRATION: '1'
-      # Prefer a dedicated read-only PAT when provided (needed only to
-      # reach private repositories or to raise rate limits); otherwise
-      # fall back to the workflow token, which suffices for public
-      # targets.  The tests skip cleanly if neither yields a usable token.
+      # Prefer a dedicated read-only PAT only on manual (workflow_dispatch)
+      # runs, where the trigger is operator-controlled.  On pull_request
+      # runs fall back to the automatic workflow token, so a compromised
+      # branch can never exfiltrate the long-lived PAT.  The workflow token
+      # can read public org/user data, which is all the report commands and
+      # PR discovery need for public targets; the tests skip cleanly if the
+      # token cannot reach the target.
       GITHUB_TOKEN: >-
-        ${{ secrets.INTEGRATION_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+        ${{ (github.event_name == 'workflow_dispatch'
+        && secrets.INTEGRATION_GITHUB_TOKEN) || secrets.GITHUB_TOKEN }}
       # Optional target overrides (defaults: org lfreleng-actions,
       # user ModeSevenIndustrialSolutions).
       DEPENDAMERGE_IT_ORG: ${{ vars.DEPENDAMERGE_IT_ORG }}
       DEPENDAMERGE_IT_USER: ${{ vars.DEPENDAMERGE_IT_USER }}
       # Optional Gerrit configuration; the Gerrit test skips without it.
+      # Inject the Gerrit credentials only on manual runs so they are never
+      # exposed to pull_request runs (where the Gerrit test self-skips).
       DEPENDAMERGE_IT_GERRIT_HOST: ${{ vars.DEPENDAMERGE_IT_GERRIT_HOST }}
       DEPENDAMERGE_IT_GERRIT_BASE_PATH: >-
         ${{ vars.DEPENDAMERGE_IT_GERRIT_BASE_PATH }}
-      GERRIT_USERNAME: ${{ secrets.GERRIT_USERNAME }}
-      GERRIT_PASSWORD: ${{ secrets.GERRIT_PASSWORD }}
+      GERRIT_USERNAME: >-
+        ${{ github.event_name == 'workflow_dispatch'
+        && secrets.GERRIT_USERNAME || '' }}
+      GERRIT_PASSWORD: >-
+        ${{ github.event_name == 'workflow_dispatch'
+        && secrets.GERRIT_PASSWORD || '' }}
     steps:
       - name: 'Checkout repository'
         # yamllint disable-line rule:line-length
