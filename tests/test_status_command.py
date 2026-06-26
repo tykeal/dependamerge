@@ -94,6 +94,13 @@ class TestStatusCommand:
         assert "repo1" in result.stdout
         assert "repo2" in result.stdout
 
+        # Summary table reports the open-PR human/automation split and a
+        # combined total alongside the repository count.
+        assert "Automation PRs" in result.stdout
+        assert "Human" in result.stdout
+        assert "Total PRs" in result.stdout
+        assert "Total Repositories" in result.stdout
+
     @patch("dependamerge.github_service.GitHubService")
     def test_status_command_json_output(self, mock_service_class):
         """Test status command with JSON output format."""

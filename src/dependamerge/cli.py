@@ -3640,6 +3640,21 @@ def _display_status_results(status_result, output_format: str):
     summary_table.add_column("Summary", style="cyan")
     summary_table.add_column("Value", style="white")
 
+    # Aggregate open-PR counts across all scanned repositories.  The
+    # per-repository "PRs Open" column shows human / automation, so the
+    # summary totals those same open-PR figures and reports the split
+    # before the combined total.
+    total_automation_prs = sum(
+        repo.open_prs_automation for repo in status_result.repository_statuses
+    )
+    total_human_prs = sum(
+        repo.open_prs_human for repo in status_result.repository_statuses
+    )
+
+    summary_table.add_row("🤖 Automation PRs", str(total_automation_prs))
+    summary_table.add_row("🤷 Human      PRs", str(total_human_prs))
+    summary_table.add_section()
+    summary_table.add_row("Total PRs", str(total_automation_prs + total_human_prs))
     summary_table.add_row("Total Repositories", str(status_result.total_repositories))
 
     # Only show Scanned Repositories if it differs from Total
