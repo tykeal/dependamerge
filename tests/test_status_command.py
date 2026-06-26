@@ -100,6 +100,8 @@ class TestStatusCommand:
         assert "Human" in result.stdout
         assert "Total PRs" in result.stdout
         assert "Total Repositories" in result.stdout
+        # GitHub Copilot is listed among the supported automation tools.
+        assert "GitHub Copilot" in result.stdout
 
     @patch("dependamerge.github_service.GitHubService")
     def test_status_command_json_output(self, mock_service_class):

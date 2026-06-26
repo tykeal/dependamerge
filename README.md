@@ -43,6 +43,7 @@ of dependency updates. Supports common automation tools:
 - Dependabot
 - pre-commit.ci
 - Renovate
+- GitHub Copilot
 
 Also works for individual GitHub users when provided with an override flag.
 
@@ -99,6 +100,7 @@ GitHub organisation. Works with the same automation tools as merge:
 - Dependabot
 - pre-commit.ci
 - Renovate
+- GitHub Copilot
 
 Also works for individual GitHub users when provided with an override flag.
 

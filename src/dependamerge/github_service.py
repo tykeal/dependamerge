@@ -48,6 +48,7 @@ AUTOMATION_TOOLS = [
     "renovate",
     "pre-commit",
     "github-actions",
+    "copilot",
     "[bot]",
 ]
 

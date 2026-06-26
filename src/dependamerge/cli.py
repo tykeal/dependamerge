@@ -3172,7 +3172,7 @@ def status(
     3. Count open and merged pull requests
     4. Identify PRs affecting actions or workflows
 
-    Automation tools supported: dependabot, pre-commit.ci
+    Automation tools supported: dependabot, pre-commit.ci, GitHub Copilot
     """
     # Parse owner login from input (handles a bare login plus every
     # GitHub owner URL form, including /orgs/owner/repositories).
@@ -3633,6 +3633,8 @@ def _display_status_results(status_result, output_format: str):
             console.print("  • pre-commit.ci")
         elif tool == "github-actions":
             console.print("  • GitHub Actions")
+        elif tool == "copilot":
+            console.print("  • GitHub Copilot")
         else:
             console.print(f"  • {tool.capitalize()}")
     console.print()
