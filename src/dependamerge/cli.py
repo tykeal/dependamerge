@@ -1243,14 +1243,15 @@ def _handle_repo_merge(
             console.print("\n❌ Merge cancelled by user.")
             return
     elif human_prs and ctx.dry_run:
+        # Human PRs only reach this branch when --include-human-prs was
+        # supplied (otherwise they are filtered out at fetch time).  A dry
+        # run performs no writes, so keep them in the preview to faithfully
+        # mirror what a real --include-human-prs run would attempt; a real
+        # run would prompt for confirmation first (unless --no-confirm).
         console.print(
-            "\nℹ️ Dry run: excluding human-authored PRs "
-            "(a real run would prompt before including them)."
+            "\nℹ️ Dry run: human-authored PRs are kept in this preview "
+            "(a real run would prompt before merging them)."
         )
-        repo_prs = automation_prs
-        if not repo_prs:
-            console.print("❌ No automation PRs remain to merge.")
-            return
 
     # --- Build the merge list (ComparisonResult is None for repo mode) ---
     all_prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]] = [
@@ -1661,14 +1662,15 @@ def _handle_org_merge(
             console.print("\n❌ Merge cancelled by user.")
             return
     elif human_prs and ctx.dry_run:
+        # Human PRs only reach this branch when --include-human-prs was
+        # supplied (otherwise they are filtered out at fetch time).  A dry
+        # run performs no writes, so keep them in the preview to faithfully
+        # mirror what a real --include-human-prs run would attempt; a real
+        # run would prompt for confirmation first (unless --no-confirm).
         console.print(
-            "\nℹ️ Dry run: excluding human-authored PRs "
-            "(a real run would prompt before including them)."
+            "\nℹ️ Dry run: human-authored PRs are kept in this preview "
+            "(a real run would prompt before merging them)."
         )
-        owner_prs = automation_prs
-        if not owner_prs:
-            console.print("❌ No automation PRs remain to merge.")
-            return
 
     # --- Build the merge list (ComparisonResult is None for owner mode) ---
     all_prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]] = [
