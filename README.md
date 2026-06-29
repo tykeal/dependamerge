@@ -43,6 +43,7 @@ of dependency updates. Supports common automation tools:
 - Dependabot
 - pre-commit.ci
 - Renovate
+- GitHub Copilot
 
 Also works for individual GitHub users when provided with an override flag.
 
@@ -99,6 +100,7 @@ GitHub organisation. Works with the same automation tools as merge:
 - Dependabot
 - pre-commit.ci
 - Renovate
+- GitHub Copilot
 
 Also works for individual GitHub users when provided with an override flag.
 
@@ -654,6 +656,34 @@ Enter the string above to continue (or press Enter to cancel):
 🚀 Final Results: 2 merged, 0 failed
 ```
 
+### Dry Run Mode
+
+Use `--dry-run` to perform a complete analysis and preview without making any
+changes. A dry run never approves, merges, rebases, or closes anything, and it
+skips the write-permission pre-flight check, so it runs under a token without
+write access. This makes it ideal for CI validation and for inspecting what
+the tool *would* do before committing to it:
+
+```bash
+# Preview a single PR (and its similar PRs) without merging
+dependamerge merge https://github.com/owner/repo/pull/123 --dry-run
+
+# Preview an owner-wide run under a token without write access
+dependamerge merge https://github.com/owner --dry-run --no-progress
+
+# Preview which PRs close would target, without closing them
+dependamerge close https://github.com/owner/repo/pull/123 --dry-run
+
+# Preview a Gerrit change without applying +2 or submitting
+dependamerge merge https://gerrit.example.org/c/project/+/12345 --dry-run
+```
+
+The repository's `Integration Tests (dry-run)` workflow exercises every
+sub-command in this mode against live GitHub (and, when configured, Gerrit)
+on each pull request, so it catches owner-resolution and command regressions
+before release. The integration suite self-skips when credentials or open
+automation PRs are absent, so it never fails on an empty target space.
+
 ### Custom Merge Options
 
 ```bash
@@ -687,6 +717,11 @@ dependamerge merge https://github.com/owner/repo/pull/123 \
 
 - `--no-confirm`: Skip confirmation prompt and merge without delay (default is
   interactive mode)
+- `--dry-run`: Analyze and preview without making changes - never approve,
+  merge, rebase, or close anything. Skips the write-permission pre-flight so it
+  runs under a token without write access (e.g. in CI). Implies preview mode and
+  suppresses confirmation prompts. Works for GitHub PR, repository, and
+  owner-wide URLs as well as Gerrit changes.
 - `--threshold FLOAT`: Similarity threshold for matching PRs/changes (0.0-1.0,
   default: 0.8)
 - `--progress/--no-progress`: Show real-time progress updates (default:
@@ -729,6 +764,9 @@ Fallback variables:
 #### Close Command Options
 
 - `--no-confirm`: Skip confirmation prompt and close without preview
+- `--dry-run`: Analyze and preview without making changes - never close
+  anything. Suppresses the confirmation prompt so it runs unattended under a
+  token without write access (e.g. in CI).
 - `--threshold FLOAT`: Similarity threshold for matching PRs (0.0-1.0,
   default: 0.8)
 - `--progress/--no-progress`: Show real-time progress updates (default:
@@ -1045,6 +1083,36 @@ You can pass args as usual:
 ```bash
 uv run pytest -k "similarity and not slow" -vv
 ```
+
+#### Live Integration Tests
+
+Live integration tests (under `tests/integration/`) drive the real CLI in
+`--dry-run` mode against GitHub and Gerrit, exercising every sub-command
+(`status`, `blocked`, `merge`, `close`) against both organization and personal
+accounts and across every supported owner-URL form. Pytest deselects them by
+default; opt in via `--run-integration` (or `DEPENDAMERGE_RUN_INTEGRATION=1`).
+Each test fails safe: it skips when its credentials or an open automation PR are
+not available, so it never mutates a repository and never fails on an empty
+target space.
+
+```bash
+# GitHub integration tests (needs a token; a token without write access works)
+GITHUB_TOKEN=... uv run pytest tests/integration --run-integration --no-cov
+
+# Point at different targets (defaults: org lfreleng-actions,
+# user ModeSevenIndustrialSolutions)
+DEPENDAMERGE_IT_ORG=my-org DEPENDAMERGE_IT_USER=my-user \
+  GITHUB_TOKEN=... uv run pytest tests/integration --run-integration --no-cov
+
+# Gerrit integration test (skips unless the host and credentials are present)
+DEPENDAMERGE_IT_GERRIT_HOST=gerrit.example.org \
+  DEPENDAMERGE_IT_GERRIT_BASE_PATH=r \
+  GERRIT_USERNAME=... GERRIT_PASSWORD=... \
+  uv run pytest tests/integration/test_live_gerrit.py --run-integration --no-cov
+```
+
+The `Integration Tests (dry-run)` GitHub Actions workflow runs this suite on
+every pull request with read-scoped permissions.
 
 #### Pre-commit Integration
 

@@ -1,0 +1,104 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Runs the live dry-run integration tests against GitHub (and optionally
+# Gerrit).  Everything runs read-only: report commands are read-only by
+# nature and the merge/close commands use --dry-run, which previews
+# without approving, merging, rebasing or closing and skips the
+# write-permission pre-flight.  The tests self-skip when credentials or
+# open automation PRs are absent, so this workflow never mutates a
+# repository and never fails on an empty target space.
+name: 'Integration Tests (dry-run)'
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches:
+      - main
+      - master
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - '.github/workflows/integration-test.yaml'
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  integration:
+    name: 'Live dry-run integration tests'
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 20
+    permissions:
+      # The dry-run paths never need write scopes; read access to
+      # repository contents is required to check out and run the suite.
+      contents: read  # Checkout and run the test suite (read-only).
+      # Read-only access to pull-request metadata lets the suite discover
+      # open automation PRs to preview in --dry-run mode.
+      pull-requests: read  # Discover open PRs to preview (read-only).
+    # Bind to a dedicated environment so the secrets referenced below are
+    # scoped to (and can be protected by) that environment rather than
+    # being read directly from repository scope (zizmor: secrets-outside-env).
+    environment: integration
+    env:
+      # Opt in to the integration suite (otherwise it self-deselects).
+      DEPENDAMERGE_RUN_INTEGRATION: '1'
+      # Prefer a dedicated read-only PAT only on manual (workflow_dispatch)
+      # runs, where the trigger is operator-controlled.  On pull_request
+      # runs fall back to the automatic workflow token, so a compromised
+      # branch can never exfiltrate the long-lived PAT.  The workflow token
+      # can read public org/user data, which is all the report commands and
+      # PR discovery need for public targets; the tests skip cleanly if the
+      # token cannot reach the target.
+      GITHUB_TOKEN: >-
+        ${{ (github.event_name == 'workflow_dispatch'
+        && secrets.INTEGRATION_GITHUB_TOKEN) || secrets.GITHUB_TOKEN }}
+      # Optional target overrides (defaults: org lfreleng-actions,
+      # user ModeSevenIndustrialSolutions).
+      DEPENDAMERGE_IT_ORG: ${{ vars.DEPENDAMERGE_IT_ORG }}
+      DEPENDAMERGE_IT_USER: ${{ vars.DEPENDAMERGE_IT_USER }}
+      # Optional Gerrit configuration; the Gerrit test skips without it.
+      # Inject the Gerrit credentials only on manual runs so they are never
+      # exposed to pull_request runs (where the Gerrit test self-skips).
+      DEPENDAMERGE_IT_GERRIT_HOST: ${{ vars.DEPENDAMERGE_IT_GERRIT_HOST }}
+      DEPENDAMERGE_IT_GERRIT_BASE_PATH: >-
+        ${{ vars.DEPENDAMERGE_IT_GERRIT_BASE_PATH }}
+      GERRIT_USERNAME: >-
+        ${{ github.event_name == 'workflow_dispatch'
+        && secrets.GERRIT_USERNAME || '' }}
+      GERRIT_PASSWORD: >-
+        ${{ github.event_name == 'workflow_dispatch'
+        && secrets.GERRIT_PASSWORD || '' }}
+    steps:
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
+        with:
+          # This job only reads the repository and runs tests; it never
+          # pushes.  Drop the persisted token so it cannot leak via the
+          # local git config or uploaded artifacts (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: 'Set up uv and Python'
+        # yamllint disable-line rule:line-length
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: 'Install project with test dependencies'
+        run: uv sync
+
+      - name: 'Run live dry-run integration tests'
+        # --run-integration enables the suite; --no-cov avoids the
+        # coverage gate, which is meaningless for a network-gated subset
+        # that self-skips when targets are empty.
+        run: >-
+          uv run pytest tests/integration
+          --run-integration --no-cov -ra

@@ -16,6 +16,8 @@ from dependamerge.url_parser import (
     _host_matches,
     detect_source,
     parse_change_url,
+    parse_org_url,
+    parse_owner_arg,
 )
 
 
@@ -539,3 +541,122 @@ class TestUrlBypassPrevention:
         url = "https://not-a-gerrit-server.evil.org/dashboard"
         with pytest.raises(UrlParseError, match="Cannot determine platform"):
             parse_change_url(url)
+
+
+class TestParseOwnerArg:
+    """Tests for ``parse_owner_arg`` owner-login extraction.
+
+    These cover every owner URL form the ``status`` and ``blocked``
+    commands advertise support for.  An organization login and a
+    personal user login are indistinguishable at parse time (the account
+    type is resolved later at runtime), so the same parsing applies to
+    both — the cases below intentionally mix org-style and user-style
+    logins.
+    """
+
+    def test_bare_login(self):
+        """A plain login is returned verbatim."""
+        assert parse_owner_arg("lfreleng-actions") == "lfreleng-actions"
+
+    def test_bare_login_user_account(self):
+        """A personal user login parses identically to an org login."""
+        assert (
+            parse_owner_arg("ModeSevenIndustrialSolutions")
+            == "ModeSevenIndustrialSolutions"
+        )
+
+    def test_bare_login_with_surrounding_whitespace(self):
+        assert parse_owner_arg("  lfreleng-actions  ") == "lfreleng-actions"
+
+    def test_bare_login_with_trailing_slash(self):
+        """A bare login plus a trailing slash stays a login.
+
+        Regression guard: ``status``/``blocked`` historically accepted
+        ``owner/`` via ``rstrip("/")``, so it must not be misread as a
+        URL whose host is ``owner``.
+        """
+        assert parse_owner_arg("lfreleng-actions/") == "lfreleng-actions"
+
+    def test_bare_login_with_multiple_trailing_slashes(self):
+        assert parse_owner_arg("lfreleng-actions//") == "lfreleng-actions"
+
+    def test_slashes_only_raises(self):
+        """Input consisting only of slashes has no login to extract."""
+        with pytest.raises(UrlParseError, match="cannot be empty"):
+            parse_owner_arg("////")
+
+    def test_https_owner_url(self):
+        assert (
+            parse_owner_arg("https://github.com/lfreleng-actions") == "lfreleng-actions"
+        )
+
+    def test_https_owner_url_trailing_slash(self):
+        assert (
+            parse_owner_arg("https://github.com/lfreleng-actions/")
+            == "lfreleng-actions"
+        )
+
+    def test_https_user_url(self):
+        assert (
+            parse_owner_arg("https://github.com/ModeSevenIndustrialSolutions")
+            == "ModeSevenIndustrialSolutions"
+        )
+
+    def test_owner_url_without_scheme(self):
+        assert parse_owner_arg("github.com/lfreleng-actions") == "lfreleng-actions"
+
+    def test_orgs_owner_url(self):
+        assert (
+            parse_owner_arg("https://github.com/orgs/lfreleng-actions")
+            == "lfreleng-actions"
+        )
+
+    def test_orgs_owner_repositories_url(self):
+        """The canonical ``/orgs/owner/repositories`` form must resolve.
+
+        The old naive ``split('/')[-1]`` parsing returned
+        ``repositories`` here — this case guards against that regression.
+        """
+        assert (
+            parse_owner_arg("https://github.com/orgs/lfreleng-actions/repositories")
+            == "lfreleng-actions"
+        )
+
+    def test_empty_string_raises(self):
+        with pytest.raises(UrlParseError):
+            parse_owner_arg("")
+
+    def test_whitespace_only_raises(self):
+        with pytest.raises(UrlParseError):
+            parse_owner_arg("   ")
+
+    def test_non_github_host_url_raises(self):
+        with pytest.raises(UrlParseError):
+            parse_owner_arg("https://gitlab.com/some-owner")
+
+    def test_pr_url_is_rejected(self):
+        """A full PR URL is not an owner URL and must be rejected."""
+        with pytest.raises(UrlParseError):
+            parse_owner_arg("https://github.com/owner/repo/pull/1")
+
+
+class TestParseOrgUrlForms:
+    """Tests for ``parse_org_url`` across the supported owner URL forms."""
+
+    def test_bare_owner(self):
+        result = parse_org_url("https://github.com/lfreleng-actions")
+        assert result.owner == "lfreleng-actions"
+        assert result.host == "github.com"
+        assert result.is_github is True
+
+    def test_orgs_owner_repositories(self):
+        result = parse_org_url("https://github.com/orgs/lfreleng-actions/repositories")
+        assert result.owner == "lfreleng-actions"
+
+    def test_user_account_owner(self):
+        result = parse_org_url("https://github.com/ModeSevenIndustrialSolutions")
+        assert result.owner == "ModeSevenIndustrialSolutions"
+
+    def test_non_github_host_rejected(self):
+        with pytest.raises(UrlParseError):
+            parse_org_url("https://gitlab.com/some-owner")

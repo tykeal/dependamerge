@@ -32,9 +32,9 @@ jobs:
     uses: lfit/releng-reusable-workflows/.github/workflows/reuse-openssf-scorecard.yaml@50e324ef804880c13d4aebcefcac07ad81661d01 # v0.6.1
     permissions:
       # Needed to upload the results to code-scanning dashboard.
-      security-events: write
+      security-events: write  # Upload Scorecard results to code scanning.
       # Needed to publish results and get a badge (see publish_results below).
-      id-token: write
+      id-token: write  # Publish results and mint the badge.
       # Uncomment the permissions below if installing in a private repository.
       # contents: read
       # actions: read

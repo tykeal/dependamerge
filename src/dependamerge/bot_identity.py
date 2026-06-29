@@ -50,17 +50,20 @@ _AUTOMATION_BOT_NAMES = frozenset(
         "allcontributors",
         "copilot",
         "github-copilot",
+        "copilot-swe-agent",
     }
 )
 
 # Known GitHub Copilot actor logins (normalised).  Copilot reports under
 # several identities depending on the surface: the App author
-# (``Copilot`` / ``copilot[bot]`` / ``github-copilot[bot]``) and the
-# review actor (``copilot-pull-request-reviewer``).
+# (``Copilot`` / ``copilot[bot]`` / ``github-copilot[bot]``), the coding
+# agent that raises automated code fixes (``copilot-swe-agent[bot]``), and
+# the review actor (``copilot-pull-request-reviewer``).
 _COPILOT_NAMES = frozenset(
     {
         "copilot",
         "github-copilot",
+        "copilot-swe-agent",
         "copilot-pull-request-reviewer",
     }
 )

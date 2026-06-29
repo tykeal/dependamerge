@@ -127,6 +127,7 @@ addopts = [
 asyncio_mode = "auto"
 markers = [
   "slow: marks tests as slow (deselected by prek/pre-commit hooks)",
+  "integration: marks live GitHub/Gerrit CLI tests; deselected by default and run only with --run-integration or DEPENDAMERGE_RUN_INTEGRATION=1 (and self-skip without credentials)",
 ]
 
 [tool.coverage.run]

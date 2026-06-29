@@ -561,6 +561,64 @@ def parse_org_url(url: str) -> ParsedOrgUrl:
     )
 
 
+def parse_owner_arg(value: str) -> str:
+    """Extract an owner login from a CLI argument.
+
+    The owner-wide *report* commands (``status`` and ``blocked``) accept
+    either a bare login or any of the GitHub owner URL forms that
+    :func:`parse_org_url` understands.  This single helper normalises all
+    of them to a plain login so the commands no longer rely on a naive
+    ``split("/")[-1]`` that silently mis-parses the canonical
+    ``/orgs/owner/repositories`` form (it would return ``repositories``).
+
+    Accepted inputs:
+        owner
+        owner/
+        https://github.com/owner
+        https://github.com/owner/
+        github.com/owner
+        https://github.com/orgs/owner
+        https://github.com/orgs/owner/repositories
+
+    A bare token — optionally with one or more trailing slashes but no
+    other path separator and no scheme — is treated as a login and
+    returned verbatim (minus the trailing slashes).  This preserves the
+    long-standing ability to pass just an organization/user name, and to
+    pass ``owner/`` (the ``status``/``blocked`` commands historically
+    accepted a trailing slash via ``rstrip("/")``).  Anything that still
+    looks like a URL (an embedded ``/`` or a scheme) is delegated to
+    :func:`parse_org_url`, which enforces the github.com-only guard and
+    the canonical forms.
+
+    Args:
+        value: The raw CLI argument.
+
+    Returns:
+        The extracted owner login.
+
+    Raises:
+        UrlParseError: If ``value`` is empty or is a URL that is not a
+            recognised github.com owner URL.
+    """
+    value = (value or "").strip()
+    if not value:
+        raise UrlParseError("Owner name or URL cannot be empty")
+
+    # A bare login has no scheme and no embedded path separator once any
+    # trailing slashes are removed; accept it as-is so plain names like
+    # "lfreleng-actions" and the historical "lfreleng-actions/" form keep
+    # working.
+    bare = value.rstrip("/")
+    if not bare:
+        # The input was only slashes (e.g. "////"); there is no login to
+        # extract, so treat it the same as an empty value.
+        raise UrlParseError("Owner name or URL cannot be empty")
+    if "/" not in bare and "://" not in bare:
+        return bare
+
+    return parse_org_url(value).owner
+
+
 def derive_api_urls(host: str) -> tuple[str, str]:
     """Derive the (REST, GraphQL) API base URLs for a GitHub host.
 

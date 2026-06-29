@@ -83,6 +83,8 @@ class TestIsCopilot:
             "copilot[bot]",
             "github-copilot",
             "github-copilot[bot]",
+            "copilot-swe-agent",
+            "copilot-swe-agent[bot]",
             "copilot-pull-request-reviewer",
         ],
     )
@@ -110,8 +112,11 @@ class TestIsAutomationAuthor:
             "dependabot",
             "renovate",
             "github-actions",
-            # Copilot is automation too.
+            # Copilot is automation too, including the coding agent that
+            # raises automated code fixes in either login form.
             "github-copilot[bot]",
+            "copilot-swe-agent[bot]",
+            "copilot-swe-agent",
             # Unknown bot caught by the [bot] fallthrough.
             "some-future-bot[bot]",
         ],

@@ -29,9 +29,9 @@ jobs:
     with:
       codeql_config: .github/codeql/codeql-config.yml
     permissions:
-      security-events: write
+      security-events: write  # Upload CodeQL results to code scanning.
       # required to fetch internal or private CodeQL packs
-      packages: read
+      packages: read  # Fetch internal or private CodeQL packs.
       # only required for workflows in private repositories
-      actions: read
-      contents: read
+      actions: read  # Read workflow metadata (private repos only).
+      contents: read  # Check out the repository to analyze.

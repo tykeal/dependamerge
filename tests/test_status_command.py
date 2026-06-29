@@ -3,6 +3,7 @@
 
 from unittest.mock import Mock, patch
 
+import pytest
 from typer.testing import CliRunner
 
 from dependamerge.cli import app
@@ -93,6 +94,15 @@ class TestStatusCommand:
         assert "repo1" in result.stdout
         assert "repo2" in result.stdout
 
+        # Summary table reports the open-PR human/automation split and a
+        # combined total alongside the repository count.
+        assert "Automation PRs" in result.stdout
+        assert "Human" in result.stdout
+        assert "Total PRs" in result.stdout
+        assert "Total Repositories" in result.stdout
+        # GitHub Copilot is listed among the supported automation tools.
+        assert "GitHub Copilot" in result.stdout
+
     @patch("dependamerge.github_service.GitHubService")
     def test_status_command_json_output(self, mock_service_class):
         """Test status command with JSON output format."""
@@ -160,7 +170,7 @@ class TestStatusCommand:
 
         # Should fail with invalid input
         assert result.exit_code == 1
-        assert "Invalid GitHub organization" in result.stdout
+        assert "Invalid GitHub owner" in result.stdout
 
     @patch("dependamerge.github_service.GitHubService")
     def test_status_command_with_errors(self, mock_service_class):
@@ -212,3 +222,89 @@ class TestStatusCommand:
             "Errors Encountered" in result.stdout
             or "Connection timeout" in result.stdout
         )
+
+
+class TestStatusCommandUrlForms:
+    """Verify ``status`` resolves the owner from every supported URL form.
+
+    Each invocation captures the login handed to
+    ``gather_organization_status`` so we assert the CLI extracts the
+    correct owner from bare names, bare URLs, trailing-slash URLs, and
+    the canonical ``/orgs/owner`` and ``/orgs/owner/repositories`` forms.
+    These forms apply equally to organizations and personal user
+    accounts (the two are only distinguished later at runtime).
+    """
+
+    runner: CliRunner = CliRunner()
+
+    def setup_method(self):
+        self.runner = CliRunner()
+
+    @pytest.mark.parametrize(
+        "argument,expected_owner",
+        [
+            ("lfreleng-actions", "lfreleng-actions"),
+            ("lfreleng-actions/", "lfreleng-actions"),
+            ("ModeSevenIndustrialSolutions", "ModeSevenIndustrialSolutions"),
+            ("https://github.com/lfreleng-actions", "lfreleng-actions"),
+            ("https://github.com/lfreleng-actions/", "lfreleng-actions"),
+            (
+                "https://github.com/ModeSevenIndustrialSolutions",
+                "ModeSevenIndustrialSolutions",
+            ),
+            ("github.com/lfreleng-actions", "lfreleng-actions"),
+            ("https://github.com/orgs/lfreleng-actions", "lfreleng-actions"),
+            (
+                "https://github.com/orgs/lfreleng-actions/repositories",
+                "lfreleng-actions",
+            ),
+        ],
+    )
+    @patch("dependamerge.github_service.GitHubService")
+    def test_status_resolves_owner_from_url_form(
+        self, mock_service_class, argument, expected_owner
+    ):
+        captured: dict[str, str] = {}
+        mock_service = Mock()
+        mock_service_class.return_value = mock_service
+
+        async def mock_gather_status(org_name):
+            captured["owner"] = org_name
+            return OrganizationStatus(
+                organization=org_name,
+                total_repositories=0,
+                scanned_repositories=0,
+                repository_statuses=[],
+                scan_timestamp="2026-01-20T10:00:00",
+                errors=[],
+            )
+
+        async def mock_close():
+            pass
+
+        mock_service.gather_organization_status = mock_gather_status
+        mock_service.close = mock_close
+
+        result = self.runner.invoke(
+            app,
+            ["status", argument, "--no-progress"],
+            env={"GITHUB_TOKEN": "fake-token"},
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert captured.get("owner") == expected_owner
+
+    @patch("dependamerge.github_service.GitHubService")
+    def test_status_rejects_non_github_owner_url(self, mock_service_class):
+        """A non-github.com owner URL is rejected before any scan starts."""
+        mock_service = Mock()
+        mock_service_class.return_value = mock_service
+
+        result = self.runner.invoke(
+            app,
+            ["status", "https://gitlab.com/some-owner", "--no-progress"],
+            env={"GITHUB_TOKEN": "fake-token"},
+        )
+
+        assert result.exit_code == 1
+        assert "Invalid GitHub owner" in result.stdout

@@ -77,6 +77,7 @@ from .url_parser import (
     UrlParseError,
     parse_change_url,
     parse_org_url,
+    parse_owner_arg,
     parse_repo_url,
 )
 
@@ -345,6 +346,12 @@ class _MergeContext:
     github2gerrit_mode: str
     include_human_prs: bool = False
     rebase_local: bool = True
+    # Dry-run: perform the full analysis and preview but never merge,
+    # approve, rebase, or close anything.  Because no write occurs, the
+    # write-permission pre-flight check is skipped so the command can run
+    # under a read-only token (e.g. in CI).  Implies preview-only and
+    # suppresses the interactive confirmation prompt.
+    dry_run: bool = False
     # Owner-wide global wait ceiling (seconds).  Default 900 (15 min);
     # 0 = fire-and-forget (arm auto-merge, report pending, never block).
     # Applies to owner/user-wide runs; ignored for single-PR and
@@ -515,9 +522,7 @@ def _source_pr_modifies_workflows(ctx: _MergeContext) -> bool:
         return False
     for change in source_pr.files_changed:
         path = getattr(change, "filename", "") or ""
-        if path.startswith(".github/workflows/") and path.endswith(
-            (".yml", ".yaml")
-        ):
+        if path.startswith(".github/workflows/") and path.endswith((".yml", ".yaml")):
             return True
     return False
 
@@ -638,6 +643,24 @@ def _check_merge_permissions(ctx: _MergeContext) -> None:
         console.print("   Continuing anyway...")
 
 
+def _maybe_check_merge_permissions(ctx: _MergeContext) -> None:
+    """Run the write-permission pre-flight unless this is a dry run.
+
+    A dry run performs no writes (no merge, approve, rebase, or branch
+    update), so the merge/approve/update_branch/branch_protection scopes
+    are not required.  Skipping the check lets the full analysis and
+    preview run under a read-only token — which is exactly what the CI
+    dry-run test matrix needs, since the default workflow token (and
+    other low-privilege tokens) cannot satisfy the write scopes.
+    """
+    if ctx.dry_run:
+        console.print(
+            "🧪 Dry run: skipping token permission check " "(no changes will be made)"
+        )
+        return
+    _check_merge_permissions(ctx)
+
+
 def _validate_automation_author(ctx: _MergeContext) -> None:
     """Verify the source PR author is from automation or has a valid override.
 
@@ -688,10 +711,10 @@ def _scan_and_find_similar(ctx: _MergeContext) -> None:
     assert ctx.source_pr is not None
     assert ctx.comparator is not None
 
-    console.print(f"Checking organization: {ctx.owner}")
+    console.print(f"Checking owner: {ctx.owner}")
 
     # Start the progress tracker now — this is where the
-    # long-running org-wide scan begins.
+    # long-running owner-wide scan begins.
     if ctx.progress_tracker:
         ctx.progress_tracker.start()
 
@@ -754,7 +777,7 @@ def _scan_and_find_similar(ctx: _MergeContext) -> None:
         # Not a failure: the supplied PR is simply the only one to
         # merge.  Use a neutral "skip ahead" glyph rather than ❌ so
         # the output does not read like an error.
-        console.print("⏩ No similar PRs found in the organization")
+        console.print("⏩ No similar PRs found for this owner")
 
     for target_pr, comparison in ctx.all_similar_prs:
         console.print(f"  • {target_pr.repository_full_name} #{target_pr.number}")
@@ -831,9 +854,7 @@ def _run_parallel_merge(
                 console.print(
                     f"{prefix}🚀 Merging {len(prs_to_merge)} pull requests..."
                 )
-            return await merge_manager.merge_prs_parallel(
-                prs_to_merge, stripe=stripe
-            )
+            return await merge_manager.merge_prs_parallel(prs_to_merge, stripe=stripe)
 
     return asyncio.run(_do_merge())
 
@@ -1105,7 +1126,7 @@ def _handle_repo_merge(
     console.print(f"🔍 Repository mode: fetching open PRs in {parsed_repo.project}...")
 
     # --- Token permission check (reuse existing helper) ---
-    _check_merge_permissions(ctx)
+    _maybe_check_merge_permissions(ctx)
 
     # --- Progress tracker ---
     if ctx.show_progress:
@@ -1194,8 +1215,10 @@ def _handle_repo_merge(
 
     # --- Human PR confirmation gate ---
     # Only prompt when human PRs are actually in scope, not merely
-    # because --include-human-prs was supplied.
-    needs_human_confirm = bool(human_prs) and not ctx.no_confirm
+    # because --include-human-prs was supplied.  A dry run never prompts;
+    # it mirrors the safe default (exclude human PRs) so the preview
+    # matches a real run where the operator presses Enter at the prompt.
+    needs_human_confirm = bool(human_prs) and not ctx.no_confirm and not ctx.dry_run
     if needs_human_confirm:
         console.print("\n⚠️ Human-authored PRs are included in this merge operation.")
         console.print("   Review the list above carefully before proceeding.")
@@ -1219,6 +1242,16 @@ def _handle_repo_merge(
         except (KeyboardInterrupt, EOFError, typer.Abort):
             console.print("\n❌ Merge cancelled by user.")
             return
+    elif human_prs and ctx.dry_run:
+        # Human PRs only reach this branch when --include-human-prs was
+        # supplied (otherwise they are filtered out at fetch time).  A dry
+        # run performs no writes, so keep them in the preview to faithfully
+        # mirror what a real --include-human-prs run would attempt; a real
+        # run would prompt for confirmation first (unless --no-confirm).
+        console.print(
+            "\nℹ️ Dry run: human-authored PRs are kept in this preview "
+            "(a real run would prompt before merging them)."
+        )
 
     # --- Build the merge list (ComparisonResult is None for repo mode) ---
     all_prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]] = [
@@ -1246,7 +1279,7 @@ def _handle_repo_merge(
         merge_results = _run_parallel_merge(
             ctx,
             all_prs_to_merge,
-            preview=not ctx.no_confirm,
+            preview=ctx.dry_run or not ctx.no_confirm,
             # Allow parallel workers; the merge dispatch itself is
             # serialised per repo by ``AsyncMergeManager`` so PRs
             # parked in Step 5.5's wait loop no longer block other
@@ -1267,6 +1300,11 @@ def _handle_repo_merge(
         return
 
     merged_count = sum(1 for r in merge_results if r.status.value == "merged")
+
+    # Dry run: report the preview and stop before any prompt or merge.
+    if ctx.dry_run:
+        _display_merge_results(merge_results, no_confirm=False)
+        return
 
     if not ctx.no_confirm:
         # In preview mode, show what would happen, then prompt
@@ -1496,9 +1534,7 @@ def _handle_org_merge(
     ctx.owner = parsed_org.owner
     ctx.repo_name = ""
 
-    console.print(
-        f"🔍 Owner mode: scanning {parsed_org.owner} for automation PRs..."
-    )
+    console.print(f"🔍 Owner mode: scanning {parsed_org.owner} for automation PRs...")
 
     # NOTE: the token permission check is deferred until *after*
     # enumeration (see below).  ``_check_merge_permissions`` probes a
@@ -1546,9 +1582,7 @@ def _handle_org_merge(
     if scan_errors:
         error_count = len(scan_errors)
         repo_noun = "repository" if error_count == 1 else "repositories"
-        console.print(
-            f"\n⚠️ {error_count} {repo_noun} could not be scanned:"
-        )
+        console.print(f"\n⚠️ {error_count} {repo_noun} could not be scanned:")
         for err in scan_errors:
             console.print(f"   - {err}")
 
@@ -1570,7 +1604,7 @@ def _handle_org_merge(
     # per-repo permission variance with fine-grained tokens is caught at
     # merge time by the scheduler's per-repository error isolation.
     ctx.repo_name = owner_prs[0].repository_full_name.split("/", 1)[-1]
-    _check_merge_permissions(ctx)
+    _maybe_check_merge_permissions(ctx)
 
     # --- Classify PRs as automation vs human ---
     # Delegated to the shared bot-identity predicate (see _handle_repo_merge).
@@ -1601,7 +1635,7 @@ def _handle_org_merge(
     _print_prs_grouped_by_repo(owner_prs)
 
     # --- Human PR confirmation gate ---
-    needs_human_confirm = bool(human_prs) and not ctx.no_confirm
+    needs_human_confirm = bool(human_prs) and not ctx.no_confirm and not ctx.dry_run
     if needs_human_confirm:
         console.print(
             "\n⚠️ Human-authored PRs across the entire owner "
@@ -1627,6 +1661,16 @@ def _handle_org_merge(
         except (KeyboardInterrupt, EOFError, typer.Abort):
             console.print("\n❌ Merge cancelled by user.")
             return
+    elif human_prs and ctx.dry_run:
+        # Human PRs only reach this branch when --include-human-prs was
+        # supplied (otherwise they are filtered out at fetch time).  A dry
+        # run performs no writes, so keep them in the preview to faithfully
+        # mirror what a real --include-human-prs run would attempt; a real
+        # run would prompt for confirmation first (unless --no-confirm).
+        console.print(
+            "\nℹ️ Dry run: human-authored PRs are kept in this preview "
+            "(a real run would prompt before merging them)."
+        )
 
     # --- Build the merge list (ComparisonResult is None for owner mode) ---
     all_prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]] = [
@@ -1653,7 +1697,7 @@ def _handle_org_merge(
         merge_results = _run_parallel_merge(
             ctx,
             all_prs_to_merge,
-            preview=not ctx.no_confirm,
+            preview=ctx.dry_run or not ctx.no_confirm,
             concurrency=concurrency,
             # Owner-wide batches mix many repositories and often contain
             # multiple PRs per repository; stripe to avoid stacking and
@@ -1670,6 +1714,11 @@ def _handle_org_merge(
         return
 
     merged_count = sum(1 for r in merge_results if r.status.value == "merged")
+
+    # Dry run: report the preview and stop before any prompt or merge.
+    if ctx.dry_run:
+        _display_merge_results(merge_results, no_confirm=False)
+        return
 
     if not ctx.no_confirm:
         _handle_org_preview_confirmation(
@@ -1801,6 +1850,7 @@ def _handle_gerrit_merge(
     no_netrc: bool = False,
     netrc_file: Path | None = None,
     netrc_optional: bool = True,
+    dry_run: bool = False,
 ) -> None:
     """
     Handle merge operation for a Gerrit change URL.
@@ -1814,6 +1864,8 @@ def _handle_gerrit_merge(
         no_netrc: If True, skip .netrc credential lookup.
         netrc_file: Explicit path to a .netrc file.
         netrc_optional: If True, don't fail if netrc not found.
+        dry_run: If True, preview only and never review or submit any
+            change, even when ``no_confirm`` is also set.
     """
     # Resolve Gerrit credentials from all sources using centralized function
     try:
@@ -1951,10 +2003,12 @@ def _handle_gerrit_merge(
                 "succeed on some changes."
             )
 
-        if not no_confirm:
+        if not no_confirm or dry_run:
             # Preview mode - show permission status
+            label = "Dry run" if dry_run else "Preview"
             console.print(
-                f"\n📊 Preview: {len(all_changes)} changes would be reviewed and submitted"
+                f"\n📊 {label}: {len(all_changes)} changes would be "
+                "reviewed and submitted"
             )
             if source_change.has_required_permissions():
                 console.print(
@@ -1964,7 +2018,10 @@ def _handle_gerrit_merge(
                 console.print(
                     "   ⚠️ You may not have all required permissions (see warnings above)"
                 )
-            console.print("\nTo proceed, run with --no-confirm flag")
+            if dry_run:
+                console.print("\n🧪 Dry run: no changes were reviewed or submitted.")
+            else:
+                console.print("\nTo proceed, run with --no-confirm flag")
             return
 
         # Create submit manager and submit changes
@@ -2144,6 +2201,16 @@ def merge(
         "--include-human-prs",
         help="Include human-authored PRs when merging a repository (prompts for confirmation when human PRs are found)",
     ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Analyze and preview only: never approve, merge, rebase, or "
+            "close anything. Skips the write-permission pre-flight so it "
+            "runs under a read-only token (e.g. in CI). Implies "
+            "preview-only and suppresses confirmation prompts."
+        ),
+    ),
 ):
     """
     Bulk approve/merge pull requests or Gerrit changes.
@@ -2157,7 +2224,7 @@ def merge(
 
     1. Analyze the provided PR
 
-    2. Find similar PRs in the organization
+    2. Find similar PRs across the owner (organization or user account)
 
     3. Approve and merge matching PRs
 
@@ -2318,6 +2385,7 @@ def merge(
             no_netrc=no_netrc,
             netrc_file=netrc_file,
             netrc_optional=netrc_optional,
+            dry_run=dry_run,
         )
         return
 
@@ -2344,6 +2412,7 @@ def merge(
             github2gerrit_mode=github2gerrit_mode,
             include_human_prs=include_human_prs,
             rebase_local=rebase_local,
+            dry_run=dry_run,
         )
         try:
             _handle_org_merge(parsed_org, org_ctx)
@@ -2412,6 +2481,7 @@ def merge(
             github2gerrit_mode=github2gerrit_mode,
             include_human_prs=include_human_prs,
             rebase_local=rebase_local,
+            dry_run=dry_run,
         )
         try:
             _handle_repo_merge(parsed_repo, repo_ctx)
@@ -2480,12 +2550,13 @@ def merge(
         github2gerrit_mode=github2gerrit_mode,
         include_human_prs=include_human_prs,
         rebase_local=rebase_local,
+        dry_run=dry_run,
     )
 
     try:
         _init_github_merge(ctx)
         _fetch_and_validate_source_pr(ctx)
-        _check_merge_permissions(ctx)
+        _maybe_check_merge_permissions(ctx)
 
         # Debug matching info for source PR
         if ctx.debug_matching:
@@ -2497,7 +2568,7 @@ def merge(
         # Scan org and find similar PRs
         _scan_and_find_similar(ctx)
 
-        if not ctx.no_confirm:
+        if not ctx.no_confirm or ctx.dry_run:
             console.print("\n🔍 Dependamerge Evaluation\n")
 
         # Build full list and run parallel merge
@@ -2513,21 +2584,27 @@ def merge(
         # For the real merge (``--no-confirm``) the scan has already
         # stopped the progress tracker; stand up a fresh one so the
         # background wait-status ticker has a live display to update
-        # while PRs sit in the Step 5.5 auto-merge wait.  Preview runs
-        # keep the stopped tracker (one line per PR, no wait loop).
-        if ctx.no_confirm:
+        # while PRs sit in the Step 5.5 auto-merge wait.  Preview and
+        # dry runs keep the stopped tracker (one line per PR, no wait
+        # loop) because they never execute a real merge.
+        if ctx.no_confirm and not ctx.dry_run:
             _restart_merge_progress_tracker(ctx, len(all_prs_to_merge))
         try:
             merge_results = _run_parallel_merge(
                 ctx,
                 all_prs_to_merge,
-                preview=not ctx.no_confirm,
+                preview=ctx.dry_run or not ctx.no_confirm,
                 # No similar-PR list was printed when none were found, so
                 # skip the blank line before the merge banner.
                 leading_blank=bool(ctx.all_similar_prs),
             )
         finally:
-            if ctx.no_confirm and ctx.show_progress and ctx.progress_tracker:
+            if (
+                ctx.no_confirm
+                and not ctx.dry_run
+                and ctx.show_progress
+                and ctx.progress_tracker
+            ):
                 ctx.progress_tracker.stop()
 
         # Process and display results
@@ -2536,6 +2613,13 @@ def merge(
             return
 
         merged_count = sum(1 for r in merge_results if r.status.value == "merged")
+
+        # Dry run: report what *would* happen and stop before any prompt
+        # or real merge.  ``no_confirm=False`` selects the "Would …"
+        # preview phrasing in the results summary.
+        if ctx.dry_run:
+            _display_merge_results(merge_results, no_confirm=False)
+            return
 
         if not ctx.no_confirm:
             _handle_preview_confirmation(
@@ -2673,9 +2757,19 @@ def close(
         "--debug-matching",
         help="Show detailed scoring information for PR matching",
     ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Analyze and preview only: never close anything. Suppresses "
+            "the confirmation prompt so it runs unattended under a "
+            "read-only token (e.g. in CI)."
+        ),
+    ),
 ):
     """
-    Bulk close pull requests across a GitHub organization.
+    Bulk close pull requests across a GitHub owner (organization or user
+    account).
 
     By default, runs in interactive mode showing what changes will apply,
     then prompts to proceed with closing. Use --no-confirm to close immediately.
@@ -2684,7 +2778,7 @@ def close(
 
     1. Analyze the provided PR
 
-    2. Find similar PRs in the organization
+    2. Find similar PRs across the owner (organization or user account)
 
     3. Close matching PRs
 
@@ -2789,11 +2883,11 @@ def close(
                 "Override SHA validated. Proceeding with non-automation PR close."
             )
 
-        # Find similar PRs in the organization
+        # Find similar PRs across the owner (organization or user)
         if progress_tracker:
             console.print()
         else:
-            console.print(f"\nChecking organization: {owner}")
+            console.print(f"\nChecking owner: {owner}")
 
         # Use GitHubService for async PR finding
         from .github_service import GitHubService
@@ -2844,7 +2938,7 @@ def close(
             # Not a failure: the supplied PR is simply the only one to
             # close.  Use a neutral glyph rather than ❌ so the output
             # does not read like an error.
-            console.print("⏩ No similar PRs found in the organization")
+            console.print("⏩ No similar PRs found for this owner")
 
         for target_pr, comparison in all_similar_prs:
             console.print(f"  • {target_pr.repository_full_name} #{target_pr.number}")
@@ -2874,6 +2968,34 @@ def close(
                 return await close_manager.close_prs_parallel(pr_tuples)
 
         # Perform preview to check which PRs can be closed
+        if dry_run:
+            # Dry run: evaluate in preview mode and report what *would*
+            # be closed, then stop.  No prompt, no actual close — safe to
+            # run unattended under a read-only token.
+            if progress_tracker:
+                progress_tracker.start()
+                console.print()
+            else:
+                console.print(
+                    f"\n🧪 Dry run: evaluating {len(all_prs_to_close)} "
+                    "pull requests..."
+                )
+
+            close_results = asyncio.run(_close_parallel(all_prs_to_close, True))
+
+            if progress_tracker:
+                progress_tracker.stop()
+                console.print()
+
+            closeable_count = sum(
+                1 for r in close_results if r.status.value == "closed"
+            )
+            console.print(
+                f"\n🧪 Dry run: would close {closeable_count}/"
+                f"{len(all_prs_to_close)} PRs (no changes made)"
+            )
+            return
+
         if not no_confirm:
             if progress_tracker:
                 progress_tracker.start()
@@ -3030,7 +3152,7 @@ def close(
 def status(
     org_input: str = typer.Argument(
         ...,
-        help="GitHub organization name or URL (e.g., 'lfreleng-actions' or 'https://github.com/lfreleng-actions/')",
+        help="GitHub owner (organization or user) name or URL (e.g., 'lfreleng-actions' or 'https://github.com/lfreleng-actions/')",
     ),
     token: str | None = typer.Option(
         None, "--token", help="GitHub token (or set GITHUB_TOKEN env var)"
@@ -3046,19 +3168,25 @@ def status(
     Reports repository statistics for tags, releases and pull requests.
 
     This command will:
-    1. Scan all repositories in the organization
+    1. Scan all repositories owned by the organization or user
     2. Gather tag and release information
     3. Count open and merged pull requests
     4. Identify PRs affecting actions or workflows
 
-    Automation tools supported: dependabot, pre-commit.ci
+    Automation tools supported: Dependabot, Renovate, pre-commit.ci,
+    GitHub Actions, GitHub Copilot, and any other [bot] account.
     """
-    # Parse organization name from input (handle both URL and plain name)
-    org_name = org_input.rstrip("/").split("/")[-1]
+    # Parse owner login from input (handles a bare login plus every
+    # GitHub owner URL form, including /orgs/owner/repositories).
+    try:
+        org_name = parse_owner_arg(org_input)
+    except UrlParseError:
+        org_name = ""
     if not org_name:
-        console.print("❌ Invalid GitHub organization name or URL")
+        console.print("❌ Invalid GitHub owner name or URL")
         console.print(
-            "   Expected: 'organization-name' or 'https://github.com/organization-name/'"
+            "   Expected an organization or user account, e.g. "
+            "'owner-name' or 'https://github.com/owner-name/'"
         )
         raise typer.Exit(1)
 
@@ -3070,11 +3198,13 @@ def status(
             progress_tracker = ProgressTracker(org_name, show_pr_stats=False)
             progress_tracker.start()
             if not progress_tracker.rich_available:
-                console.print(f"🔍 Scanning organization: {org_name}")
+                console.print(f"🔍 Scanning owner: {org_name}")
                 console.print("Progress updates will be shown as simple text...")
         else:
-            console.print(f"🔍 Scanning organization: {org_name}")
-            console.print("This may take a few minutes for large organizations...")
+            console.print(f"🔍 Scanning owner: {org_name}")
+            console.print(
+                "This may take a few minutes for owners with many repositories..."
+            )
 
         # Perform the scan
         from .github_service import GitHubService
@@ -3121,7 +3251,7 @@ def status(
 def blocked(
     org_input: str = typer.Argument(
         ...,
-        help="GitHub organization name or URL (e.g., 'lfreleng-actions' or 'https://github.com/lfreleng-actions/')",
+        help="GitHub owner (organization or user) name or URL (e.g., 'lfreleng-actions' or 'https://github.com/lfreleng-actions/')",
     ),
     token: str | None = typer.Option(
         None, "--token", help="GitHub token (or set GITHUB_TOKEN env var)"
@@ -3182,22 +3312,27 @@ def blocked(
     ),
 ):
     """
-    Reports blocked pull requests in a GitHub organization.
+    Reports blocked pull requests in a GitHub organization or user account.
 
     This command will:
-    1. Check all repositories in the organization
+    1. Check all repositories owned by the organization or user
     2. Identify pull requests that cannot be merged
     3. Report blocking reasons (conflicts, failing checks, etc.)
     4. Count unresolved Copilot feedback comments
 
     Standard code review requirements are not considered blocking.
     """
-    # Parse organization name from input (handle both URL and plain name)
-    organization = org_input.rstrip("/").split("/")[-1]
+    # Parse owner login from input (handles a bare login plus every
+    # GitHub owner URL form, including /orgs/owner/repositories).
+    try:
+        organization = parse_owner_arg(org_input)
+    except UrlParseError:
+        organization = ""
     if not organization:
-        console.print("❌ Invalid GitHub organization name or URL")
+        console.print("❌ Invalid GitHub owner name or URL")
         console.print(
-            "   Expected: 'organization-name' or 'https://github.com/organization-name/'"
+            "   Expected an organization or user account, e.g. "
+            "'owner-name' or 'https://github.com/owner-name/'"
         )
         raise typer.Exit(1)
 
@@ -3210,11 +3345,13 @@ def blocked(
             progress_tracker.start()
             # Check if Rich display is available
             if not progress_tracker.rich_available:
-                console.print(f"🔍 Checking organization: {organization}")
+                console.print(f"🔍 Checking owner: {organization}")
                 console.print("Progress updates will be shown as simple text...")
         else:
-            console.print(f"🔍 Checking organization: {organization}")
-            console.print("This may take a few minutes for large organizations...")
+            console.print(f"🔍 Checking owner: {organization}")
+            console.print(
+                "This may take a few minutes for owners with many repositories..."
+            )
 
         # Perform the scan
         from .github_service import GitHubService
@@ -3354,7 +3491,7 @@ def blocked(
         else:
             exit_with_error(
                 ExitCode.GENERAL_ERROR,
-                message="❌ Error during organization scan",
+                message="❌ Error during owner scan",
                 details=str(e),
                 exception=e,
             )
@@ -3493,11 +3630,13 @@ def _display_status_results(status_result, output_format: str):
     for tool in AUTOMATION_TOOLS:
         # Format tool names nicely
         if tool == "[bot]":
-            console.print("  • Any bot account")
+            console.print("  • Any other [bot] account")
         elif tool == "pre-commit":
             console.print("  • pre-commit.ci")
         elif tool == "github-actions":
             console.print("  • GitHub Actions")
+        elif tool == "copilot":
+            console.print("  • GitHub Copilot")
         else:
             console.print(f"  • {tool.capitalize()}")
     console.print()
@@ -3507,6 +3646,21 @@ def _display_status_results(status_result, output_format: str):
     summary_table.add_column("Summary", style="cyan")
     summary_table.add_column("Value", style="white")
 
+    # Aggregate open-PR counts across all scanned repositories.  The
+    # per-repository "PRs Open" column shows human / automation, so the
+    # summary totals those same open-PR figures and reports the split
+    # before the combined total.
+    total_automation_prs = sum(
+        repo.open_prs_automation for repo in status_result.repository_statuses
+    )
+    total_human_prs = sum(
+        repo.open_prs_human for repo in status_result.repository_statuses
+    )
+
+    summary_table.add_row("🤖 Automation PRs", str(total_automation_prs))
+    summary_table.add_row("🤷 Human      PRs", str(total_human_prs))
+    summary_table.add_section()
+    summary_table.add_row("Total PRs", str(total_automation_prs + total_human_prs))
     summary_table.add_row("Total Repositories", str(status_result.total_repositories))
 
     # Only show Scanned Repositories if it differs from Total
