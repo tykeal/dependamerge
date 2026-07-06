@@ -79,7 +79,7 @@ jobs:
     steps:
       - name: 'Checkout repository'
         # yamllint disable-line rule:line-length
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           # This job only reads the repository and runs tests; it never
           # pushes.  Drop the persisted token so it cannot leak via the
