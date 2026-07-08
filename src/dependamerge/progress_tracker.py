@@ -29,6 +29,9 @@ except ImportError:
         def update(self, *args: Any) -> None:
             pass
 
+        def refresh(self) -> None:
+            pass
+
     class Text:  # type: ignore[no-redef]  # pyright: ignore[reportRedefinition]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
@@ -88,8 +91,12 @@ class ProgressTracker:
             return
 
         try:
+            # Pass a callable rather than a static renderable: Rich
+            # re-invokes it on every auto-refresh tick, so the elapsed
+            # clock keeps advancing even when no progress events fire
+            # (long silent API sequences used to freeze the display).
             self.live = Live(
-                self._generate_display_text(),
+                get_renderable=self._generate_display_text,
                 console=self.console,
                 refresh_per_second=2,
                 transient=False,
@@ -135,7 +142,7 @@ class ProgressTracker:
         if self.rich_available and self.paused:
             try:
                 self.live = Live(
-                    self._generate_display_text(),
+                    get_renderable=self._generate_display_text,
                     console=self.console,
                     refresh_per_second=2,
                     transient=False,
@@ -208,10 +215,15 @@ class ProgressTracker:
         self._refresh_display()
 
     def _refresh_display(self) -> None:
-        """Refresh the live display with current progress."""
+        """Repaint the live display with current progress.
+
+        The Live instance renders via ``get_renderable``, so a plain
+        ``refresh()`` repaints with current state immediately instead
+        of waiting for the next auto-refresh tick.
+        """
         if self.live and self.rich_available and not self.paused:
             try:
-                self.live.update(self._generate_display_text())
+                self.live.refresh()
             except Exception:
                 # If Rich display fails, fall back to simple print
                 self._fallback_display()
