@@ -1345,7 +1345,30 @@ class AsyncMergeManager:
             # local-vs-REST decision tree, the local-git workflow,
             # and the post-rebase polling loop all live in one
             # place where they can be tested in isolation.
-            if pr_info.mergeable_state == "behind" and self.fix_out_of_date:
+            #
+            # ``mergeable_state`` is a single value, so ``blocked``
+            # (failing required check) masks ``behind`` (stale head).
+            # A required check that *failed* on a branch that is
+            # *behind base* was judged against pre-rebase content —
+            # e.g. an org-required workflow audit that the base branch
+            # has since fixed — and only a rebase re-runs it against
+            # the current base.  Mirror the engine ladder's
+            # "stale failing verdict" rung here: when a blocked PR's
+            # block reason is check-related and the compare API shows
+            # the head demonstrably behind, refresh the branch before
+            # treating the failure as terminal.
+            needs_rebase = pr_info.mergeable_state == "behind"
+            if (
+                not needs_rebase
+                and self.fix_out_of_date
+                and not self.preview_mode
+                and pr_info.mergeable_state == "blocked"
+                and self._github_client is not None
+            ):
+                needs_rebase = await self._blocked_pr_needs_rebase(
+                    pr_info, repo_owner, repo_name
+                )
+            if needs_rebase and self.fix_out_of_date:
                 rebase_ctx = rebase.RebaseContext(
                     github_client=self._github_client,
                     token=self.token,
@@ -2202,6 +2225,120 @@ class AsyncMergeManager:
             or "waiting for status" in reason_lower
             or "queued" in reason_lower
         )
+
+    @staticmethod
+    def _block_reason_indicates_check_blockage(
+        block_reason: str | None,
+    ) -> bool:
+        """Return True if a block reason concerns status checks at all.
+
+        Broader sibling of
+        :meth:`_block_reason_indicates_pending_checks`: matches any
+        ``analyze_block_reason()`` phrasing about checks — failing,
+        missing, or pending — while rejecting reasons a rebase cannot
+        influence (missing approvals, requested changes, unresolved
+        Copilot feedback, opaque ruleset blocks).
+
+        Step 5 uses this to decide whether a ``blocked`` PR is worth
+        probing for staleness: refreshing the branch re-runs checks
+        against the current base, so only check-related blockage can
+        possibly be cured by a rebase.
+
+        Args:
+            block_reason: The string returned by
+                ``analyze_block_reason()``, or ``None`` if the
+                analysis failed or returned nothing.
+
+        Returns:
+            True when the reason mentions failing, missing, or
+            pending checks; False otherwise (including ``None``).
+        """
+        if block_reason is None:
+            return False
+        reason_lower = block_reason.lower()
+        return (
+            "failing check" in reason_lower
+            or "missing required status" in reason_lower
+            or "missing required check" in reason_lower
+            or "pending required check" in reason_lower
+            or ("required" in reason_lower and "pending" in reason_lower)
+            or "waiting for status" in reason_lower
+            or "queued" in reason_lower
+        )
+
+    async def _blocked_pr_needs_rebase(
+        self,
+        pr_info: PullRequestInfo,
+        repo_owner: str,
+        repo_name: str,
+    ) -> bool:
+        """Decide whether a ``blocked`` PR is really stale-and-fixable.
+
+        Implements the staleness probe behind Step 5's
+        blocked-masks-behind handling: a ``blocked`` PR is treated
+        like ``behind`` when **both** hold:
+
+        1. Its block reason is check-related (failing, missing, or
+           pending checks) — the only class of blockage a branch
+           refresh can cure, because the refresh re-runs checks
+           against the current base.
+        2. The compare API confirms the head is at least one commit
+           behind the base branch.  ``None`` (comparison failed)
+           counts as "not behind": a rebase is a write action and a
+           CI-time expense, so it must rest on positive evidence.
+
+        The two probes run in this order so the cheaper classification
+        gates the extra compare call.
+
+        Args:
+            pr_info: The pull request under evaluation.
+            repo_owner: Base repository owner.
+            repo_name: Base repository name.
+
+        Returns:
+            True when the PR should take the Step 5 rebase path.
+        """
+        if self._github_client is None:
+            return False
+        pr_key = f"{repo_owner}/{repo_name}#{pr_info.number}"
+        block_reason: str | None = None
+        try:
+            block_reason = await self._github_client.analyze_block_reason(
+                repo_owner,
+                repo_name,
+                pr_info.number,
+                pr_info.head_sha,
+            )
+        except Exception as exc:
+            self.log.debug(
+                "analyze_block_reason failed for %s during Step 5 "
+                "staleness probe: %s",
+                pr_key,
+                exc,
+            )
+            return False
+        if not self._block_reason_indicates_check_blockage(block_reason):
+            return False
+
+        behind_by = await self._github_client.get_behind_by(
+            repo_owner,
+            repo_name,
+            pr_info.base_branch or "main",
+            pr_info.head_sha,
+        )
+        if behind_by is None or behind_by <= 0:
+            return False
+
+        pr_info.behind_by = behind_by
+        log_and_print(
+            self.log,
+            self._console,
+            f"\U0001f504 Stale head: {pr_info.html_url} "
+            f"[blocked ({block_reason}); {behind_by} commit(s) behind "
+            f"base — rebasing to re-run checks]",
+            level="debug",
+        )
+        return True
 
     def _is_pr_mergeable(self, pr_info: PullRequestInfo) -> bool:
         """Check whether a PR is worth attempting to merge.

@@ -1852,6 +1852,51 @@ class GitHubAsync:
                 raise perm_error from e
             raise
 
+    async def get_behind_by(
+        self, owner: str, repo: str, base_ref: str, head_sha: str
+    ) -> int | None:
+        """Return how many commits ``head_sha`` is behind ``base_ref``.
+
+        GitHub's ``mergeable_state`` is a single value, so ``blocked``
+        (a failing required check) masks ``behind`` (a stale head).
+        This helper answers the staleness question independently via
+        the compare API, which works regardless of the reported
+        mergeable state and regardless of whether the head lives on a
+        fork (the SHA is resolvable in the base repository's network).
+
+        Args:
+            owner: Base repository owner
+            repo: Base repository name
+            base_ref: Base branch name (e.g. ``main``)
+            head_sha: Head commit SHA of the pull request
+
+        Returns:
+            The ``behind_by`` commit count, or ``None`` when the
+            comparison could not be performed (API error, unexpected
+            payload).  Callers must treat ``None`` as "unknown", not
+            as "up to date".
+        """
+        encoded_base = quote(base_ref, safe="")
+        try:
+            comparison = await self.get(
+                f"/repos/{owner}/{repo}/compare/{encoded_base}...{head_sha}"
+            )
+        except Exception as exc:
+            self.log.debug(
+                "Compare %s...%s failed for %s/%s: %s",
+                base_ref,
+                head_sha,
+                owner,
+                repo,
+                exc,
+            )
+            return None
+        if isinstance(comparison, dict):
+            behind = comparison.get("behind_by")
+            if isinstance(behind, int):
+                return behind
+        return None
+
     async def analyze_block_reason(
         self, owner: str, repo: str, number: int, head_sha: str
     ) -> str:
