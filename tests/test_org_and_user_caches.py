@@ -347,3 +347,198 @@ class TestAuthenticatedUserLoginCache:
 
             assert call_count["user"] == 1
             assert gh._authenticated_user_login == "persistent-user"
+
+
+# ---------------------------------------------------------------------------
+# GitHubAsync.get_authenticated_user_login
+# ---------------------------------------------------------------------------
+
+
+class TestGetAuthenticatedUserLogin:
+    """The public login accessor caches per session and degrades on error."""
+
+    @pytest.mark.asyncio
+    async def test_fetches_once_then_caches(self):
+        async with GitHubAsync(token="fake-token") as gh:
+            gh.get = AsyncMock(return_value={"login": "cached-user"})  # type: ignore[method-assign]
+
+            first = await gh.get_authenticated_user_login()
+            second = await gh.get_authenticated_user_login()
+
+            assert first == "cached-user"
+            assert second == "cached-user"
+            gh.get.assert_awaited_once_with("/user")
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_error_without_caching(self):
+        async with GitHubAsync(token="fake-token") as gh:
+            gh.get = AsyncMock(  # type: ignore[method-assign]
+                side_effect=[Exception("boom"), {"login": "recovered"}]
+            )
+
+            assert await gh.get_authenticated_user_login() is None
+            # A later call retries and succeeds (failures are not cached).
+            assert await gh.get_authenticated_user_login() == "recovered"
+
+
+# ---------------------------------------------------------------------------
+# GitHubAsync repo/branch-scoped session caches
+# ---------------------------------------------------------------------------
+
+
+class TestRepoBranchSessionCaches:
+    """Session caches added for the merge-phase performance work.
+
+    Branch protection, required status checks, and the repo default
+    branch are repo/branch-level configuration that does not change
+    mid-run, yet the merge pipeline used to re-fetch them per PR (or
+    several times per blocked PR via ``analyze_block_reason``).
+    """
+
+    @pytest.mark.asyncio
+    async def test_branch_protection_cached_per_branch(self):
+        async with GitHubAsync(token="fake-token") as gh:
+            gh.get = AsyncMock(  # type: ignore[method-assign]
+                return_value={"required_pull_request_reviews": {}}
+            )
+
+            first = await gh.get_branch_protection("org", "repo", "main")
+            second = await gh.get_branch_protection("org", "repo", "main")
+
+            assert first == second == {"required_pull_request_reviews": {}}
+            gh.get.assert_awaited_once()
+
+            # A different branch is fetched separately.
+            await gh.get_branch_protection("org", "repo", "dev")
+            assert gh.get.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_branch_protection_404_negative_cached(self):
+        async with GitHubAsync(token="fake-token") as gh:
+            gh.get = AsyncMock(side_effect=Exception("404 Not Found"))  # type: ignore[method-assign]
+
+            assert await gh.get_branch_protection("org", "repo", "main") == {}
+            assert await gh.get_branch_protection("org", "repo", "main") == {}
+            # The 404 ("no protection") verdict is cached too.
+            gh.get.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_branch_protection_transient_error_not_cached(self):
+        async with GitHubAsync(token="fake-token") as gh:
+            gh.get = AsyncMock(  # type: ignore[method-assign]
+                side_effect=[Exception("500 Server Error"), {"ok": True}]
+            )
+
+            with pytest.raises(Exception, match="500"):
+                await gh.get_branch_protection("org", "repo", "main")
+            # The failure was not cached; the retry succeeds.
+            assert await gh.get_branch_protection("org", "repo", "main") == {"ok": True}
+
+    @pytest.mark.asyncio
+    async def test_required_status_checks_cached_per_branch(self):
+        async with GitHubAsync(token="fake-token") as gh:
+
+            async def mock_get(url: str):
+                if url == "/repos/org/repo":
+                    return {"default_branch": "main"}
+                if url.endswith("/rulesets?per_page=100"):
+                    return [{"id": 7}]
+                if url.endswith("/rulesets/7"):
+                    return {
+                        "id": 7,
+                        "conditions": {},
+                        "rules": [
+                            {
+                                "type": "required_status_checks",
+                                "parameters": {
+                                    "required_status_checks": [{"context": "ci/build"}]
+                                },
+                            }
+                        ],
+                    }
+                return {}
+
+            gh.get = AsyncMock(side_effect=mock_get)  # type: ignore[method-assign]
+
+            first = await gh.get_required_status_checks("org", "repo", "main")
+            calls_after_first = gh.get.await_count
+            second = await gh.get_required_status_checks("org", "repo", "main")
+
+            assert first == [{"context": "ci/build"}]
+            assert second == [{"context": "ci/build"}]
+            # The repeat is served entirely from cache.
+            assert gh.get.await_count == calls_after_first
+
+    @pytest.mark.asyncio
+    async def test_required_status_checks_cache_returns_copy(self):
+        """Callers must not be able to mutate the cached list."""
+        async with GitHubAsync(token="fake-token") as gh:
+            gh.get = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+            first = await gh.get_required_status_checks("org", "repo", "main")
+            first.append({"context": "injected"})
+            second = await gh.get_required_status_checks("org", "repo", "main")
+
+            assert second == []
+
+    @pytest.mark.asyncio
+    async def test_default_branch_cached(self):
+        async with GitHubAsync(token="fake-token") as gh:
+            gh.get = AsyncMock(return_value={"default_branch": "master"})  # type: ignore[method-assign]
+
+            assert await gh._resolve_default_branch("org", "repo") == "master"
+            assert await gh._resolve_default_branch("org", "repo") == "master"
+            gh.get.assert_awaited_once_with("/repos/org/repo")
+
+    @pytest.mark.asyncio
+    async def test_default_branch_failure_not_cached(self):
+        async with GitHubAsync(token="fake-token") as gh:
+            gh.get = AsyncMock(  # type: ignore[method-assign]
+                side_effect=[Exception("boom"), {"default_branch": "main"}]
+            )
+
+            assert await gh._resolve_default_branch("org", "repo") is None
+            assert await gh._resolve_default_branch("org", "repo") == "main"
+
+
+# ---------------------------------------------------------------------------
+# analyze_block_reason base_branch fast path
+# ---------------------------------------------------------------------------
+
+
+class TestAnalyzeBlockReasonBaseBranchFastPath:
+    """A caller-supplied base_branch skips the PR-detail fetch."""
+
+    @pytest.mark.asyncio
+    async def test_supplied_base_branch_skips_pr_fetch(self):
+        async with GitHubAsync(token="fake-token") as gh:
+            fetched_urls: list[str] = []
+
+            async def mock_get(url: str):
+                fetched_urls.append(url)
+                if url.endswith("/check-runs"):
+                    return {"check_runs": []}
+                if url.endswith("/status"):
+                    return {"statuses": []}
+                if url.endswith("/reviews"):
+                    return [{"state": "APPROVED", "user": {"login": "u"}}]
+                if url.endswith("/comments"):
+                    return []
+                return {}
+
+            gh.get = AsyncMock(side_effect=mock_get)  # type: ignore[method-assign]
+            gh.get_required_status_checks = AsyncMock(return_value=[])  # type: ignore[method-assign]
+            gh._detect_branch_protection_kind = AsyncMock(  # type: ignore[method-assign]
+                return_value="ruleset"
+            )
+
+            await gh.analyze_block_reason(
+                "org", "repo", 5, "abc123", base_branch="main"
+            )
+
+            # The PR-detail endpoint was never fetched — the supplied
+            # base branch made that round-trip unnecessary.
+            assert "/repos/org/repo/pulls/5" not in fetched_urls
+            gh.get_required_status_checks.assert_awaited_once_with(
+                "org", "repo", "main"
+            )

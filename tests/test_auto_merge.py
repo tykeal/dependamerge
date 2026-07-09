@@ -574,11 +574,11 @@ class TestRecheckIntervalClamping:
 
 
 class TestAutoMergePendingCompletesProgress:
-    """AUTO_MERGE_PENDING status must bump PR-level progress to completed."""
+    """AUTO_MERGE_PENDING status must be recorded as a pending outcome."""
 
     @pytest.mark.asyncio
-    async def test_auto_merge_pending_calls_pr_completed(self) -> None:
-        """pr_completed() is called so PR progress reaches 100%."""
+    async def test_auto_merge_pending_calls_merge_pending(self) -> None:
+        """merge_pending() is called so the PR lands in the 🤖 Pending counter."""
         tracker = MagicMock()
         mgr, client = make_merge_manager(
             preview_mode=False,
@@ -645,7 +645,11 @@ class TestAutoMergePendingCompletesProgress:
             result = await mgr._merge_single_pr_with_semaphore(pr)
 
         assert result.status == MergeStatus.AUTO_MERGE_PENDING
-        tracker.pr_completed.assert_called_once()
+        # Terminal accounting routes AUTO_MERGE_PENDING to the
+        # dedicated pending counter (which also advances PR-level
+        # completion), not the generic pr_completed() fallback.
+        tracker.merge_pending.assert_called_once_with("owner/repo#42")
+        tracker.pr_completed.assert_not_called()
         tracker.merge_success.assert_not_called()
         tracker.merge_failure.assert_not_called()
 

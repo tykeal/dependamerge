@@ -527,7 +527,7 @@ class TestReportMergeFailure:
 
     @pytest.mark.asyncio
     async def test_stuck_check_reports_and_arms_auto_merge(self) -> None:
-        """A stuck check yields the ⚠️ line and arms auto-merge (non-dirty)."""
+        """A stuck check sets the error reason and arms auto-merge (non-dirty)."""
         mgr, _client = _make_manager()
         pr = _make_pr_info(author="someuser", mergeable_state="blocked")
         result = MergeResult(pr_info=pr, status=MergeStatus.PENDING)
@@ -551,9 +551,11 @@ class TestReportMergeFailure:
         assert out.status == MergeStatus.FAILED
         assert out.error == "stuck check: DCO"
         mock_enable.assert_awaited_once()
+        # Real merge runs keep the console clean: per-PR status goes
+        # to the log only, and the stuck-check reason reaches the
+        # user via ``result.error`` in the end-of-run summary.
         printed = _printed(mock_console)
-        assert "⚠️ Stuck check" in printed
-        # The generic failure line is suppressed for stuck PRs.
+        assert "⚠️ Stuck check" not in printed
         assert "❌ Failed" not in printed
 
     @pytest.mark.asyncio
@@ -603,10 +605,11 @@ class TestReportMergeFailure:
         # The result error now surfaces the real reason so the
         # end-of-run summary is informative (was a generic message).
         assert out.error == "branch protection rules prevent merge"
-        # The inline line is now terse (URL only); the reason is
-        # reserved for the end-of-run summary to avoid duplication.
+        # Real merge runs no longer print per-PR failure lines; the
+        # reason is reported once in the end-of-run summary via
+        # ``result.error``.
         printed = _printed(mock_console)
-        assert "❌ Failed" in printed
+        assert "❌ Failed" not in printed
         assert "branch protection" not in printed
 
     @pytest.mark.asyncio

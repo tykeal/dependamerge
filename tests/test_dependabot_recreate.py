@@ -188,7 +188,12 @@ class TestCheckPrCommitSignatures:
 # GitHubAsync.requires_commit_signatures
 # ---------------------------------------------------------------------------
 class TestRequiresCommitSignatures:
-    """Tests for the requires_commit_signatures method."""
+    """Tests for the requires_commit_signatures method.
+
+    The decision logic lives in ``_requires_commit_signatures_uncached``;
+    the public method adds a per-``owner/repo@branch`` session cache
+    (covered by ``test_result_is_cached_per_branch`` below).
+    """
 
     @pytest.mark.asyncio
     async def test_classic_protection_enabled(self):
@@ -196,7 +201,7 @@ class TestRequiresCommitSignatures:
         api.get = AsyncMock(return_value={"enabled": True})
         api.log = AsyncMock()
         api.log.debug = lambda *a, **kw: None
-        result = await GitHubAsync.requires_commit_signatures(
+        result = await GitHubAsync._requires_commit_signatures_uncached(
             api, "owner", "repo", "main"
         )
         assert result is True
@@ -214,7 +219,7 @@ class TestRequiresCommitSignatures:
         )
         api.log = AsyncMock()
         api.log.debug = lambda *a, **kw: None
-        result = await GitHubAsync.requires_commit_signatures(
+        result = await GitHubAsync._requires_commit_signatures_uncached(
             api, "owner", "repo", "main"
         )
         assert result is False
@@ -243,7 +248,7 @@ class TestRequiresCommitSignatures:
         api.log = AsyncMock()
         api.log.debug = lambda *a, **kw: None
         api._ruleset_applies_to_branch = GitHubAsync._ruleset_applies_to_branch
-        result = await GitHubAsync.requires_commit_signatures(
+        result = await GitHubAsync._requires_commit_signatures_uncached(
             api, "owner", "repo", "main"
         )
         assert result is True
@@ -272,7 +277,7 @@ class TestRequiresCommitSignatures:
         api.log = AsyncMock()
         api.log.debug = lambda *a, **kw: None
         api._ruleset_applies_to_branch = GitHubAsync._ruleset_applies_to_branch
-        result = await GitHubAsync.requires_commit_signatures(
+        result = await GitHubAsync._requires_commit_signatures_uncached(
             api, "owner", "repo", "main"
         )
         assert result is False
@@ -283,7 +288,7 @@ class TestRequiresCommitSignatures:
         api.get = AsyncMock(side_effect=Exception("Server error"))
         api.log = AsyncMock()
         api.log.debug = lambda *a, **kw: None
-        result = await GitHubAsync.requires_commit_signatures(
+        result = await GitHubAsync._requires_commit_signatures_uncached(
             api, "owner", "repo", "main"
         )
         assert result is False
@@ -295,7 +300,7 @@ class TestRequiresCommitSignatures:
         api.get = AsyncMock(return_value={"enabled": True})
         api.log = AsyncMock()
         api.log.debug = lambda *a, **kw: None
-        result = await GitHubAsync.requires_commit_signatures(
+        result = await GitHubAsync._requires_commit_signatures_uncached(
             api, "owner", "repo", "release/v1"
         )
         assert result is True
@@ -303,6 +308,24 @@ class TestRequiresCommitSignatures:
         called_path = api.get.call_args_list[0][0][0]
         assert "release%2Fv1" in called_path
         assert "release/v1" not in called_path
+
+    @pytest.mark.asyncio
+    async def test_result_is_cached_per_branch(self):
+        """The public method caches the verdict per owner/repo@branch."""
+        async with GitHubAsync(token="t") as api:
+            api.get = AsyncMock(return_value={"enabled": True})  # type: ignore[method-assign]
+            first = await api.requires_commit_signatures("owner", "repo", "main")
+            calls_after_first = api.get.await_count
+            second = await api.requires_commit_signatures("owner", "repo", "main")
+
+            assert first is True
+            assert second is True
+            # No additional API traffic for the repeat lookup.
+            assert api.get.await_count == calls_after_first
+
+            # A different branch is a different cache entry.
+            await api.requires_commit_signatures("owner", "repo", "dev")
+            assert api.get.await_count > calls_after_first
 
 
 # ---------------------------------------------------------------------------

@@ -348,14 +348,15 @@ class TestCLI:
             assert "No similar PRs found" in result.stdout
             # Check for merge message (may include Rich color codes)
             assert "22" in result.stdout
-            # Check for merge success message (may include Rich color codes)
-            assert "✅ Merged:" in result.stdout
-            assert "1" in result.stdout and "PRs" in result.stdout
+            # Per-PR ✅ Merged lines are no longer printed during real
+            # merges (the live tracker conveys progress); assert the
+            # final summary reports the merge instead.
+            assert "Final Results:" in result.stdout
+            assert "1 merged" in result.stdout
 
             # Test passes if we reach this point - the merge was successful
         # The mocking prevented actual HTTP calls and the CLI completed successfully
-        # Check that the PR URL appears in the success message
-        assert "https://github.com/owner/repo/pull/22" in result.stdout
+        assert "0 failed" in result.stdout
 
     @patch("dependamerge.cli.GitHubClient")
     def test_merge_command_non_automation_pr_no_override(self, mock_client_class):
