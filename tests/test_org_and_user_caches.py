@@ -482,6 +482,75 @@ class TestRepoBranchSessionCaches:
             assert second == []
 
     @pytest.mark.asyncio
+    async def test_required_status_checks_error_result_not_cached(self):
+        """An error-degraded (empty) result must not be pinned.
+
+        The fetch treats API errors as "no required checks"; caching
+        that verdict would let a transient outage misclassify blocked
+        PRs for the rest of the session.  The next call retries.
+        """
+        async with GitHubAsync(token="fake-token") as gh:
+            healthy = False
+
+            async def mock_get(url: str):
+                if not healthy:
+                    raise Exception("500 Server Error")
+                if url == "/repos/org/repo":
+                    return {"default_branch": "main"}
+                if url.endswith("/rulesets?per_page=100"):
+                    return [{"id": 7}]
+                if url.endswith("/rulesets/7"):
+                    return {
+                        "id": 7,
+                        "conditions": {},
+                        "rules": [
+                            {
+                                "type": "required_status_checks",
+                                "parameters": {
+                                    "required_status_checks": [{"context": "ci/build"}]
+                                },
+                            }
+                        ],
+                    }
+                return {}
+
+            gh.get = AsyncMock(side_effect=mock_get)  # type: ignore[method-assign]
+
+            # Outage: degraded empty verdict, not cached.
+            assert await gh.get_required_status_checks("org", "repo", "main") == []
+
+            # API recovers: the retry sees the real required checks.
+            healthy = True
+            result = await gh.get_required_status_checks("org", "repo", "main")
+            assert result == [{"context": "ci/build"}]
+
+            # And the reliable result IS cached.
+            calls_before = gh.get.await_count
+            again = await gh.get_required_status_checks("org", "repo", "main")
+            assert again == [{"context": "ci/build"}]
+            assert gh.get.await_count == calls_before
+
+    @pytest.mark.asyncio
+    async def test_required_status_checks_404_protection_cached(self):
+        """A 404 on the fallback endpoint is definitive and cached."""
+        async with GitHubAsync(token="fake-token") as gh:
+
+            async def mock_get(url: str):
+                if url == "/repos/org/repo":
+                    return {"default_branch": "main"}
+                if url.endswith("/rulesets?per_page=100"):
+                    return []
+                raise Exception("404 Not Found")
+
+            gh.get = AsyncMock(side_effect=mock_get)  # type: ignore[method-assign]
+
+            assert await gh.get_required_status_checks("org", "repo", "main") == []
+            calls_after_first = gh.get.await_count
+            assert await gh.get_required_status_checks("org", "repo", "main") == []
+            # "No protection" (404) is a real verdict — served from cache.
+            assert gh.get.await_count == calls_after_first
+
+    @pytest.mark.asyncio
     async def test_default_branch_cached(self):
         async with GitHubAsync(token="fake-token") as gh:
             gh.get = AsyncMock(return_value={"default_branch": "master"})  # type: ignore[method-assign]

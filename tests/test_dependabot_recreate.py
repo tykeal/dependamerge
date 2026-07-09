@@ -190,9 +190,11 @@ class TestCheckPrCommitSignatures:
 class TestRequiresCommitSignatures:
     """Tests for the requires_commit_signatures method.
 
-    The decision logic lives in ``_requires_commit_signatures_uncached``;
-    the public method adds a per-``owner/repo@branch`` session cache
-    (covered by ``test_result_is_cached_per_branch`` below).
+    The decision logic lives in ``_requires_commit_signatures_uncached``
+    (which returns a ``(verdict, reliable)`` tuple); the public method
+    adds a per-``owner/repo@branch`` session cache that only stores
+    reliable verdicts (covered by ``test_result_is_cached_per_branch``
+    and ``test_unreliable_verdict_not_cached`` below).
     """
 
     @pytest.mark.asyncio
@@ -201,10 +203,11 @@ class TestRequiresCommitSignatures:
         api.get = AsyncMock(return_value={"enabled": True})
         api.log = AsyncMock()
         api.log.debug = lambda *a, **kw: None
-        result = await GitHubAsync._requires_commit_signatures_uncached(
+        result, reliable = await GitHubAsync._requires_commit_signatures_uncached(
             api, "owner", "repo", "main"
         )
         assert result is True
+        assert reliable is True
 
     @pytest.mark.asyncio
     async def test_classic_protection_disabled(self):
@@ -219,10 +222,11 @@ class TestRequiresCommitSignatures:
         )
         api.log = AsyncMock()
         api.log.debug = lambda *a, **kw: None
-        result = await GitHubAsync._requires_commit_signatures_uncached(
+        result, reliable = await GitHubAsync._requires_commit_signatures_uncached(
             api, "owner", "repo", "main"
         )
         assert result is False
+        assert reliable is True
 
     @pytest.mark.asyncio
     async def test_classic_protection_404_falls_through_to_rulesets(self):
@@ -248,10 +252,11 @@ class TestRequiresCommitSignatures:
         api.log = AsyncMock()
         api.log.debug = lambda *a, **kw: None
         api._ruleset_applies_to_branch = GitHubAsync._ruleset_applies_to_branch
-        result = await GitHubAsync._requires_commit_signatures_uncached(
+        result, reliable = await GitHubAsync._requires_commit_signatures_uncached(
             api, "owner", "repo", "main"
         )
         assert result is True
+        assert reliable is True
 
     @pytest.mark.asyncio
     async def test_ruleset_inactive_is_ignored(self):
@@ -277,10 +282,11 @@ class TestRequiresCommitSignatures:
         api.log = AsyncMock()
         api.log.debug = lambda *a, **kw: None
         api._ruleset_applies_to_branch = GitHubAsync._ruleset_applies_to_branch
-        result = await GitHubAsync._requires_commit_signatures_uncached(
+        result, reliable = await GitHubAsync._requires_commit_signatures_uncached(
             api, "owner", "repo", "main"
         )
         assert result is False
+        assert reliable is True
 
     @pytest.mark.asyncio
     async def test_both_apis_error_returns_false(self):
@@ -288,10 +294,13 @@ class TestRequiresCommitSignatures:
         api.get = AsyncMock(side_effect=Exception("Server error"))
         api.log = AsyncMock()
         api.log.debug = lambda *a, **kw: None
-        result = await GitHubAsync._requires_commit_signatures_uncached(
+        result, reliable = await GitHubAsync._requires_commit_signatures_uncached(
             api, "owner", "repo", "main"
         )
         assert result is False
+        # Error-derived False verdicts are flagged unreliable so the
+        # public method will not cache them.
+        assert reliable is False
 
     @pytest.mark.asyncio
     async def test_branch_with_slash_is_url_encoded(self):
@@ -300,10 +309,11 @@ class TestRequiresCommitSignatures:
         api.get = AsyncMock(return_value={"enabled": True})
         api.log = AsyncMock()
         api.log.debug = lambda *a, **kw: None
-        result = await GitHubAsync._requires_commit_signatures_uncached(
+        result, reliable = await GitHubAsync._requires_commit_signatures_uncached(
             api, "owner", "repo", "release/v1"
         )
         assert result is True
+        assert reliable is True
         # The REST call must URL-encode the slash in the branch name
         called_path = api.get.call_args_list[0][0][0]
         assert "release%2Fv1" in called_path
@@ -326,6 +336,34 @@ class TestRequiresCommitSignatures:
             # A different branch is a different cache entry.
             await api.requires_commit_signatures("owner", "repo", "dev")
             assert api.get.await_count > calls_after_first
+
+    @pytest.mark.asyncio
+    async def test_unreliable_verdict_not_cached(self):
+        """A False verdict derived from transient errors is retried."""
+        async with GitHubAsync(token="t") as api:
+            # First lookup: every request fails (transient outage) →
+            # False, but unreliable and therefore uncached.  Second
+            # lookup: classic protection answers definitively → True,
+            # cached.
+            api.get = AsyncMock(  # type: ignore[method-assign]
+                side_effect=[
+                    Exception("500 Server Error"),  # classic protection
+                    Exception("500 Server Error"),  # repo metadata
+                    Exception("500 Server Error"),  # rulesets list
+                    {"enabled": True},  # retry: classic protection
+                ]
+            )
+
+            first = await api.requires_commit_signatures("owner", "repo", "main")
+            second = await api.requires_commit_signatures("owner", "repo", "main")
+            calls_after_second = api.get.await_count
+            third = await api.requires_commit_signatures("owner", "repo", "main")
+
+            assert first is False
+            assert second is True
+            assert third is True
+            # The reliable True verdict was cached; no more traffic.
+            assert api.get.await_count == calls_after_second
 
 
 # ---------------------------------------------------------------------------

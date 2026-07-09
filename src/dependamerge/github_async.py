@@ -1190,20 +1190,35 @@ class GitHubAsync:
         the requirement is branch-protection/ruleset configuration that
         does not change while dependamerge runs, and the uncached path
         costs up to 3 + N requests (classic-protection probe, repo
-        metadata, ruleset list, one detail GET per ruleset).
+        metadata, ruleset list, one detail GET per ruleset).  Verdicts
+        derived from transient API errors are *not* cached, so a
+        momentary outage cannot pin a wrong answer for the whole run.
         """
         cache_key = f"{owner}/{repo}@{branch}"
         cached = self._requires_signatures_cache.get(cache_key)
         if cached is not None:
             return cached
-        result = await self._requires_commit_signatures_uncached(owner, repo, branch)
-        self._requires_signatures_cache[cache_key] = result
+        result, reliable = await self._requires_commit_signatures_uncached(
+            owner, repo, branch
+        )
+        if reliable:
+            self._requires_signatures_cache[cache_key] = result
         return result
 
     async def _requires_commit_signatures_uncached(
         self, owner: str, repo: str, branch: str
-    ) -> bool:
-        """Uncached implementation of :meth:`requires_commit_signatures`."""
+    ) -> tuple[bool, bool]:
+        """Uncached implementation of :meth:`requires_commit_signatures`.
+
+        Returns:
+            Tuple of ``(requires_signatures, reliable)``.  ``reliable``
+            is False when a transient (non-404) API error prevented a
+            definitive verdict — a ``True`` verdict is always reliable
+            (positive evidence), but an error-derived ``False`` must
+            not be cached because the requirement may simply have been
+            unreadable at that moment.
+        """
+        reliable = True
         # --- 1. Classic branch protection ---
         try:
             # The signatures endpoint returns 200 with {"enabled": true/false}
@@ -1219,10 +1234,11 @@ class GitHubAsync:
                     repo,
                     branch,
                 )
-                return True
+                return True, True
         except Exception as e:
             # 404 → not enabled; other errors → continue checking rulesets
             if "404" not in str(e):
+                reliable = False
                 self.log.debug(
                     "Error checking classic signature requirement for %s/%s:%s: %s",
                     owner,
@@ -1273,6 +1289,10 @@ class GitHubAsync:
                     if not isinstance(detail, dict):
                         continue
                 except Exception as detail_err:
+                    # An unreadable ruleset could hide a
+                    # required_signatures rule — the eventual False
+                    # verdict is no longer definitive.
+                    reliable = False
                     self.log.debug(
                         "Could not fetch ruleset %s for %s/%s: %s",
                         ruleset_id,
@@ -1307,8 +1327,9 @@ class GitHubAsync:
                                 branch,
                                 detail.get("name", "unknown"),
                             )
-                            return True
+                            return True, True
         except Exception as e:
+            reliable = False
             self.log.debug(
                 "Error checking rulesets for signature requirement on %s/%s:%s: %s",
                 owner,
@@ -1317,7 +1338,7 @@ class GitHubAsync:
                 e,
             )
 
-        return False
+        return False, reliable
 
     @staticmethod
     def _ruleset_applies_to_branch(
@@ -1413,7 +1434,11 @@ class GitHubAsync:
         consults it repeatedly (several times per blocked PR).  The
         uncached path costs 2 + N requests (repo + ruleset list + one
         detail GET per ruleset), so the cache saves a burst of API
-        traffic on every repeat.
+        traffic on every repeat.  Results assembled while any of those
+        requests failed are *not* cached: the fetch treats errors as
+        "no required checks", and pinning that error-derived verdict
+        for the whole session could misclassify blocked PRs long after
+        a transient outage has passed.
         """
         cache_key = f"{owner}/{repo}@{branch}"
         cached = self._required_checks_cache.get(cache_key)
@@ -1423,6 +1448,7 @@ class GitHubAsync:
 
         required_checks: list[dict[str, Any]] = []
         seen_contexts: set[str] = set()
+        reliable = True
 
         # Resolve the repo's actual default branch so that ~DEFAULT_BRANCH
         # ruleset conditions are evaluated correctly (not hardcoded to
@@ -1471,10 +1497,12 @@ class GitHubAsync:
                                             seen_contexts.add(ctx)
                                             required_checks.append(check)
                     except Exception as detail_err:
+                        reliable = False
                         self.log.debug(
                             f"Could not fetch ruleset {ruleset_id} details: {detail_err}"
                         )
         except Exception as e:
+            reliable = False
             self.log.debug(f"Could not fetch rulesets for {owner}/{repo}: {e}")
 
         # Fall back to branch protection if no ruleset checks found
@@ -1494,12 +1522,16 @@ class GitHubAsync:
                             if ctx not in seen_contexts:
                                 seen_contexts.add(ctx)
                                 required_checks.append(check)
-            except Exception:
+            except Exception as e:
                 # Branch protection may be absent or inaccessible with
-                # the current token; treat as no required checks.
-                pass
+                # the current token; treat as no required checks.  A
+                # plain 404 is the definitive "no protection" answer;
+                # anything else leaves the verdict unreliable.
+                if "404" not in str(e):
+                    reliable = False
 
-        self._required_checks_cache[cache_key] = list(required_checks)
+        if reliable:
+            self._required_checks_cache[cache_key] = list(required_checks)
         return required_checks
 
     async def get_branch_protection(

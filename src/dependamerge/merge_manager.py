@@ -657,7 +657,12 @@ class AsyncMergeManager:
             tracker.merge_pending(pr_key)
         else:
             # Defensive: an unexpected terminal status still counts
-            # toward completion so the percentage reaches 100%.
+            # toward completion so the percentage reaches 100%.  Clear
+            # any transitory display state first so the PR cannot be
+            # left stuck in "rebasing"/"waiting" on the live display
+            # if a new terminal status is added without a counter
+            # mapping here.
+            tracker.track_pr_state(pr_key, None)
             tracker.pr_completed()
 
     def _track_pr_state(self, pr_info: PullRequestInfo, state: str | None) -> None:
