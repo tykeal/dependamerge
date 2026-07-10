@@ -1981,8 +1981,12 @@ class GitHubAsync:
         Returns:
             The ``behind_by`` commit count, or ``None`` when the
             comparison could not be performed (API error, unexpected
-            payload).  Callers must treat ``None`` as "unknown", not
-            as "up to date".
+            payload).  ``None`` means "unknown": callers must not
+            interpret it as ``behind_by == 0`` ("up to date"), and
+            staleness-driven write actions (e.g. requesting a rebase)
+            should require positive evidence (``behind_by > 0``)
+            rather than acting on an unknown — the pattern used by
+            ``AsyncMergeManager._blocked_pr_needs_rebase``.
         """
         encoded_base = quote(base_ref, safe="")
         try:
