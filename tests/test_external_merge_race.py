@@ -182,7 +182,7 @@ class TestEarlyExitClosedPrPath:
         assert result.error == "already merged externally"
 
     @pytest.mark.asyncio
-    async def test_closed_without_merge_is_failed(self) -> None:
+    async def test_closed_without_merge_is_closed(self) -> None:
         mgr, client = make_merge_manager()
         # Recheck call returns closed but not merged.
         client.get = AsyncMock(return_value={"state": "closed", "merged": False})

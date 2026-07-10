@@ -296,7 +296,7 @@ class TestHandleMergeConflict:
         assert result.status == MergeStatus.AUTO_MERGE_PENDING
 
     @pytest.mark.asyncio
-    async def test_closed_without_merge_fails(self) -> None:
+    async def test_closed_without_merge_reports_closed(self) -> None:
         """A PR closed without merging during the wait reports CLOSED."""
         mgr, _client = make_merge_manager()
         pr = _make_pr()

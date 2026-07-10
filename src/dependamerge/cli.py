@@ -982,6 +982,8 @@ def _print_final_merge_summary(real_results: list[MergeResult]) -> None:
     parts.append(f"{final_failed} failed")
     if final_skipped > 0:
         parts.append(f"{final_skipped} skipped")
+    if final_blocked > 0:
+        parts.append(f"{final_blocked} blocked")
     if final_closed > 0:
         parts.append(f"{final_closed} closed")
     console.print(f"\n🚀 Final Results: {', '.join(parts)}")
@@ -1056,8 +1058,8 @@ def _print_failed_pr_details(
     no longer printed to the console at all (progress is conveyed
     by the live tracker counters), so this end-of-run report is
     the *only* place reasons appear.  It therefore covers every
-    non-merged terminal outcome — failed, blocked, skipped and
-    auto-merge pending — one section per outcome.
+    non-merged terminal outcome — failed, blocked, skipped, closed
+    and auto-merge pending — one section per outcome.
     """
     sections: list[tuple[str, str]] = [
         ("failed", "\n❌ Failed PRs:"),
@@ -1116,6 +1118,8 @@ def _display_merge_results(
         parts.append(f"{failed_count} failed")
         if skipped_count > 0:
             parts.append(f"{skipped_count} skipped")
+        if blocked_count > 0:
+            parts.append(f"{blocked_count} blocked")
         if closed_count > 0:
             parts.append(f"{closed_count} closed")
         console.print(f"📈 Final Results: {', '.join(parts)}")

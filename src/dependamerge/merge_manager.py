@@ -641,7 +641,8 @@ class AsyncMergeManager:
 
         This is the **single** place terminal outcomes reach the
         tracker: every PR ends in exactly one counter (merged /
-        failed / skipped / blocked / pending), its transitory
+        failed / skipped / blocked / closed / pending), its
+        transitory
         display state (rebasing, waiting, …) is cleared, and the
         PR-level completion percentage advances.  Centralising the
         accounting here closes the historical "result returned but
@@ -4361,10 +4362,13 @@ class AsyncMergeManager:
         if not isinstance(pr_data, dict):
             return None, None
         state = pr_data.get("state")
-        return (
-            state if isinstance(state, str) else None,
-            bool(pr_data.get("merged")),
-        )
+        merged = pr_data.get("merged")
+        if not isinstance(state, str) or not isinstance(merged, bool):
+            # Malformed payload — degrade to unknown rather than
+            # coercing a missing/mistyped field into a concrete
+            # verdict the callers would act on.
+            return None, None
+        return state, merged
 
     async def _is_pr_dirty_now(
         self, pr_info: PullRequestInfo, owner: str, repo: str
