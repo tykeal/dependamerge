@@ -5,9 +5,11 @@
 
 Package: `src/dependamerge/engine/`
 
-Status: **Phase 1 — engine landed standalone (this document's PR).**
-Nothing in the production merge path uses it yet; wiring happens in a
-follow-up PR (see [Migration plan](#migration-plan)).
+Status: **Phase 1 landed standalone; Phase 2 (park-aware slots) wired
+into the production path via `slot_lease.py`.** The engine package
+itself remains standalone; Phase 2 ports its central scheduling
+semantic — waiting holds no concurrency slot — into the legacy
+orchestration directly (see [Migration plan](#migration-plan)).
 
 ## Motivation
 
@@ -196,7 +198,39 @@ pipelines; Phase 2 re-asserts them end-to-end):
 Engine package + tests. Standalone: no production code path imports
 it, no behaviour change, full legacy suite must pass untouched.
 
-### Phase 2 (follow-up PR)
+### Phase 2 (landed: park-aware slots via `slot_lease.py`)
+
+Phase 2 as originally sketched (a full pipeline adapter decomposing
+`_merge_single_pr` into engine phases) would rework ~96
+orchestration-level test functions in one step. Instead, the phase
+delivers the engine's highest-value semantic — **slot-free waiting**
+— as a minimal, surgical port that leaves the legacy control flow
+(and its test seams) intact:
+
+1. `slot_lease.py` — `holding_slot(semaphore)` replaces the bare
+   `async with semaphore:` in `_merge_single_pr_with_semaphore` and
+   publishes a re-acquirable `SlotLease` through a `ContextVar`;
+   `parked()` releases the current task's slot while a wait runs and
+   re-acquires it before active work resumes. Nested parks
+   and parks outside a lease are no-ops, so helpers stay safe from
+   any call site.
+2. Every long waiting loop in the merge path now runs inside
+   `parked()`: the auto-merge wait (`_wait_for_auto_merge`, which
+   also serves both conflict-recovery phases), the pre-commit.ci
+   re-trigger poll, the dependabot recreate poll (including the
+   nested recreated-PR checks wait), and the post-rebase settle +
+   poll in the rebase module.
+3. Invariants preserved: ≤1 in-flight PR per repository (the striped
+   scheduler's serial repo workers stay as-is — parking releases
+   the *global* slot, never the per-repo serialisation), per-repo
+   merge-dispatch locks are never held across a park, and the
+   `_waiting_prs` ticker still tracks every waiting PR.
+
+This fixes structural problem 1 (waiting pins concurrency slots)
+for the production path. Problems 2 (per-loop budgets) and 3
+(scattered recovery routing) remain engine-phase work — the original
+pipeline-adapter plan below still applies if/when we want full
+decomposition:
 
 1. **Pipeline adapter** implementing `PhaseRunner` with phases mapping
    the legacy steps: `intake` (github2gerrit detection, merge-method

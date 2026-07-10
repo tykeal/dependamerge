@@ -66,6 +66,7 @@ from .git_ops import (
     secure_rmtree,
 )
 from .models import PullRequestInfo
+from .slot_lease import parked
 
 if TYPE_CHECKING:
     from .github_async import GitHubAsync
@@ -762,18 +763,22 @@ async def _run_rest_path(
         # ``_poll_post_rebase`` polls at that cadence anyway and
         # tolerates the transient ``null``/``behind`` states GitHub
         # reports while recomputing, so a short head start just gets
-        # the first data point sooner.
+        # the first data point sooner.  The settle sleep and the poll
+        # are both waits on GitHub-side processing, so the worker's
+        # concurrency slot is released for their duration
+        # (``parked()`` — see ``slot_lease.py``).
         ctx.log.debug("Waiting for rebase to process: %s", pr_info.html_url)
         _set_tracker_state(ctx, pr_info, "waiting")
-        await asyncio.sleep(min(2.0, ctx.merge_recheck_interval))
+        async with parked():
+            await asyncio.sleep(min(2.0, ctx.merge_recheck_interval))
 
-        updated_mergeable, updated_mergeable_state = await _poll_post_rebase(
-            ctx=ctx,
-            pr_info=pr_info,
-            owner=owner,
-            repo=repo,
-            auto_merge_ok=auto_merge_ok,
-        )
+            updated_mergeable, updated_mergeable_state = await _poll_post_rebase(
+                ctx=ctx,
+                pr_info=pr_info,
+                owner=owner,
+                repo=repo,
+                auto_merge_ok=auto_merge_ok,
+            )
 
         # Update our PR info with the latest state.  Preserve the
         # previous non-None values when the refresh returns

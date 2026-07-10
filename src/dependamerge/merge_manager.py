@@ -43,6 +43,7 @@ from .models import ComparisonResult, PullRequestInfo
 from .netrc import NetrcParseError, resolve_gerrit_credentials
 from .output_utils import log_and_print
 from .progress_tracker import MergeProgressTracker
+from .slot_lease import holding_slot, parked
 
 # ---------------------------------------------------------------------------
 # Centralised timing constants for all async merge operations.
@@ -691,8 +692,17 @@ class AsyncMergeManager:
     async def _merge_single_pr_with_semaphore(
         self, pr_info: PullRequestInfo
     ) -> MergeResult:
-        """Merge a single PR with concurrency control."""
-        async with self._merge_semaphore:
+        """Merge a single PR with concurrency control.
+
+        The slot is leased, not pinned: any wait loop inside
+        ``_merge_single_pr`` that wraps itself in ``parked()`` (the
+        auto-merge wait, post-rebase polls, recreate waits, …)
+        releases the slot for the duration of the wait and re-acquires
+        it before resuming active work, so PRs waiting on external
+        events (dependabot rebases, CI) never starve runnable PRs.
+        See ``slot_lease.py`` and ``docs/MERGE_ENGINE_DESIGN.md``.
+        """
+        async with holding_slot(self._merge_semaphore):
             result = await self._merge_single_pr(pr_info)
             # Single terminal-accounting point: map the result status
             # onto the tracker counters (see _record_terminal_outcome).
@@ -3232,47 +3242,50 @@ class AsyncMergeManager:
         # 4. Poll for the status to appear (up to ~5 minutes)
         # pre-commit.ci can take up to five minutes to run and report back,
         # so we need a generous timeout to avoid prematurely marking PRs as
-        # unmergeable when the check simply hasn't finished yet.
+        # unmergeable when the check simply hasn't finished yet.  The
+        # whole poll is a wait on an external service, so the worker's
+        # concurrency slot is released for its duration (``parked()``).
         max_polls = self._merge_poll_max_attempts
-        for attempt in range(max_polls):
-            await asyncio.sleep(self._merge_recheck_interval)
-            try:
-                status_data = await self._github_client.get(
-                    f"/repos/{repo_owner}/{repo_name}/commits/{pr_info.head_sha}/status"
-                )
-                if isinstance(status_data, dict):
-                    for s in status_data.get("statuses", []):
-                        if not isinstance(s, dict):
-                            continue
-                        if s.get("context") != precommit_context:
-                            continue
-                        state = s.get("state")
-                        if state == "success":
-                            self._pr_status(
-                                f"✅ pre-commit.ci passed: {pr_info.html_url}",
-                                level="info",
-                            )
-                            return True
-                        elif state in ("failure", "error"):
-                            self._pr_status(
-                                f"❌ pre-commit.ci failed: {pr_info.html_url}",
-                                level="warning",
-                            )
-                            return False
-                        # state == "pending" — keep polling
-            except Exception as e:
-                self.log.debug(
-                    "Failed to poll pre-commit.ci status for %s: %s",
-                    f"{pr_info.repository_full_name}#{pr_info.number}",
-                    e,
-                )
+        async with parked():
+            for attempt in range(max_polls):
+                await asyncio.sleep(self._merge_recheck_interval)
+                try:
+                    status_data = await self._github_client.get(
+                        f"/repos/{repo_owner}/{repo_name}/commits/{pr_info.head_sha}/status"
+                    )
+                    if isinstance(status_data, dict):
+                        for s in status_data.get("statuses", []):
+                            if not isinstance(s, dict):
+                                continue
+                            if s.get("context") != precommit_context:
+                                continue
+                            state = s.get("state")
+                            if state == "success":
+                                self._pr_status(
+                                    f"✅ pre-commit.ci passed: {pr_info.html_url}",
+                                    level="info",
+                                )
+                                return True
+                            elif state in ("failure", "error"):
+                                self._pr_status(
+                                    f"❌ pre-commit.ci failed: {pr_info.html_url}",
+                                    level="warning",
+                                )
+                                return False
+                            # state == "pending" — keep polling
+                except Exception as e:
+                    self.log.debug(
+                        "Failed to poll pre-commit.ci status for %s: %s",
+                        f"{pr_info.repository_full_name}#{pr_info.number}",
+                        e,
+                    )
 
-            if attempt == max_polls - 1:
-                self.log.debug(
-                    f"Still waiting for pre-commit.ci on "
-                    f"{pr_info.repository_full_name}#{pr_info.number} "
-                    f"({(attempt + 1) * self._merge_recheck_interval:.0f}s elapsed)"
-                )
+                if attempt == max_polls - 1:
+                    self.log.debug(
+                        f"Still waiting for pre-commit.ci on "
+                        f"{pr_info.repository_full_name}#{pr_info.number} "
+                        f"({(attempt + 1) * self._merge_recheck_interval:.0f}s elapsed)"
+                    )
 
         self.log.warning(
             f"Timed out waiting for pre-commit.ci on "
@@ -3646,91 +3659,97 @@ class AsyncMergeManager:
 
         # 6. Poll for the old PR to close and a replacement to appear.
         #    Dependabot typically responds within 30-90 seconds.
-        #    We poll using the centralised merge timeout.
+        #    We poll using the centralised merge timeout.  The whole
+        #    poll (including the nested recreated-PR checks wait) is a
+        #    wait on dependabot + CI, so the worker's concurrency slot
+        #    is released for its duration (``parked()``).
         max_polls = self._merge_poll_max_attempts
         old_pr_closed = False
 
-        for attempt in range(max_polls):
-            await asyncio.sleep(self._merge_recheck_interval)
+        async with parked():
+            for attempt in range(max_polls):
+                await asyncio.sleep(self._merge_recheck_interval)
 
-            # 6a. Check if the old PR has been closed
-            if not old_pr_closed:
-                try:
-                    old_pr_data = await self._github_client.get(
-                        f"/repos/{repo_owner}/{repo_name}/pulls/{pr_info.number}"
-                    )
-                    if isinstance(old_pr_data, dict):
-                        if old_pr_data.get("state") == "closed":
-                            old_pr_closed = True
-                            self._pr_status(
-                                f"✅ Old PR closed by dependabot: "
-                                f"{pr_info.html_url} "
-                                f"({(attempt + 1) * self._merge_recheck_interval:.0f}s elapsed)",
-                                level="info",
-                            )
-                except Exception as e:
-                    self.log.debug(
-                        "Error polling old PR state for %s#%s: %s",
-                        pr_info.repository_full_name,
-                        pr_info.number,
-                        e,
-                    )
-
-            # 6b. Once the old PR is closed, look for the replacement
-            if old_pr_closed:
-                try:
-                    # Search for open PRs from dependabot on the same head branch
-                    prs = await self._github_client.get(
-                        f"/repos/{repo_owner}/{repo_name}/pulls"
-                        f"?state=open&head={repo_owner}:{pr_info.head_branch}&per_page=5"
-                    )
-                    if isinstance(prs, list):
-                        for pr_data in prs:
-                            if not isinstance(pr_data, dict):
-                                continue
-                            pr_author = pr_data.get("user", {}).get("login", "")
-                            if not is_dependabot(pr_author):
-                                continue
-
-                            new_number = pr_data.get("number")
-                            if new_number is None or new_number == pr_info.number:
-                                continue
-
-                            # Verify the replacement targets the same base branch
-                            new_base = pr_data.get("base", {}).get("ref", "")
-                            if new_base != (pr_info.base_branch or "main"):
-                                self.log.debug(
-                                    "Skipping candidate PR #%s: targets %s, "
-                                    "expected %s",
-                                    new_number,
-                                    new_base,
-                                    pr_info.base_branch or "main",
+                # 6a. Check if the old PR has been closed
+                if not old_pr_closed:
+                    try:
+                        old_pr_data = await self._github_client.get(
+                            f"/repos/{repo_owner}/{repo_name}/pulls/{pr_info.number}"
+                        )
+                        if isinstance(old_pr_data, dict):
+                            if old_pr_data.get("state") == "closed":
+                                old_pr_closed = True
+                                self._pr_status(
+                                    f"✅ Old PR closed by dependabot: "
+                                    f"{pr_info.html_url} "
+                                    f"({(attempt + 1) * self._merge_recheck_interval:.0f}s elapsed)",
+                                    level="info",
                                 )
-                                continue
+                    except Exception as e:
+                        self.log.debug(
+                            "Error polling old PR state for %s#%s: %s",
+                            pr_info.repository_full_name,
+                            pr_info.number,
+                            e,
+                        )
 
-                            # Found a replacement — now wait for checks to pass
-                            new_pr_info = await self._wait_for_recreated_pr_checks(
-                                repo_owner, repo_name, new_number, pr_data
-                            )
-                            # Always return after the first wait attempt to avoid
-                            # performing multiple long waits for the same PR.
-                            return new_pr_info
-                except Exception as e:
+                # 6b. Once the old PR is closed, look for the replacement
+                if old_pr_closed:
+                    try:
+                        # Search for open PRs from dependabot on the same head branch
+                        prs = await self._github_client.get(
+                            f"/repos/{repo_owner}/{repo_name}/pulls"
+                            f"?state=open&head={repo_owner}:{pr_info.head_branch}&per_page=5"
+                        )
+                        if isinstance(prs, list):
+                            for pr_data in prs:
+                                if not isinstance(pr_data, dict):
+                                    continue
+                                pr_author = pr_data.get("user", {}).get("login", "")
+                                if not is_dependabot(pr_author):
+                                    continue
+
+                                new_number = pr_data.get("number")
+                                if new_number is None or new_number == pr_info.number:
+                                    continue
+
+                                # Verify the replacement targets the same base branch
+                                new_base = pr_data.get("base", {}).get("ref", "")
+                                if new_base != (pr_info.base_branch or "main"):
+                                    self.log.debug(
+                                        "Skipping candidate PR #%s: targets %s, "
+                                        "expected %s",
+                                        new_number,
+                                        new_base,
+                                        pr_info.base_branch or "main",
+                                    )
+                                    continue
+
+                                # Found a replacement — now wait for checks to pass
+                                new_pr_info = (
+                                    await self._wait_for_recreated_pr_checks(
+                                        repo_owner, repo_name, new_number, pr_data
+                                    )
+                                )
+                                # Always return after the first wait attempt to avoid
+                                # performing multiple long waits for the same PR.
+                                return new_pr_info
+                    except Exception as e:
+                        self.log.debug(
+                            "Error searching for replacement PR for %s#%s: %s",
+                            pr_info.repository_full_name,
+                            pr_info.number,
+                            e,
+                        )
+
+                if attempt % 3 == 2:
                     self.log.debug(
-                        "Error searching for replacement PR for %s#%s: %s",
+                        "Still waiting for dependabot recreate on %s#%s (%.0fs elapsed, old_pr_closed=%s)",
                         pr_info.repository_full_name,
                         pr_info.number,
-                        e,
+                        (attempt + 1) * self._merge_recheck_interval,
+                        old_pr_closed,
                     )
-
-            if attempt % 3 == 2:
-                self.log.debug(
-                    "Still waiting for dependabot recreate on %s#%s (%.0fs elapsed, old_pr_closed=%s)",
-                    pr_info.repository_full_name,
-                    pr_info.number,
-                    (attempt + 1) * self._merge_recheck_interval,
-                    old_pr_closed,
-                )
 
         self.log.warning(
             "Timed out waiting for dependabot to recreate %s#%s",
@@ -4577,89 +4596,103 @@ class AsyncMergeManager:
         merged_during_wait = False
         first_poll = True
         try:
-            while loop.time() < deadline:
-                if stop_on_clean and pr_info.mergeable_state == "clean":
-                    break
-                # Sleep no longer than the time remaining so we don't
-                # overshoot the deadline.  Clamp to non-negative: the
-                # ``while`` check and this ``time()`` call are not
-                # atomic, so a near-deadline crossing could otherwise
-                # pass ``asyncio.sleep`` a tiny negative value.  The
-                # first poll uses a much shorter delay (see
-                # ``MERGE_WAIT_FIRST_POLL_SECONDS``) so a PR that
-                # resolved the moment the wait started is detected
-                # promptly instead of a full interval late.
-                interval = (
-                    min(MERGE_WAIT_FIRST_POLL_SECONDS, self._merge_recheck_interval)
-                    if first_poll
-                    else self._merge_recheck_interval
-                )
-                first_poll = False
-                remaining = max(0.0, deadline - loop.time())
-                await asyncio.sleep(min(interval, remaining))
-                try:
-                    refreshed_wait = await wait_client.get(
-                        f"/repos/{owner}/{repo}/pulls/{pr_info.number}"
-                    )
-                except Exception as wait_exc:
-                    self.log.debug(
-                        "Failed to refresh PR state during auto-merge "
-                        "wait for %s: %s",
-                        pr_key,
-                        wait_exc,
-                    )
-                    continue
-                if isinstance(refreshed_wait, dict):
-                    # Only overwrite when present, and preserve the
-                    # previous non-None value when GitHub returns null
-                    # (it does so while recomputing) so the
-                    # ``continue_states`` check below does not break the
-                    # loop early on a transient null.
-                    if "mergeable" in refreshed_wait:
-                        refreshed_mergeable = refreshed_wait.get("mergeable")
-                        if refreshed_mergeable is not None:
-                            pr_info.mergeable = refreshed_mergeable
-                    if "mergeable_state" in refreshed_wait:
-                        refreshed_state = refreshed_wait.get("mergeable_state")
-                        # Preserve the previous concrete state while
-                        # GitHub is still recomputing mergeability: it
-                        # returns ``null`` / ``""`` / ``"unknown"``
-                        # transiently, and overwriting with those would
-                        # push the state out of ``continue_states`` and
-                        # break the wait loop early (e.g. a ``blocked``
-                        # PR briefly going ``unknown`` would exit and
-                        # trigger a premature manual merge).
-                        if refreshed_state not in (None, "", "unknown"):
-                            pr_info.mergeable_state = refreshed_state
-                    # The head can change while we wait (rebase,
-                    # force-push); keep it current so any later
-                    # block-reason analysis queries the right commit.
-                    refreshed_head = (refreshed_wait.get("head") or {}).get("sha")
-                    if refreshed_head:
-                        pr_info.head_sha = refreshed_head
-                    if refreshed_wait.get("state") == "closed":
-                        closed_during_wait = True
-                        merged_during_wait = bool(refreshed_wait.get("merged", False))
-                        pr_info.state = "closed"
+            # The whole poll loop is a wait on an external event
+            # (auto-merge / CI / a rebase), so release this worker's
+            # concurrency slot for its duration — a parked PR must
+            # never starve runnable PRs (see ``slot_lease.py``).  The
+            # polling GETs are paced by the HTTP client's own limits.
+            async with parked():
+                while loop.time() < deadline:
+                    if stop_on_clean and pr_info.mergeable_state == "clean":
                         break
-                # A PR that becomes immediately mergeable while still
-                # ``unstable`` (only a non-required check is red) will
-                # never reach ``clean`` and never leave ``unstable``,
-                # so keeping it in ``continue_states`` would spin the
-                # wait to the deadline — the exact slow hang the
-                # Step 5.5 routing fix removes for PRs that *start*
-                # mergeable.  Break out as soon as GitHub reports
-                # ``unstable`` + ``mergeable is True`` so the caller can
-                # dispatch (auto-merge, already armed before this wait,
-                # will land it; failing that the caller merges directly).
-                if pr_info.mergeable_state == "unstable" and pr_info.mergeable is True:
-                    break
-                # Continue waiting only while the PR is in a state the
-                # caller still considers rescuable; any other value
-                # means it became mergeable, closed, or hit a terminal
-                # state, so exit and let the caller decide.
-                if pr_info.mergeable_state not in continue_states:
-                    break
+                    # Sleep no longer than the time remaining so we don't
+                    # overshoot the deadline.  Clamp to non-negative: the
+                    # ``while`` check and this ``time()`` call are not
+                    # atomic, so a near-deadline crossing could otherwise
+                    # pass ``asyncio.sleep`` a tiny negative value.  The
+                    # first poll uses a much shorter delay (see
+                    # ``MERGE_WAIT_FIRST_POLL_SECONDS``) so a PR that
+                    # resolved the moment the wait started is detected
+                    # promptly instead of a full interval late.
+                    interval = (
+                        min(
+                            MERGE_WAIT_FIRST_POLL_SECONDS,
+                            self._merge_recheck_interval,
+                        )
+                        if first_poll
+                        else self._merge_recheck_interval
+                    )
+                    first_poll = False
+                    remaining = max(0.0, deadline - loop.time())
+                    await asyncio.sleep(min(interval, remaining))
+                    try:
+                        refreshed_wait = await wait_client.get(
+                            f"/repos/{owner}/{repo}/pulls/{pr_info.number}"
+                        )
+                    except Exception as wait_exc:
+                        self.log.debug(
+                            "Failed to refresh PR state during auto-merge "
+                            "wait for %s: %s",
+                            pr_key,
+                            wait_exc,
+                        )
+                        continue
+                    if isinstance(refreshed_wait, dict):
+                        # Only overwrite when present, and preserve the
+                        # previous non-None value when GitHub returns null
+                        # (it does so while recomputing) so the
+                        # ``continue_states`` check below does not break the
+                        # loop early on a transient null.
+                        if "mergeable" in refreshed_wait:
+                            refreshed_mergeable = refreshed_wait.get("mergeable")
+                            if refreshed_mergeable is not None:
+                                pr_info.mergeable = refreshed_mergeable
+                        if "mergeable_state" in refreshed_wait:
+                            refreshed_state = refreshed_wait.get("mergeable_state")
+                            # Preserve the previous concrete state while
+                            # GitHub is still recomputing mergeability: it
+                            # returns ``null`` / ``""`` / ``"unknown"``
+                            # transiently, and overwriting with those would
+                            # push the state out of ``continue_states`` and
+                            # break the wait loop early (e.g. a ``blocked``
+                            # PR briefly going ``unknown`` would exit and
+                            # trigger a premature manual merge).
+                            if refreshed_state not in (None, "", "unknown"):
+                                pr_info.mergeable_state = refreshed_state
+                        # The head can change while we wait (rebase,
+                        # force-push); keep it current so any later
+                        # block-reason analysis queries the right commit.
+                        refreshed_head = (refreshed_wait.get("head") or {}).get("sha")
+                        if refreshed_head:
+                            pr_info.head_sha = refreshed_head
+                        if refreshed_wait.get("state") == "closed":
+                            closed_during_wait = True
+                            merged_during_wait = bool(
+                                refreshed_wait.get("merged", False)
+                            )
+                            pr_info.state = "closed"
+                            break
+                    # A PR that becomes immediately mergeable while still
+                    # ``unstable`` (only a non-required check is red) will
+                    # never reach ``clean`` and never leave ``unstable``,
+                    # so keeping it in ``continue_states`` would spin the
+                    # wait to the deadline — the exact slow hang the
+                    # Step 5.5 routing fix removes for PRs that *start*
+                    # mergeable.  Break out as soon as GitHub reports
+                    # ``unstable`` + ``mergeable is True`` so the caller can
+                    # dispatch (auto-merge, already armed before this wait,
+                    # will land it; failing that the caller merges directly).
+                    if (
+                        pr_info.mergeable_state == "unstable"
+                        and pr_info.mergeable is True
+                    ):
+                        break
+                    # Continue waiting only while the PR is in a state the
+                    # caller still considers rescuable; any other value
+                    # means it became mergeable, closed, or hit a terminal
+                    # state, so exit and let the caller decide.
+                    if pr_info.mergeable_state not in continue_states:
+                        break
         finally:
             async with self._waiting_lock:
                 self._waiting_prs.pop(pr_key, None)
