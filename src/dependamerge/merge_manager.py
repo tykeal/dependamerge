@@ -104,6 +104,11 @@ class MergeStatus(Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
     BLOCKED = "blocked"
+    # Terminal: the PR was closed without merging (dependabot decided
+    # the update is no longer needed after sibling merges, the PR was
+    # superseded, or a human closed it mid-run).  Distinct from FAILED
+    # because there is nothing for the operator to follow up on.
+    CLOSED = "closed"
 
 
 @dataclass
@@ -654,6 +659,8 @@ class AsyncMergeManager:
             tracker.merge_skipped(pr_key)
         elif status == MergeStatus.BLOCKED:
             tracker.merge_blocked(pr_key)
+        elif status == MergeStatus.CLOSED:
+            tracker.increment_closed(pr_key)
         elif status == MergeStatus.AUTO_MERGE_PENDING:
             tracker.merge_pending(pr_key)
         else:
@@ -1272,10 +1279,10 @@ class AsyncMergeManager:
                         level="info",
                     )
                     return result
-                result.status = MergeStatus.FAILED
-                result.error = "PR is already closed"
+                result.status = MergeStatus.CLOSED
+                result.error = "PR was already closed without merging"
                 self._pr_status(
-                    f"🛑 Failed: {pr_info.html_url} [already closed]",
+                    f"🚪 Closed: {pr_info.html_url} [already closed]",
                     level="info",
                 )
                 return result
@@ -1603,12 +1610,13 @@ class AsyncMergeManager:
                             level="debug",
                         )
                     else:
-                        result.status = MergeStatus.FAILED
+                        result.status = MergeStatus.CLOSED
                         result.error = (
-                            "PR closed without merging during auto-merge wait"
+                            "PR closed without merging during auto-merge wait "
+                            "(superseded or no longer needed)"
                         )
                         self._pr_status(
-                            f"🛑 Closed without merging: {pr_info.html_url}",
+                            f"🚪 Closed without merging: {pr_info.html_url}",
                             level="warning",
                         )
                     return result
@@ -1818,21 +1826,33 @@ class AsyncMergeManager:
                     # Before computing a failure reason, recheck
                     # whether the PR was actually merged externally
                     # (e.g. by a concurrent dependamerge run at org
-                    # scope, or by a human admin) while our merge
-                    # attempt was in flight.  When that has happened
-                    # there is no remaining work and no follow-up
-                    # action for the operator: classify the outcome
-                    # as SKIPPED rather than FAILED so the summary
-                    # does not request human attention.
-                    already_merged = await self._is_pr_already_merged(
+                    # scope, or by a human admin) or closed without
+                    # merging (e.g. dependabot decided the update is
+                    # no longer needed after sibling merges advanced
+                    # the base) while our merge attempt was in
+                    # flight.  Neither outcome needs human follow-up,
+                    # so classify as SKIPPED / CLOSED rather than
+                    # FAILED.
+                    ext_state, ext_merged = await self._fetch_pr_state_now(
                         pr_info, repo_owner, repo_name
                     )
-                    if already_merged:
+                    if ext_state == "closed" and ext_merged:
                         result.status = MergeStatus.SKIPPED
                         result.error = "already merged externally"
                         self._pr_status(
                             f"⏭️ Skipped: {pr_info.html_url} "
                             "[already merged externally]",
+                            level="info",
+                        )
+                        return result
+                    if ext_state == "closed":
+                        result.status = MergeStatus.CLOSED
+                        result.error = (
+                            "PR closed without merging during the run "
+                            "(superseded or no longer needed)"
+                        )
+                        self._pr_status(
+                            f"🚪 Closed without merging: {pr_info.html_url}",
                             level="info",
                         )
                         return result
@@ -4308,24 +4328,43 @@ class AsyncMergeManager:
         The intent here is to upgrade the user experience for a
         known benign race, not to mask genuine errors.
         """
+        state, merged = await self._fetch_pr_state_now(pr_info, owner, repo)
+        return state == "closed" and merged is True
+
+    async def _fetch_pr_state_now(
+        self, pr_info: PullRequestInfo, owner: str, repo: str
+    ) -> tuple[str | None, bool | None]:
+        """Best-effort fetch of a PR's current ``(state, merged)``.
+
+        Returns ``(None, None)`` on any API error or unexpected
+        payload so callers can fall back to their existing paths.
+        Used to distinguish merged-externally (SKIPPED) from
+        closed-without-merge (CLOSED — e.g. dependabot decided the
+        update is no longer needed after sibling merges advanced the
+        base branch) after a merge attempt fails.
+        """
         if not self._github_client:
-            return False
+            return None, None
         try:
             pr_data = await self._github_client.get(
                 f"/repos/{owner}/{repo}/pulls/{pr_info.number}"
             )
         except Exception as e:
             self.log.debug(
-                "Failed to recheck %s/%s#%s for external merge: %s",
+                "Failed to recheck %s/%s#%s state: %s",
                 owner,
                 repo,
                 pr_info.number,
                 e,
             )
-            return False
+            return None, None
         if not isinstance(pr_data, dict):
-            return False
-        return pr_data.get("state") == "closed" and bool(pr_data.get("merged"))
+            return None, None
+        state = pr_data.get("state")
+        return (
+            state if isinstance(state, str) else None,
+            bool(pr_data.get("merged")),
+        )
 
     async def _is_pr_dirty_now(
         self, pr_info: PullRequestInfo, owner: str, repo: str
@@ -4779,10 +4818,13 @@ class AsyncMergeManager:
                 level="debug",
             )
         else:
-            result.status = MergeStatus.FAILED
-            result.error = "PR closed without merging during conflict rebase"
+            result.status = MergeStatus.CLOSED
+            result.error = (
+                "PR closed without merging during conflict rebase "
+                "(superseded or no longer needed)"
+            )
             self._pr_status(
-                f"🛑 Closed without merging: {pr_info.html_url}",
+                f"🚪 Closed without merging: {pr_info.html_url}",
                 level="warning",
             )
         return result

@@ -958,10 +958,21 @@ def _execute_confirmed_merge(
         if ctx.show_progress and ctx.progress_tracker:
             ctx.progress_tracker.stop()
 
+    _print_final_merge_summary(real_results)
+
+
+def _print_final_merge_summary(real_results: list[MergeResult]) -> None:
+    """Print the post-run 🚀 Final Results line and per-outcome recap.
+
+    Shared by the org / repo / similar-PR confirmed-merge paths so
+    every outcome category (including closed-without-merge) renders
+    identically regardless of scope.
+    """
     final_merged = sum(1 for r in real_results if r.status.value == "merged")
     final_failed = sum(1 for r in real_results if r.status.value == "failed")
     final_skipped = sum(1 for r in real_results if r.status.value == "skipped")
     final_blocked = sum(1 for r in real_results if r.status.value == "blocked")
+    final_closed = sum(1 for r in real_results if r.status.value == "closed")
     final_auto_merge = sum(
         1 for r in real_results if r.status.value == "auto_merge_pending"
     )
@@ -971,11 +982,15 @@ def _execute_confirmed_merge(
     parts.append(f"{final_failed} failed")
     if final_skipped > 0:
         parts.append(f"{final_skipped} skipped")
+    if final_closed > 0:
+        parts.append(f"{final_closed} closed")
     console.print(f"\n🚀 Final Results: {', '.join(parts)}")
     if final_skipped > 0:
         console.print(f"⏭️ Skipped {final_skipped} PRs")
     if final_blocked > 0:
         console.print(f"🛑 Blocked {final_blocked} PRs")
+    if final_closed > 0:
+        console.print(f"🚪 Closed without merging: {final_closed} PRs")
     if final_auto_merge > 0:
         console.print(f"⏳ Auto-merge pending for {final_auto_merge} PRs")
 
@@ -1048,6 +1063,7 @@ def _print_failed_pr_details(
         ("failed", "\n❌ Failed PRs:"),
         ("blocked", "\n🛑 Blocked PRs:"),
         ("skipped", "\n⏭️ Skipped PRs:"),
+        ("closed", "\n🚪 Closed PRs:"),
         ("auto_merge_pending", "\n🤖 Auto-merge pending PRs:"),
     ]
     for status_value, heading in sections:
@@ -1074,6 +1090,7 @@ def _display_merge_results(
     failed_count = sum(1 for r in merge_results if r.status.value == "failed")
     skipped_count = sum(1 for r in merge_results if r.status.value == "skipped")
     blocked_count = sum(1 for r in merge_results if r.status.value == "blocked")
+    closed_count = sum(1 for r in merge_results if r.status.value == "closed")
     auto_merge_count = sum(
         1 for r in merge_results if r.status.value == "auto_merge_pending"
     )
@@ -1087,6 +1104,8 @@ def _display_merge_results(
         console.print(f"⏭️ Skipped {skipped_count} PRs")
     if blocked_count > 0:
         console.print(f"🛑 Blocked {blocked_count} PRs")
+    if closed_count > 0:
+        console.print(f"🚪 Closed without merging: {closed_count} PRs")
     if auto_merge_count > 0:
         console.print(f"⏳ Auto-merge pending for {auto_merge_count} PRs")
 
@@ -1097,6 +1116,8 @@ def _display_merge_results(
         parts.append(f"{failed_count} failed")
         if skipped_count > 0:
             parts.append(f"{skipped_count} skipped")
+        if closed_count > 0:
+            parts.append(f"{closed_count} closed")
         console.print(f"📈 Final Results: {', '.join(parts)}")
 
     _print_failed_pr_details(merge_results)
@@ -1415,28 +1436,7 @@ def _execute_repo_confirmed_merge(
         if ctx.show_progress and ctx.progress_tracker:
             ctx.progress_tracker.stop()
 
-    final_merged = sum(1 for r in real_results if r.status.value == "merged")
-    final_failed = sum(1 for r in real_results if r.status.value == "failed")
-    final_skipped = sum(1 for r in real_results if r.status.value == "skipped")
-    final_blocked = sum(1 for r in real_results if r.status.value == "blocked")
-    final_auto_merge = sum(
-        1 for r in real_results if r.status.value == "auto_merge_pending"
-    )
-    parts = [f"{final_merged} merged"]
-    if final_auto_merge > 0:
-        parts.append(f"{final_auto_merge} auto-merge pending")
-    parts.append(f"{final_failed} failed")
-    if final_skipped > 0:
-        parts.append(f"{final_skipped} skipped")
-    console.print(f"\n🚀 Final Results: {', '.join(parts)}")
-    if final_skipped > 0:
-        console.print(f"⏭️ Skipped {final_skipped} PRs")
-    if final_blocked > 0:
-        console.print(f"🛑 Blocked {final_blocked} PRs")
-    if final_auto_merge > 0:
-        console.print(f"⏳ Auto-merge pending for {final_auto_merge} PRs")
-
-    _print_failed_pr_details(real_results)
+    _print_final_merge_summary(real_results)
 
 
 def _repo_merge_order(
@@ -1830,28 +1830,7 @@ def _execute_org_confirmed_merge(
         if ctx.show_progress and ctx.progress_tracker:
             ctx.progress_tracker.stop()
 
-    final_merged = sum(1 for r in real_results if r.status.value == "merged")
-    final_failed = sum(1 for r in real_results if r.status.value == "failed")
-    final_skipped = sum(1 for r in real_results if r.status.value == "skipped")
-    final_blocked = sum(1 for r in real_results if r.status.value == "blocked")
-    final_auto_merge = sum(
-        1 for r in real_results if r.status.value == "auto_merge_pending"
-    )
-    parts = [f"{final_merged} merged"]
-    if final_auto_merge > 0:
-        parts.append(f"{final_auto_merge} auto-merge pending")
-    parts.append(f"{final_failed} failed")
-    if final_skipped > 0:
-        parts.append(f"{final_skipped} skipped")
-    console.print(f"\n🚀 Final Results: {', '.join(parts)}")
-    if final_skipped > 0:
-        console.print(f"⏭️ Skipped {final_skipped} PRs")
-    if final_blocked > 0:
-        console.print(f"🛑 Blocked {final_blocked} PRs")
-    if final_auto_merge > 0:
-        console.print(f"⏳ Auto-merge pending for {final_auto_merge} PRs")
-
-    _print_failed_pr_details(real_results)
+    _print_final_merge_summary(real_results)
 
 
 def _handle_gerrit_merge(
