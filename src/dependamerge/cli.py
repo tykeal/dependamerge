@@ -1033,23 +1033,36 @@ def _format_failure_reason(reason: str) -> list[str]:
 def _print_failed_pr_details(
     merge_results: list[MergeResult],
 ) -> None:
-    """Print URL and reason for each failed PR in the result list.
+    """Print URL and reason for every non-merged PR in the result list.
 
     A bare ``Failed: 1`` line in the summary forces the user to
     scroll back through the merge output to find which PR failed
-    and why.  Surface that information directly so the failure is
-    actionable from the final summary alone.
+    and why.  During a real merge run the per-PR status lines are
+    no longer printed to the console at all (progress is conveyed
+    by the live tracker counters), so this end-of-run report is
+    the *only* place reasons appear.  It therefore covers every
+    non-merged terminal outcome — failed, blocked, skipped and
+    auto-merge pending — one section per outcome.
     """
-    failed = [r for r in merge_results if r.status.value == "failed"]
-    if not failed:
-        return
-    console.print("\n❌ Failed PRs:")
-    for r in failed:
-        url = getattr(r.pr_info, "html_url", "<unknown>")
-        reason = r.error or "no reason reported"
-        body = "\n".join(f"     {line}" for line in _format_failure_reason(reason))
-        # markup=False so bracketed reasons are not eaten by Rich.
-        console.print(f"   • {url}\n{body}", markup=False)
+    sections: list[tuple[str, str]] = [
+        ("failed", "\n❌ Failed PRs:"),
+        ("blocked", "\n🛑 Blocked PRs:"),
+        ("skipped", "\n⏭️ Skipped PRs:"),
+        ("auto_merge_pending", "\n🤖 Auto-merge pending PRs:"),
+    ]
+    for status_value, heading in sections:
+        matching = [r for r in merge_results if r.status.value == status_value]
+        if not matching:
+            continue
+        console.print(heading)
+        for r in matching:
+            url = getattr(r.pr_info, "html_url", "<unknown>")
+            reason = r.error or "no reason reported"
+            body = "\n".join(
+                f"     {line}" for line in _format_failure_reason(reason)
+            )
+            # markup=False so bracketed reasons are not eaten by Rich.
+            console.print(f"   • {url}\n{body}", markup=False)
 
 
 def _display_merge_results(

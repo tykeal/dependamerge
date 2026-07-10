@@ -66,7 +66,7 @@ from .git_ops import (
     secure_rmtree,
 )
 from .models import PullRequestInfo
-from .output_utils import log_and_print
+from .slot_lease import parked
 
 if TYPE_CHECKING:
     from .github_async import GitHubAsync
@@ -104,6 +104,12 @@ class RebaseContext:
     # Async callable equivalent to ``manager._enable_auto_merge_for_pr``.
     # Passed in to avoid a circular import.
     enable_auto_merge: Callable[[PullRequestInfo, str, str], Awaitable[bool]]
+    # Optional callback (``manager._track_pr_state``) that moves the PR
+    # between transitory states on the Rich progress tracker
+    # ("rebasing", "rebased", "waiting", or ``None`` to clear).
+    # Default ``None`` keeps existing test constructions working and
+    # makes the tracker strictly optional for isolated use.
+    track_pr_state: Callable[[PullRequestInfo, str | None], None] | None = None
 
 
 @dataclass
@@ -580,12 +586,8 @@ async def perform_step5_rebase(
         # section.
         return Step5Outcome()
 
-    log_and_print(
-        ctx.log,
-        ctx.console,
-        f"🔄 Rebasing: {pr_info.html_url} [behind base branch]",
-        level="debug",
-    )
+    ctx.log.debug("Rebasing %s [behind base branch]", pr_info.html_url)
+    _set_tracker_state(ctx, pr_info, "rebasing")
 
     use_local, local_reason = await should_use_local_rebase(
         github_client=ctx.github_client,
@@ -620,6 +622,20 @@ async def perform_step5_rebase(
 # ---------------------------------------------------------------------------
 
 
+def _set_tracker_state(
+    ctx: RebaseContext,
+    pr_info: PullRequestInfo,
+    state: str | None,
+) -> None:
+    """Move the PR between transitory progress-tracker states.
+
+    No-op when the context was constructed without a
+    ``track_pr_state`` callback (isolated tests, preview mode).
+    """
+    if ctx.track_pr_state is not None:
+        ctx.track_pr_state(pr_info, state)
+
+
 async def _run_local_path(
     *,
     ctx: RebaseContext,
@@ -648,11 +664,10 @@ async def _run_local_path(
       manual merge attempt would 405 transiently. Letting Step
       5.5 wait gives GitHub time to settle before Step 6 acts.
     """
-    log_and_print(
-        ctx.log,
-        ctx.console,
-        f"🛡️ Local rebase: {pr_info.html_url} [{local_reason}]",
-        level="debug",
+    ctx.log.debug(
+        "Local rebase: %s [%s]",
+        pr_info.html_url,
+        local_reason,
     )
     try:
         local_rebase_ok = await local_rebase_pr(
@@ -695,18 +710,12 @@ async def _run_local_path(
         ctx.rebased_prs.add(f"{owner}/{repo}#{pr_info.number}")
 
     if local_rebase_ok:
-        log_and_print(
-            ctx.log,
-            ctx.console,
-            f"✅ Rebased (local): {pr_info.html_url}",
-            level="debug",
-        )
+        ctx.log.debug("Rebased (local): %s", pr_info.html_url)
+        _set_tracker_state(ctx, pr_info, "rebased")
     else:
-        log_and_print(
-            ctx.log,
-            ctx.console,
-            f"🛡️ Local rebase failed; deferring to auto-merge: {pr_info.html_url}",
-            level="debug",
+        ctx.log.debug(
+            "Local rebase failed; deferring to auto-merge: %s",
+            pr_info.html_url,
         )
 
 
@@ -749,17 +758,27 @@ async def _run_rest_path(
                 pr_info.number,
             )
 
-        # Wait for GitHub to process the update and run checks
-        ctx.console.print(f"⏳ Waiting: {pr_info.html_url}")
-        await asyncio.sleep(ctx.merge_recheck_interval)
+        # Wait briefly for GitHub to start processing the update.
+        # The full recheck interval (default 10s) is unnecessary here:
+        # ``_poll_post_rebase`` polls at that cadence anyway and
+        # tolerates the transient ``null``/``behind`` states GitHub
+        # reports while recomputing, so a short head start just gets
+        # the first data point sooner.  The settle sleep and the poll
+        # are both waits on GitHub-side processing, so the worker's
+        # concurrency slot is released for their duration
+        # (``parked()`` — see ``slot_lease.py``).
+        ctx.log.debug("Waiting for rebase to process: %s", pr_info.html_url)
+        _set_tracker_state(ctx, pr_info, "waiting")
+        async with parked():
+            await asyncio.sleep(min(2.0, ctx.merge_recheck_interval))
 
-        updated_mergeable, updated_mergeable_state = await _poll_post_rebase(
-            ctx=ctx,
-            pr_info=pr_info,
-            owner=owner,
-            repo=repo,
-            auto_merge_ok=auto_merge_ok,
-        )
+            updated_mergeable, updated_mergeable_state = await _poll_post_rebase(
+                ctx=ctx,
+                pr_info=pr_info,
+                owner=owner,
+                repo=repo,
+                auto_merge_ok=auto_merge_ok,
+            )
 
         # Update our PR info with the latest state.  Preserve the
         # previous non-None values when the refresh returns
@@ -787,11 +806,12 @@ async def _run_rest_path(
         # in ``blocked`` or ``behind`` state.
         ctx.rebased_prs.add(f"{owner}/{repo}#{pr_info.number}")
 
+        _set_tracker_state(ctx, pr_info, "rebased")
         _log_post_rebase_status(ctx=ctx, pr_info=pr_info)
         return Step5Outcome()
 
     except Exception as exc:
-        ctx.console.print(f"❌ Failed: {pr_info.html_url} [rebase error: {exc}]")
+        ctx.log.warning("Rebase failed for %s: %s", pr_info.html_url, exc)
         return Step5Outcome(failed=True, error_message=f"Failed to rebase PR: {exc}")
 
 
@@ -913,22 +933,16 @@ def _log_blocked_timeout(
     pr_info: PullRequestInfo,
     auto_merge_ok: bool,
 ) -> None:
-    """Emit the user-facing line when the post-rebase poll times out blocked."""
+    """Log when the post-rebase poll times out blocked (log only)."""
     if auto_merge_ok:
-        log_and_print(
-            ctx.log,
-            ctx.console,
-            f"⏳ Auto-merge will complete: {pr_info.html_url} "
-            "[timeout waiting for checks]",
-            level="warning",
+        ctx.log.warning(
+            "Auto-merge will complete: %s [timeout waiting for checks]",
+            pr_info.html_url,
         )
     else:
-        log_and_print(
-            ctx.log,
-            ctx.console,
-            f"⚠️ Proceeding without checks: {pr_info.html_url} "
-            "[timeout waiting for checks]",
-            level="warning",
+        ctx.log.warning(
+            "Proceeding without checks: %s [timeout waiting for checks]",
+            pr_info.html_url,
         )
 
 
@@ -937,33 +951,15 @@ def _log_post_rebase_status(
     ctx: RebaseContext,
     pr_info: PullRequestInfo,
 ) -> None:
-    """Emit the post-rebase status line based on the final mergeable_state."""
+    """Log the post-rebase status based on the final mergeable_state."""
     state = pr_info.mergeable_state
     if state == "clean":
-        log_and_print(
-            ctx.log,
-            ctx.console,
-            f"✅ Rebased: {pr_info.html_url}",
-            level="debug",
-        )
+        ctx.log.debug("Rebased: %s", pr_info.html_url)
     elif state == "behind":
-        log_and_print(
-            ctx.log,
-            ctx.console,
-            f"⚠️ Rebased: {pr_info.html_url} [still behind after rebase]",
-            level="debug",
-        )
+        ctx.log.debug("Rebased: %s [still behind after rebase]", pr_info.html_url)
     elif state == "blocked":
-        log_and_print(
-            ctx.log,
-            ctx.console,
-            f"⬆️ Rebased: {pr_info.html_url} [waiting for status checks]",
-            level="debug",
+        ctx.log.debug(
+            "Rebased: %s [waiting for status checks]", pr_info.html_url
         )
     else:
-        log_and_print(
-            ctx.log,
-            ctx.console,
-            f"ℹ️ Rebased: {pr_info.html_url}",
-            level="debug",
-        )
+        ctx.log.debug("Rebased: %s [state=%s]", pr_info.html_url, state)

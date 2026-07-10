@@ -268,6 +268,20 @@ class GitHubAsync:
         # Cache for the authenticated user's login (never changes during a session)
         self._authenticated_user_login: str | None = None
 
+        # Session caches for repo/branch-scoped configuration.  Branch
+        # protection, required status checks, and a repo's default
+        # branch are effectively immutable for the lifetime of a merge
+        # run, yet the merge pipeline consults them repeatedly — once
+        # per PR (or several times per *blocked* PR via
+        # ``analyze_block_reason``).  Caching them here collapses those
+        # repeats into one fetch per repo/branch.  No locking: a
+        # concurrent first miss may fetch twice, which is harmless and
+        # no worse than the uncached behaviour.
+        self._default_branch_cache: dict[str, str | None] = {}
+        self._required_checks_cache: dict[str, list[dict[str, Any]]] = {}
+        self._branch_protection_cache: dict[str, dict[str, Any]] = {}
+        self._requires_signatures_cache: dict[str, bool] = {}
+
         # Cache for the token's OAuth scopes.  ``_token_scopes_fetched``
         # distinguishes "not looked up yet" from "looked up, but this token
         # type does not expose scopes" (fine-grained PAT / app token, which
@@ -1171,7 +1185,40 @@ class GitHubAsync:
 
         Returns:
             True if signed commits are required by *either* mechanism.
+
+        Results are cached per ``owner/repo@branch`` for the session:
+        the requirement is branch-protection/ruleset configuration that
+        does not change while dependamerge runs, and the uncached path
+        costs up to 3 + N requests (classic-protection probe, repo
+        metadata, ruleset list, one detail GET per ruleset).  Verdicts
+        derived from transient API errors are *not* cached, so a
+        momentary outage cannot pin a wrong answer for the whole run.
         """
+        cache_key = f"{owner}/{repo}@{branch}"
+        cached = self._requires_signatures_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        result, reliable = await self._requires_commit_signatures_uncached(
+            owner, repo, branch
+        )
+        if reliable:
+            self._requires_signatures_cache[cache_key] = result
+        return result
+
+    async def _requires_commit_signatures_uncached(
+        self, owner: str, repo: str, branch: str
+    ) -> tuple[bool, bool]:
+        """Uncached implementation of :meth:`requires_commit_signatures`.
+
+        Returns:
+            Tuple of ``(requires_signatures, reliable)``.  ``reliable``
+            is False when a transient (non-404) API error prevented a
+            definitive verdict — a ``True`` verdict is always reliable
+            (positive evidence), but an error-derived ``False`` must
+            not be cached because the requirement may simply have been
+            unreadable at that moment.
+        """
+        reliable = True
         # --- 1. Classic branch protection ---
         try:
             # The signatures endpoint returns 200 with {"enabled": true/false}
@@ -1187,10 +1234,11 @@ class GitHubAsync:
                     repo,
                     branch,
                 )
-                return True
+                return True, True
         except Exception as e:
             # 404 → not enabled; other errors → continue checking rulesets
             if "404" not in str(e):
+                reliable = False
                 self.log.debug(
                     "Error checking classic signature requirement for %s/%s:%s: %s",
                     owner,
@@ -1241,6 +1289,10 @@ class GitHubAsync:
                     if not isinstance(detail, dict):
                         continue
                 except Exception as detail_err:
+                    # An unreadable ruleset could hide a
+                    # required_signatures rule — the eventual False
+                    # verdict is no longer definitive.
+                    reliable = False
                     self.log.debug(
                         "Could not fetch ruleset %s for %s/%s: %s",
                         ruleset_id,
@@ -1275,8 +1327,9 @@ class GitHubAsync:
                                 branch,
                                 detail.get("name", "unknown"),
                             )
-                            return True
+                            return True, True
         except Exception as e:
+            reliable = False
             self.log.debug(
                 "Error checking rulesets for signature requirement on %s/%s:%s: %s",
                 owner,
@@ -1285,7 +1338,7 @@ class GitHubAsync:
                 e,
             )
 
-        return False
+        return False, reliable
 
     @staticmethod
     def _ruleset_applies_to_branch(
@@ -1374,20 +1427,33 @@ class GitHubAsync:
         are not available.
         Returns a list of dicts with 'context' and optionally 'integration_id'.
         Results are deduplicated by ``context``.
+
+        Results are cached per ``owner/repo@branch`` for the session:
+        required-check configuration is repo/branch-level state that does
+        not change while dependamerge runs, and the block-reason analysis
+        consults it repeatedly (several times per blocked PR).  The
+        uncached path costs 2 + N requests (repo + ruleset list + one
+        detail GET per ruleset), so the cache saves a burst of API
+        traffic on every repeat.  Results assembled while any of those
+        requests failed are *not* cached: the fetch treats errors as
+        "no required checks", and pinning that error-derived verdict
+        for the whole session could misclassify blocked PRs long after
+        a transient outage has passed.
         """
+        cache_key = f"{owner}/{repo}@{branch}"
+        cached = self._required_checks_cache.get(cache_key)
+        if cached is not None:
+            # Return a copy so callers cannot mutate the cached list.
+            return list(cached)
+
         required_checks: list[dict[str, Any]] = []
         seen_contexts: set[str] = set()
+        reliable = True
 
         # Resolve the repo's actual default branch so that ~DEFAULT_BRANCH
         # ruleset conditions are evaluated correctly (not hardcoded to
         # main/master).
-        default_branch: str | None = None
-        try:
-            repo_data = await self.get(f"/repos/{owner}/{repo}")
-            if isinstance(repo_data, dict):
-                default_branch = repo_data.get("default_branch")
-        except Exception:
-            pass  # Will fall through to conservative matching
+        default_branch = await self._resolve_default_branch(owner, repo)
 
         # Try rulesets first (org-level and repo-level)
         try:
@@ -1431,10 +1497,12 @@ class GitHubAsync:
                                             seen_contexts.add(ctx)
                                             required_checks.append(check)
                     except Exception as detail_err:
+                        reliable = False
                         self.log.debug(
                             f"Could not fetch ruleset {ruleset_id} details: {detail_err}"
                         )
         except Exception as e:
+            reliable = False
             self.log.debug(f"Could not fetch rulesets for {owner}/{repo}: {e}")
 
         # Fall back to branch protection if no ruleset checks found
@@ -1454,11 +1522,16 @@ class GitHubAsync:
                             if ctx not in seen_contexts:
                                 seen_contexts.add(ctx)
                                 required_checks.append(check)
-            except Exception:
+            except Exception as e:
                 # Branch protection may be absent or inaccessible with
-                # the current token; treat as no required checks.
-                pass
+                # the current token; treat as no required checks.  A
+                # plain 404 is the definitive "no protection" answer;
+                # anything else leaves the verdict unreliable.
+                if "404" not in str(e):
+                    reliable = False
 
+        if reliable:
+            self._required_checks_cache[cache_key] = list(required_checks)
         return required_checks
 
     async def get_branch_protection(
@@ -1468,18 +1541,53 @@ class GitHubAsync:
         Get branch protection rules for a branch.
 
         REST: GET /repos/{owner}/{repo}/branches/{branch}/protection
+
+        Results (including the empty "no protection" result) are cached
+        per ``owner/repo@branch`` for the session: the merge pipeline
+        calls this once per PR via ``_check_merge_requirements``, but
+        protection config is branch-level state that does not change
+        mid-run.  Errors other than 404 are not cached so a transient
+        failure can succeed on retry.
         """
+        cache_key = f"{owner}/{repo}@{branch}"
+        cached = self._branch_protection_cache.get(cache_key)
+        if cached is not None:
+            return cached
         try:
             protection_data = await self.get(
                 f"/repos/{owner}/{repo}/branches/{branch}/protection"
             )
             # Branch protection data should always be a dict, not a list
-            return protection_data if isinstance(protection_data, dict) else {}
+            result = protection_data if isinstance(protection_data, dict) else {}
+            self._branch_protection_cache[cache_key] = result
+            return result
         except Exception as e:
             # Branch protection might not be enabled, return empty dict
             if "404" in str(e):
+                self._branch_protection_cache[cache_key] = {}
                 return {}
             raise
+
+    async def get_authenticated_user_login(self) -> str | None:
+        """Return the authenticated user's login, cached for the session.
+
+        The login never changes for a given token, so the ``/user``
+        round-trip is paid at most once per client instance.  Returns
+        ``None`` when the lookup fails (callers should degrade
+        gracefully); failures are not cached so a transient error can
+        recover on the next call.
+        """
+        if self._authenticated_user_login is None:
+            try:
+                user_data = await self.get("/user")
+            except Exception as e:
+                self.log.debug("Could not resolve authenticated user: %s", e)
+                return None
+            if isinstance(user_data, dict):
+                login = user_data.get("login")
+                if isinstance(login, str) and login:
+                    self._authenticated_user_login = login
+        return self._authenticated_user_login
 
     async def check_user_can_bypass_protection(
         self, owner: str, repo: str, force_level: str = "code-owners"
@@ -1852,13 +1960,73 @@ class GitHubAsync:
                 raise perm_error from e
             raise
 
+    async def get_behind_by(
+        self, owner: str, repo: str, base_ref: str, head_sha: str
+    ) -> int | None:
+        """Return how many commits ``head_sha`` is behind ``base_ref``.
+
+        GitHub's ``mergeable_state`` is a single value, so ``blocked``
+        (a failing required check) masks ``behind`` (a stale head).
+        This helper answers the staleness question independently via
+        the compare API, which works regardless of the reported
+        mergeable state and regardless of whether the head lives on a
+        fork (the SHA is resolvable in the base repository's network).
+
+        Args:
+            owner: Base repository owner
+            repo: Base repository name
+            base_ref: Base branch name (e.g. ``main``)
+            head_sha: Head commit SHA of the pull request
+
+        Returns:
+            The ``behind_by`` commit count, or ``None`` when the
+            comparison could not be performed (API error, unexpected
+            payload).  ``None`` means "unknown": callers must not
+            interpret it as ``behind_by == 0`` ("up to date"), and
+            staleness-driven write actions (e.g. requesting a rebase)
+            should require positive evidence (``behind_by > 0``)
+            rather than acting on an unknown — the pattern used by
+            ``AsyncMergeManager._blocked_pr_needs_rebase``.
+        """
+        encoded_base = quote(base_ref, safe="")
+        try:
+            comparison = await self.get(
+                f"/repos/{owner}/{repo}/compare/{encoded_base}...{head_sha}"
+            )
+        except Exception as exc:
+            self.log.debug(
+                "Compare %s...%s failed for %s/%s: %s",
+                base_ref,
+                head_sha,
+                owner,
+                repo,
+                exc,
+            )
+            return None
+        if isinstance(comparison, dict):
+            behind = comparison.get("behind_by")
+            if isinstance(behind, int):
+                return behind
+        return None
+
     async def analyze_block_reason(
-        self, owner: str, repo: str, number: int, head_sha: str
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        head_sha: str,
+        base_branch: str | None = None,
     ) -> str:
         """
         Analyze why a PR is blocked and return appropriate status.
 
         This is the async version that should be used from async contexts.
+
+        ``base_branch`` lets callers that already know the PR's base ref
+        (e.g. the merge pipeline, which carries it on ``PullRequestInfo``)
+        skip the PR-detail fetch this method otherwise performs just to
+        read ``base.ref`` — one request saved per invocation, and this
+        method runs several times per blocked PR.
         """
         # Reviews
         approved = False
@@ -1969,21 +2137,21 @@ class GitHubAsync:
         # required status-check lookup and the final guard-kind
         # classification, so a wrong value (e.g. assuming "main" on a repo
         # that defaults to "master") produces a misleading block reason.
-        # Prefer the PR's own base ref; if that cannot be read, fall back
-        # to the repository's real default branch rather than a hardcoded
-        # name, and only give up (leaving it ``None``) when neither is
-        # available.
-        base_branch: str | None = None
-        try:
-            pr_data = await self.get(f"/repos/{owner}/{repo}/pulls/{number}")
-            if isinstance(pr_data, dict):
-                ref = pr_data.get("base", {}).get("ref")
-                if isinstance(ref, str) and ref:
-                    base_branch = ref
-        except Exception as pr_err:
-            self.log.debug(
-                f"Could not read base branch for {owner}/{repo}#{number}: {pr_err}"
-            )
+        # Prefer the caller-supplied value, then the PR's own base ref; if
+        # neither is available, fall back to the repository's real default
+        # branch rather than a hardcoded name, and only give up (leaving
+        # it ``None``) when nothing can be determined.
+        if base_branch is None:
+            try:
+                pr_data = await self.get(f"/repos/{owner}/{repo}/pulls/{number}")
+                if isinstance(pr_data, dict):
+                    ref = pr_data.get("base", {}).get("ref")
+                    if isinstance(ref, str) and ref:
+                        base_branch = ref
+            except Exception as pr_err:
+                self.log.debug(
+                    f"Could not read base branch for {owner}/{repo}#{number}: {pr_err}"
+                )
 
         if base_branch is None:
             base_branch = await self._resolve_default_branch(owner, repo)
@@ -2100,7 +2268,14 @@ class GitHubAsync:
         ``None`` when it cannot be determined (the repo is unreadable or
         the field is absent), letting callers degrade gracefully instead
         of operating on a wrong branch.
+
+        Successful lookups are cached per ``owner/repo`` for the
+        session (a repo's default branch does not change mid-run);
+        failures are not cached so a transient error can recover.
         """
+        cache_key = f"{owner}/{repo}"
+        if cache_key in self._default_branch_cache:
+            return self._default_branch_cache[cache_key]
         try:
             repo_data = await self.get(f"/repos/{owner}/{repo}")
         except Exception as e:
@@ -2111,6 +2286,7 @@ class GitHubAsync:
         if isinstance(repo_data, dict):
             default_branch = repo_data.get("default_branch")
             if isinstance(default_branch, str) and default_branch:
+                self._default_branch_cache[cache_key] = default_branch
                 return default_branch
         return None
 

@@ -135,7 +135,7 @@ class TestHandleMergeConflict:
             patch.object(
                 mgr, "_wait_for_auto_merge", new_callable=AsyncMock
             ) as mock_wait,
-            patch("dependamerge.merge_manager.log_and_print") as mock_log,
+            patch.object(mgr, "log") as mock_log,
             patch.object(mgr, "_console") as mock_console,
         ):
             result = await mgr._handle_merge_conflict(
@@ -146,14 +146,19 @@ class TestHandleMergeConflict:
         assert result.error == "merge conflicts"
         mock_rebase.assert_not_called()
         mock_wait.assert_not_called()
-        # The specific 🔀 cause line is emitted.
+        # The specific 🔀 cause line is logged (not printed — real
+        # merges keep the console clean; the reason reaches the user
+        # via ``result.error`` in the end-of-run summary).
         assert any(
-            "🔀 Merge conflict" in str(call.args[2]) for call in mock_log.call_args_list
+            "🔀 Merge conflict" in str(call.args[0])
+            for call in mock_log.info.call_args_list
+            if call.args
         )
-        # ...and it is NOT duplicated with a redundant ❌ Failed line.
+        # ...and nothing is printed to the console for this PR.
         printed = " ".join(
             str(c.args[0]) for c in mock_console.print.call_args_list if c.args
         )
+        assert "🔀 Merge conflict" not in printed
         assert "❌ Failed" not in printed
 
     @pytest.mark.asyncio

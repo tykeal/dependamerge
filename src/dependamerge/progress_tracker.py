@@ -29,6 +29,9 @@ except ImportError:
         def update(self, *args: Any) -> None:
             pass
 
+        def refresh(self) -> None:
+            pass
+
     class Text:  # type: ignore[no-redef]  # pyright: ignore[reportRedefinition]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
@@ -88,8 +91,12 @@ class ProgressTracker:
             return
 
         try:
+            # Pass a callable rather than a static renderable: Rich
+            # re-invokes it on every auto-refresh tick, so the elapsed
+            # clock keeps advancing even when no progress events fire
+            # (long silent API sequences used to freeze the display).
             self.live = Live(
-                self._generate_display_text(),
+                get_renderable=self._generate_display_text,
                 console=self.console,
                 refresh_per_second=2,
                 transient=False,
@@ -135,7 +142,7 @@ class ProgressTracker:
         if self.rich_available and self.paused:
             try:
                 self.live = Live(
-                    self._generate_display_text(),
+                    get_renderable=self._generate_display_text,
                     console=self.console,
                     refresh_per_second=2,
                     transient=False,
@@ -208,10 +215,15 @@ class ProgressTracker:
         self._refresh_display()
 
     def _refresh_display(self) -> None:
-        """Refresh the live display with current progress."""
+        """Repaint the live display with current progress.
+
+        The Live instance renders via ``get_renderable``, so a plain
+        ``refresh()`` repaints with current state immediately instead
+        of waiting for the next auto-refresh tick.
+        """
         if self.live and self.rich_available and not self.paused:
             try:
-                self.live.update(self._generate_display_text())
+                self.live.refresh()
             except Exception:
                 # If Rich display fails, fall back to simple print
                 self._fallback_display()
@@ -346,7 +358,25 @@ class ProgressTracker:
 
 
 class MergeProgressTracker(ProgressTracker):
-    """Extended progress tracker with merge-specific metrics."""
+    """Extended progress tracker with merge-specific metrics.
+
+    In addition to the terminal counters (merged / failed / skipped /
+    blocked / pending / closed), PRs move through **transitory**
+    display states while the merge pipeline operates on them
+    (``rebasing`` → ``rebased`` → ``waiting`` → terminal).  Transitory
+    states are keyed by PR so a PR occupies at most one state at a
+    time; recording a terminal outcome removes the PR from whatever
+    transitory state it was in.
+    """
+
+    # Transitory display states in pipeline order.  Each entry is
+    # ``(state_key, display_label)``; only non-zero states render.
+    _STATE_ORDER: tuple[tuple[str, str], ...] = (
+        ("rebasing", "🔄 Rebasing"),
+        ("rebased", "⬆️ Rebased"),
+        ("recreating", "♻️ Recreating"),
+        ("waiting", "⏳ Waiting"),
+    )
 
     def __init__(
         self,
@@ -374,12 +404,20 @@ class MergeProgressTracker(ProgressTracker):
         self.prs_failed = 0
         self.prs_skipped = 0
         self.prs_closed = 0
+        # PRs left with auto-merge armed when the run ended (GitHub
+        # completes the merge server-side once checks pass).
+        self.prs_pending = 0
+        # PRs that are blocked and cannot be merged by this run.
+        self.prs_blocked = 0
         self.is_close_operation = is_close_operation
         self._custom_label = operation_label
         self._custom_icon = operation_icon
         # PR-level progress (used for repo-scoped operations)
         self.total_prs = 0
         self.completed_prs = 0
+        # Transitory per-PR display states: pr_key -> state key from
+        # ``_STATE_ORDER``.  Terminal outcomes remove the entry.
+        self._pr_states: dict[str, str] = {}
 
     def found_similar_pr(self, count: int = 1) -> None:
         """Update count of similar PRs found."""
@@ -395,21 +433,47 @@ class MergeProgressTracker(ProgressTracker):
         self.total_prs = total
         self._refresh_display()
 
-    def merge_success(self) -> None:
+    def track_pr_state(self, pr_key: str, state: str | None) -> None:
+        """Move a PR between transitory display states.
+
+        ``state`` is one of the keys in ``_STATE_ORDER`` (e.g.
+        ``"rebasing"``, ``"rebased"``, ``"waiting"``) or ``None`` to
+        clear the PR's entry when an operation finishes without
+        reaching a terminal outcome.  Terminal outcomes are recorded
+        via ``merge_success`` / ``merge_failure`` / ``merge_skipped``
+        / ``merge_blocked`` / ``merge_pending``, which also clear the
+        transitory entry when given the PR key.
+        """
+        if state is None:
+            self._pr_states.pop(pr_key, None)
+        else:
+            self._pr_states[pr_key] = state
+        self._refresh_display()
+
+    def _finish_pr(self, pr_key: str | None) -> None:
+        """Shared terminal-outcome bookkeeping.
+
+        Clears the PR's transitory state (when a key is supplied) and
+        advances PR-level completion progress.
+        """
+        if pr_key is not None:
+            self._pr_states.pop(pr_key, None)
+        if self.total_prs > 0:
+            self.completed_prs += 1
+
+    def merge_success(self, pr_key: str | None = None) -> None:
         """Record a successful merge."""
+        self._finish_pr(pr_key)
         self.prs_merged += 1
-        if self.total_prs > 0:
-            self.completed_prs += 1
         self._refresh_display()
 
-    def merge_failure(self) -> None:
+    def merge_failure(self, pr_key: str | None = None) -> None:
         """Record a failed merge."""
+        self._finish_pr(pr_key)
         self.prs_failed += 1
-        if self.total_prs > 0:
-            self.completed_prs += 1
         self._refresh_display()
 
-    def merge_skipped(self) -> None:
+    def merge_skipped(self, pr_key: str | None = None) -> None:
         """Record a PR skipped because it was merged externally.
 
         Distinct from ``merge_failure`` because the operator does
@@ -417,26 +481,41 @@ class MergeProgressTracker(ProgressTracker):
         by us.  Tracked separately so the final summary can show
         a non-zero ⏭️ Skipped count alongside Merged / Failed.
         """
+        self._finish_pr(pr_key)
         self.prs_skipped += 1
-        if self.total_prs > 0:
-            self.completed_prs += 1
         self._refresh_display()
 
-    def increment_closed(self) -> None:
+    def merge_blocked(self, pr_key: str | None = None) -> None:
+        """Record a PR that is blocked and cannot merge in this run."""
+        self._finish_pr(pr_key)
+        self.prs_blocked += 1
+        self._refresh_display()
+
+    def merge_pending(self, pr_key: str | None = None) -> None:
+        """Record a PR left with auto-merge armed at run end.
+
+        GitHub merges the PR server-side once its required checks
+        pass; from this run's perspective the PR is terminal but
+        neither merged nor failed.
+        """
+        self._finish_pr(pr_key)
+        self.prs_pending += 1
+        self._refresh_display()
+
+    def increment_closed(self, pr_key: str | None = None) -> None:
         """Record a successful close."""
+        self._finish_pr(pr_key)
         self.prs_closed += 1
-        if self.total_prs > 0:
-            self.completed_prs += 1
         self._refresh_display()
 
     def pr_completed(self) -> None:
         """Record a PR as processed without changing status counters.
 
-        Use this for BLOCKED/SKIPPED outcomes that bypass
-        ``merge_success()`` and ``merge_failure()``.  Those
-        methods already increment ``completed_prs``; this one
-        exists solely to keep the progress percentage accurate
-        for terminal states that neither method covers.
+        Use this for terminal outcomes that bypass the dedicated
+        counter methods.  Those methods already increment
+        ``completed_prs``; this one exists solely to keep the
+        progress percentage accurate for terminal states that no
+        counter method covers.
         """
         if self.total_prs > 0:
             self.completed_prs += 1
@@ -493,18 +572,39 @@ class MergeProgressTracker(ProgressTracker):
         if self.current_operation:
             text.append(f"\n   {self.current_operation}", style="dim")
 
-        # Merge stats
+        # Merge stats — transitory pipeline states first (in flow
+        # order), then terminal outcomes.
         stats_parts: list[str] = []
         if self.similar_prs_found > 0:
             stats_parts.append(f"🔁 Similar: {self.similar_prs_found}")
+        state_counts: dict[str, int] = {}
+        for pr_state in self._pr_states.values():
+            state_counts[pr_state] = state_counts.get(pr_state, 0) + 1
+        for state_key, label in self._STATE_ORDER:
+            count = state_counts.get(state_key, 0)
+            if count > 0:
+                stats_parts.append(f"{label}: {count}")
+        # Defensive: render unknown states too (sorted for stable
+        # output) so a new caller-supplied state is never silently
+        # dropped from the display.
+        known_states = {key for key, _ in self._STATE_ORDER}
+        for state_key in sorted(state_counts):
+            if state_key not in known_states:
+                stats_parts.append(
+                    f"{state_key.capitalize()}: {state_counts[state_key]}"
+                )
         if self.prs_merged > 0:
             stats_parts.append(f"✅ Merged: {self.prs_merged}")
+        if self.prs_pending > 0:
+            stats_parts.append(f"🤖 Pending: {self.prs_pending}")
         if self.prs_closed > 0:
             stats_parts.append(f"🚪 Closed: {self.prs_closed}")
         if self.prs_failed > 0:
             stats_parts.append(f"❌ Failed: {self.prs_failed}")
         if self.prs_skipped > 0:
             stats_parts.append(f"⏭️ Skipped: {self.prs_skipped}")
+        if self.prs_blocked > 0:
+            stats_parts.append(f"🛑 Blocked: {self.prs_blocked}")
 
         if stats_parts:
             text.append(f"\n   {' | '.join(stats_parts)}", style="dim")
@@ -541,6 +641,8 @@ class MergeProgressTracker(ProgressTracker):
                 "prs_merged": self.prs_merged,
                 "prs_failed": self.prs_failed,
                 "prs_skipped": self.prs_skipped,
+                "prs_blocked": self.prs_blocked,
+                "prs_pending": self.prs_pending,
                 "prs_closed": self.prs_closed,
                 "total_prs": self.total_prs,
                 "completed_prs": self.completed_prs,
@@ -564,12 +666,15 @@ class DummyProgressTracker(ProgressTracker):
         self.prs_merged = 0
         self.prs_failed = 0
         self.prs_skipped = 0
+        self.prs_blocked = 0
+        self.prs_pending = 0
         self.prs_closed = 0
         self.is_close_operation = False
         self._custom_label: str | None = None
         self._custom_icon: str | None = None
         self.total_prs = 0
         self.completed_prs = 0
+        self._pr_states: dict[str, str] = {}
 
     def start(self) -> None:
         pass
@@ -610,13 +715,25 @@ class DummyProgressTracker(ProgressTracker):
     def found_similar_pr(self, count: int = 1) -> None:
         pass
 
-    def merge_success(self) -> None:
+    def track_pr_state(self, pr_key: str, state: str | None) -> None:
         pass
 
-    def merge_failure(self) -> None:
+    def merge_success(self, pr_key: str | None = None) -> None:
         pass
 
-    def merge_skipped(self) -> None:
+    def merge_failure(self, pr_key: str | None = None) -> None:
+        pass
+
+    def merge_skipped(self, pr_key: str | None = None) -> None:
+        pass
+
+    def merge_blocked(self, pr_key: str | None = None) -> None:
+        pass
+
+    def merge_pending(self, pr_key: str | None = None) -> None:
+        pass
+
+    def increment_closed(self, pr_key: str | None = None) -> None:
         pass
 
     def _refresh_display(self) -> None:
