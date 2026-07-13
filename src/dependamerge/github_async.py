@@ -2223,6 +2223,36 @@ class GitHubAsync:
                 f"Blocked by {unresolved_copilot_comments} unresolved Copilot comments"
             )
 
+        # No *required* check is failing, missing, or pending, and no
+        # human/Copilot review is blocking — but if any check on the head
+        # commit is still queued or in progress, the PR is only *temporarily*
+        # blocked. This matters for checks enforced through a repository
+        # ruleset's "required workflows": those never appear in the classic
+        # required-status-checks list, so the pending_required_checks branch
+        # above cannot see them. Surface them as pending here, *before* the
+        # "requires approval" fallback, so the merge pipeline waits for them
+        # (and arms auto-merge) instead of failing the PR outright while its
+        # workflows are still running.
+        # Any name in ``pending_check_names`` has a queued/in-progress run
+        # and is therefore still running. We must NOT subtract
+        # ``completed_check_names``: GitHub can report two runs with the
+        # same name (a re-run leaves one ``completed`` entry and a fresh
+        # ``in_progress`` one), and the set difference would cancel the
+        # name out and hide a check that is genuinely still running.
+        #
+        # Defensively filter to non-empty strings: a malformed API
+        # payload can report ``name``/``context`` as ``null``, and mixing
+        # ``None`` with strings would make ``sorted``/``join`` raise. This
+        # branch is best-effort, so drop anything that is not a usable name.
+        pending_only = sorted(
+            name for name in pending_check_names if isinstance(name, str) and name
+        )
+        if pending_only:
+            if len(pending_only) == 1:
+                return f"Blocked by pending check: {pending_only[0]}"
+            names = ", ".join(pending_only)
+            return f"Blocked by {len(pending_only)} pending checks: {names}"
+
         if not approved:
             return "Blocked by branch protection (requires approval)"
 

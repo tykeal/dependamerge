@@ -2268,6 +2268,7 @@ class AsyncMergeManager:
 
         return (
             "pending required check" in reason_lower
+            or "pending check" in reason_lower
             or ("required" in reason_lower and "pending" in reason_lower)
             or "waiting for status" in reason_lower
             or "queued" in reason_lower
