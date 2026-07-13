@@ -1824,14 +1824,13 @@ class AsyncMergeManager:
                         level="debug",
                     )
                 else:
-                    # Before computing a failure reason, recheck
-                    # whether the PR was actually merged externally
-                    # (e.g. by a concurrent dependamerge run at org
-                    # scope, or by a human admin) or closed without
-                    # merging (e.g. dependabot decided the update is
-                    # no longer needed after sibling merges advanced
-                    # the base) while our merge attempt was in
-                    # flight.  Neither outcome needs human follow-up,
+                    # A failed merge attempt can mask two benign
+                    # races: the PR merged externally (a concurrent
+                    # dependamerge run at org scope, or a human
+                    # admin), or the PR closed without merging
+                    # (dependabot decided the update is no longer
+                    # needed after sibling merges advanced the
+                    # base).  Neither outcome needs human follow-up,
                     # so classify as SKIPPED / CLOSED rather than
                     # FAILED.
                     ext_state, ext_merged = await self._fetch_pr_state_now(
