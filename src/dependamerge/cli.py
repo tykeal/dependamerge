@@ -1029,6 +1029,10 @@ def _format_failure_reason(reason: str) -> list[str]:
                 _, _, after_first = after_marker.partition("'")
                 quoted, _, rest = after_first.partition("'")
                 workflows = [w.strip() for w in quoted.split(",") if w.strip()]
+                # GitHub can list the same workflow name more than once in
+                # the violation string; collapse duplicates while keeping
+                # first-seen order so each name renders as a single bullet.
+                workflows = list(dict.fromkeys(workflows))
                 verb = "failed" if "fail" in rest.lower() else "not satisfied"
                 if workflows:
                     return [
@@ -1038,6 +1042,9 @@ def _format_failure_reason(reason: str) -> list[str]:
         # Required status check(s): ``Required status check "X" is failing.``
         if "Required status check" in reason:
             checks = [c.strip() for c in re.findall(r'"([^"]+)"', reason) if c.strip()]
+            # De-duplicate repeated names (see workflows note above),
+            # preserving first-seen order.
+            checks = list(dict.fromkeys(checks))
             verb = "failed" if "fail" in reason.lower() else "not satisfied"
             if checks:
                 return [

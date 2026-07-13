@@ -839,6 +839,33 @@ class TestFormatFailureReason:
         reason = "Required workflows 'X' are not satisfied"
         assert _format_failure_reason(reason) == [reason]
 
+    def test_duplicate_workflow_names_are_collapsed(self):
+        # GitHub sometimes lists the same required workflow twice in the
+        # violation string; each name must render as a single bullet,
+        # preserving first-seen order.
+        reason = (
+            "Repository rule violations found Required workflows "
+            "'AI Slop Scan 🧹, AI Slop Scan 🧹, "
+            "Zizmor Scan 🌈, Zizmor Scan 🌈' are not satisfied"
+        )
+        assert _format_failure_reason(reason) == [
+            "Repository rule violations found / Required workflows not satisfied",
+            "• AI Slop Scan 🧹",
+            "• Zizmor Scan 🌈",
+        ]
+
+    def test_duplicate_status_check_names_are_collapsed(self):
+        # Same de-duplication applies to the required-status-check variant.
+        reason = (
+            "Repository rule violations found Required status checks "
+            '"lint", "lint", "build" are failing.'
+        )
+        assert _format_failure_reason(reason) == [
+            "Repository rule violations found / Required status checks failed",
+            "• lint",
+            "• build",
+        ]
+
 
 def _make_merge_context(show_progress: bool) -> _MergeContext:
     """Build a minimal ``_MergeContext`` for tracker-lifecycle tests."""
