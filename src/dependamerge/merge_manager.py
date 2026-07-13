@@ -4311,22 +4311,22 @@ class AsyncMergeManager:
     ) -> bool:
         """Return ``True`` if the PR has been merged externally.
 
-        Called after our own merge attempt has failed (or before
-        attempting it, when the PR was already closed at fetch
-        time) to distinguish two outcomes:
+        Called when the PR was already closed at fetch time to
+        distinguish two outcomes:
 
-        * The PR is genuinely unmergeable and needs human
-          follow-up — classify as ``FAILED``.
         * The PR was merged while we were processing it (a
           concurrent ``dependamerge`` run at org scope, a human
           admin, or auto-merge landing mid-flight) — classify as
           ``SKIPPED`` because there is no remaining work.
+        * The PR was closed without merging (superseded, no longer
+          needed, or closed by a human) — callers classify as
+          ``CLOSED``, which also needs no operator follow-up.
 
         Any API error during the recheck (network, rate limit,
         permission, unexpected payload) degrades to ``False`` so
-        the caller falls back to the existing failure path.
-        The intent here is to upgrade the user experience for a
-        known benign race, not to mask genuine errors.
+        the caller falls back to its non-merged path.  The intent
+        here is to upgrade the user experience for known benign
+        races, not to mask genuine errors.
         """
         state, merged = await self._fetch_pr_state_now(pr_info, owner, repo)
         return state == "closed" and merged is True
