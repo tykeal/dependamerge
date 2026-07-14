@@ -950,6 +950,8 @@ class TestMergeDryRun:
     asked for a preview).
     """
 
+    runner: CliRunner = CliRunner()
+
     def setup_method(self):
         self.runner = CliRunner()
 
@@ -1112,6 +1114,8 @@ class TestMergeDryRun:
 
 class TestCloseDryRun:
     """``close --dry-run`` previews without closing and without prompting."""
+
+    runner: CliRunner = CliRunner()
 
     def setup_method(self):
         self.runner = CliRunner()

@@ -2311,7 +2311,7 @@ def merge(
     # flag's behaviour stays aligned with its help text.  The isinstance
     # guard tolerates direct Python calls to ``merge`` (e.g. in tests),
     # where Typer's ``OptionInfo`` default object is passed unresolved.
-    if isinstance(max_wait, (int, float)) and max_wait < 0:
+    if isinstance(max_wait, int | float) and max_wait < 0:
         console.print(
             "❌ Invalid --max-wait: must be 0 (fire-and-forget) or a "
             "positive number of seconds"
