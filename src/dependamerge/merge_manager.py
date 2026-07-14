@@ -2965,9 +2965,15 @@ class AsyncMergeManager:
                                 "code owner reviews are required - cannot auto-approve",
                             )
 
-        except Exception:
-            # Don't fail the merge attempt if we can't check protection rules
-            pass
+        except Exception as exc:
+            # Don't fail the merge attempt if we can't check protection rules.
+            self.log.debug(
+                "Branch protection check failed for %s/%s#%s: %s",
+                repo_owner,
+                repo_name,
+                pr_info.number,
+                exc,
+            )
 
         # Predictive merge probe. This is a *best-effort* dry-run verdict
         # only: GitHub's mergeable_state can lag, and repository rulesets

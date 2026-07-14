@@ -658,9 +658,9 @@ class GitHubAsync:
                     self.limiter = AsyncLimiter(
                         max_rate=self._current_rps, time_period=1.0
                     )
-        except Exception:
-            # Tuning is best-effort; never fail the request on tuning errors
-            pass
+        except Exception as e:
+            # Tuning is best-effort; never fail the request on tuning errors.
+            self.log.debug("Adaptive concurrency tuning skipped: %s", e)
         # Push current metrics to progress tracker (if provided)
         try:
             await _maybe_await(
@@ -668,9 +668,9 @@ class GitHubAsync:
                 self._max_concurrency,
                 float(self._current_rps),
             )
-        except Exception:
-            # Metrics reporting is best-effort
-            pass
+        except Exception as e:
+            # Metrics reporting is best-effort.
+            self.log.debug("Progress metrics reporting failed: %s", e)
         return r
 
     # -------------
@@ -1256,8 +1256,16 @@ class GitHubAsync:
                 repo_data = await self.get(f"/repos/{owner}/{repo}")
                 if isinstance(repo_data, dict):
                     default_branch = repo_data.get("default_branch")
-            except Exception:
-                pass  # Will fall through to conservative matching
+            except Exception as e:
+                # Best-effort: without the default branch we fall through
+                # to conservative ~DEFAULT_BRANCH matching. Log the cause
+                # at debug level rather than discarding it silently.
+                self.log.debug(
+                    "Could not resolve default branch for %s/%s: %s",
+                    owner,
+                    repo,
+                    e,
+                )
 
             # Paginate through all rulesets to collect their IDs.
             # The list endpoint may not include full rules/conditions,
