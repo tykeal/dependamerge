@@ -188,6 +188,7 @@ class TestRecordTerminalOutcome:
             (MergeStatus.FAILED, "merge_failure"),
             (MergeStatus.SKIPPED, "merge_skipped"),
             (MergeStatus.BLOCKED, "merge_blocked"),
+            (MergeStatus.CLOSED, "increment_closed"),
             (MergeStatus.AUTO_MERGE_PENDING, "merge_pending"),
         ],
     )
@@ -206,6 +207,7 @@ class TestRecordTerminalOutcome:
             "merge_skipped",
             "merge_blocked",
             "merge_pending",
+            "increment_closed",
             "pr_completed",
         }
         for other in all_methods - {method}:

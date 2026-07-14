@@ -1406,6 +1406,8 @@ class TestBlockReasonIndicatesPendingChecks:
         for reason in (
             "Blocked by pending required check: pre-commit.ci",
             "Blocked by 2 pending required checks: ci/build, ci/lint",
+            "Blocked by pending check: AI Slop Scan 🧹",
+            "Blocked by 2 pending checks: AI Slop Scan 🧹, Zizmor Scan 🌈",
             "required status check is still pending",
             "waiting for status checks",
             "check queued",

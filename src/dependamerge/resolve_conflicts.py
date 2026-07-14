@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 import os
 import shlex
 import subprocess
@@ -51,6 +52,8 @@ from .git_ops import (
     secure_rmtree,
 )
 from .github_async import GitHubAsync
+
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -476,7 +479,10 @@ class FixOrchestrator:
         try:
             self._logger(msg)
         except Exception:
-            # Fallback to stdout
+            # The injected logger failed; record the cause with context
+            # via the module logger, then still emit the message on stdout
+            # so interactive output is not lost.
+            _LOG.warning("Injected logger failed; using stdout fallback", exc_info=True)
             print(msg)
 
 

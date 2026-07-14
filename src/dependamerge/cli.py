@@ -152,7 +152,6 @@ def _generate_override_sha(
     # Generate SHA256 hash
     sha_hash = hashlib.sha256(combined_data.encode("utf-8")).hexdigest()
 
-    # Return first 16 characters for readability
     return sha_hash[:16]
 
 
@@ -193,7 +192,6 @@ def _generate_continue_sha(
     # Generate SHA256 hash
     sha_hash = hashlib.sha256(combined_data.encode("utf-8")).hexdigest()
 
-    # Return first 16 characters for readability
     return sha_hash[:16]
 
 
@@ -204,7 +202,6 @@ def _format_condensed_similarity(comparison) -> str:
     # Check if same author is present
     has_same_author = any("Same automation author" in reason for reason in reasons)
 
-    # Extract individual scores from reasons
     score_parts = []
     for reason in reasons:
         if "Similar titles (score:" in reason:
@@ -217,7 +214,6 @@ def _format_condensed_similarity(comparison) -> str:
             score = reason.split("score: ")[1].replace(")", "")
             score_parts.append(f"changes {score}")
 
-    # Build condensed format
     if has_same_author:
         author_text = "Same author; "
     else:
@@ -291,7 +287,6 @@ def _format_gerrit_similarity(comparison: GerritComparisonResult) -> str:
     # Check if same author is present
     has_same_author = any("Same automation author" in reason for reason in reasons)
 
-    # Build condensed format
     if has_same_author:
         author_text = "Same author; "
     else:
@@ -299,7 +294,6 @@ def _format_gerrit_similarity(comparison: GerritComparisonResult) -> str:
 
     total_score = f"total score: {comparison.confidence_score:.2f}"
 
-    # Extract individual scores from reasons
     score_parts = []
     for reason in reasons:
         if "Similar subjects" in reason and "score:" in reason:
@@ -315,11 +309,6 @@ def _format_gerrit_similarity(comparison: GerritComparisonResult) -> str:
         breakdown = ""
 
     return f"{author_text}{total_score}{breakdown}"
-
-
-# ---------------------------------------------------------------------------
-# Merge context & helper subroutines
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -402,7 +391,6 @@ def _validate_merge_inputs(
     else:
         github2gerrit_mode = "submit"
 
-    # Configure logging
     if verbose:
         logging.basicConfig(
             level=logging.WARNING,
@@ -958,10 +946,21 @@ def _execute_confirmed_merge(
         if ctx.show_progress and ctx.progress_tracker:
             ctx.progress_tracker.stop()
 
+    _print_final_merge_summary(real_results)
+
+
+def _print_final_merge_summary(real_results: list[MergeResult]) -> None:
+    """Print the post-run 🚀 Final Results line and per-outcome recap.
+
+    Shared by the org / repo / similar-PR confirmed-merge paths so
+    every outcome category (including closed-without-merge) renders
+    identically regardless of scope.
+    """
     final_merged = sum(1 for r in real_results if r.status.value == "merged")
     final_failed = sum(1 for r in real_results if r.status.value == "failed")
     final_skipped = sum(1 for r in real_results if r.status.value == "skipped")
     final_blocked = sum(1 for r in real_results if r.status.value == "blocked")
+    final_closed = sum(1 for r in real_results if r.status.value == "closed")
     final_auto_merge = sum(
         1 for r in real_results if r.status.value == "auto_merge_pending"
     )
@@ -971,11 +970,17 @@ def _execute_confirmed_merge(
     parts.append(f"{final_failed} failed")
     if final_skipped > 0:
         parts.append(f"{final_skipped} skipped")
+    if final_blocked > 0:
+        parts.append(f"{final_blocked} blocked")
+    if final_closed > 0:
+        parts.append(f"{final_closed} closed")
     console.print(f"\n🚀 Final Results: {', '.join(parts)}")
     if final_skipped > 0:
         console.print(f"⏭️ Skipped {final_skipped} PRs")
     if final_blocked > 0:
         console.print(f"🛑 Blocked {final_blocked} PRs")
+    if final_closed > 0:
+        console.print(f"🚪 Closed without merging: {final_closed} PRs")
     if final_auto_merge > 0:
         console.print(f"⏳ Auto-merge pending for {final_auto_merge} PRs")
 
@@ -1012,6 +1017,10 @@ def _format_failure_reason(reason: str) -> list[str]:
                 _, _, after_first = after_marker.partition("'")
                 quoted, _, rest = after_first.partition("'")
                 workflows = [w.strip() for w in quoted.split(",") if w.strip()]
+                # GitHub can list the same workflow name more than once in
+                # the violation string; collapse duplicates while keeping
+                # first-seen order so each name renders as a single bullet.
+                workflows = list(dict.fromkeys(workflows))
                 verb = "failed" if "fail" in rest.lower() else "not satisfied"
                 if workflows:
                     return [
@@ -1021,6 +1030,9 @@ def _format_failure_reason(reason: str) -> list[str]:
         # Required status check(s): ``Required status check "X" is failing.``
         if "Required status check" in reason:
             checks = [c.strip() for c in re.findall(r'"([^"]+)"', reason) if c.strip()]
+            # De-duplicate repeated names (see workflows note above),
+            # preserving first-seen order.
+            checks = list(dict.fromkeys(checks))
             verb = "failed" if "fail" in reason.lower() else "not satisfied"
             if checks:
                 return [
@@ -1041,13 +1053,14 @@ def _print_failed_pr_details(
     no longer printed to the console at all (progress is conveyed
     by the live tracker counters), so this end-of-run report is
     the *only* place reasons appear.  It therefore covers every
-    non-merged terminal outcome — failed, blocked, skipped and
-    auto-merge pending — one section per outcome.
+    non-merged terminal outcome — failed, blocked, skipped, closed
+    and auto-merge pending — one section per outcome.
     """
     sections: list[tuple[str, str]] = [
         ("failed", "\n❌ Failed PRs:"),
         ("blocked", "\n🛑 Blocked PRs:"),
         ("skipped", "\n⏭️ Skipped PRs:"),
+        ("closed", "\n🚪 Closed PRs:"),
         ("auto_merge_pending", "\n🤖 Auto-merge pending PRs:"),
     ]
     for status_value, heading in sections:
@@ -1058,9 +1071,7 @@ def _print_failed_pr_details(
         for r in matching:
             url = getattr(r.pr_info, "html_url", "<unknown>")
             reason = r.error or "no reason reported"
-            body = "\n".join(
-                f"     {line}" for line in _format_failure_reason(reason)
-            )
+            body = "\n".join(f"     {line}" for line in _format_failure_reason(reason))
             # markup=False so bracketed reasons are not eaten by Rich.
             console.print(f"   • {url}\n{body}", markup=False)
 
@@ -1074,6 +1085,7 @@ def _display_merge_results(
     failed_count = sum(1 for r in merge_results if r.status.value == "failed")
     skipped_count = sum(1 for r in merge_results if r.status.value == "skipped")
     blocked_count = sum(1 for r in merge_results if r.status.value == "blocked")
+    closed_count = sum(1 for r in merge_results if r.status.value == "closed")
     auto_merge_count = sum(
         1 for r in merge_results if r.status.value == "auto_merge_pending"
     )
@@ -1087,6 +1099,8 @@ def _display_merge_results(
         console.print(f"⏭️ Skipped {skipped_count} PRs")
     if blocked_count > 0:
         console.print(f"🛑 Blocked {blocked_count} PRs")
+    if closed_count > 0:
+        console.print(f"🚪 Closed without merging: {closed_count} PRs")
     if auto_merge_count > 0:
         console.print(f"⏳ Auto-merge pending for {auto_merge_count} PRs")
 
@@ -1097,6 +1111,10 @@ def _display_merge_results(
         parts.append(f"{failed_count} failed")
         if skipped_count > 0:
             parts.append(f"{skipped_count} skipped")
+        if blocked_count > 0:
+            parts.append(f"{blocked_count} blocked")
+        if closed_count > 0:
+            parts.append(f"{closed_count} closed")
         console.print(f"📈 Final Results: {', '.join(parts)}")
 
     _print_failed_pr_details(merge_results)
@@ -1119,7 +1137,6 @@ def _handle_repo_merge(
     from .github_service import GitHubService
     from .url_parser import _host_matches
 
-    # --- Guard: repo-merge only supports github.com for now ---
     if not _host_matches(parsed_repo.host, "github.com"):
         console.print(
             "❌ Repository-scoped merge is currently only supported "
@@ -1129,7 +1146,6 @@ def _handle_repo_merge(
         )
         raise typer.Exit(code=1)
 
-    # --- Initialise GitHub client & token ---
     ctx.github_client = GitHubClient(ctx.token)
     assert ctx.github_client.token is not None
     ctx.token = ctx.github_client.token
@@ -1138,10 +1154,8 @@ def _handle_repo_merge(
 
     console.print(f"🔍 Repository mode: fetching open PRs in {parsed_repo.project}...")
 
-    # --- Token permission check (reuse existing helper) ---
     _maybe_check_merge_permissions(ctx)
 
-    # --- Progress tracker ---
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
             f"{ctx.owner}/{ctx.repo_name}",
@@ -1155,7 +1169,6 @@ def _handle_repo_merge(
         # ``🔍 Fetching open PRs in <owner>/<repo>``.
         ctx.progress_tracker.start()
 
-    # --- Fetch open PRs for the repository ---
     only_automation = not ctx.include_human_prs
 
     async def _fetch_prs() -> list[PullRequestInfo]:
@@ -1187,7 +1200,6 @@ def _handle_repo_merge(
         console.print(f"❌ No open {label}PRs found in {parsed_repo.project}")
         return
 
-    # --- Order PRs oldest-first (ascending PR number) ---
     # The GraphQL fetch returns PRs newest-first (CREATED_AT DESC), but
     # merging within a repository must drain oldest-first.  Merging the
     # newest PR ahead of an older sibling leaves the older one behind the
@@ -1198,7 +1210,6 @@ def _handle_repo_merge(
     # identically; the preview list below is derived from this order too.
     repo_prs = _repo_merge_order(repo_prs)
 
-    # --- Classify PRs as automation vs human ---
     # Delegated to the shared bot-identity predicate so REST and GraphQL
     # login forms (e.g. "dependabot[bot]" vs "dependabot") classify
     # identically.
@@ -1226,7 +1237,6 @@ def _handle_repo_merge(
     for pr in repo_prs:
         console.print(f"  #{pr.number} {pr.title} (by {pr.author})")
 
-    # --- Human PR confirmation gate ---
     # Only prompt when human PRs are actually in scope, not merely
     # because --include-human-prs was supplied.  A dry run never prompts;
     # it mirrors the safe default (exclude human PRs) so the preview
@@ -1247,7 +1257,6 @@ def _handle_repo_merge(
             )
             if user_input != "yes":
                 console.print("ℹ️ Excluding human PRs from merge.")
-                # Remove human PRs from the working set
                 repo_prs = automation_prs
                 if not repo_prs:
                     console.print("❌ No automation PRs remain to merge.")
@@ -1266,12 +1275,10 @@ def _handle_repo_merge(
             "(a real run would prompt before merging them)."
         )
 
-    # --- Build the merge list (ComparisonResult is None for repo mode) ---
     all_prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]] = [
         (pr, None) for pr in repo_prs
     ]
 
-    # --- Preview / merge using existing infrastructure ---
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
             f"{ctx.owner}/{ctx.repo_name}",
@@ -1415,28 +1422,7 @@ def _execute_repo_confirmed_merge(
         if ctx.show_progress and ctx.progress_tracker:
             ctx.progress_tracker.stop()
 
-    final_merged = sum(1 for r in real_results if r.status.value == "merged")
-    final_failed = sum(1 for r in real_results if r.status.value == "failed")
-    final_skipped = sum(1 for r in real_results if r.status.value == "skipped")
-    final_blocked = sum(1 for r in real_results if r.status.value == "blocked")
-    final_auto_merge = sum(
-        1 for r in real_results if r.status.value == "auto_merge_pending"
-    )
-    parts = [f"{final_merged} merged"]
-    if final_auto_merge > 0:
-        parts.append(f"{final_auto_merge} auto-merge pending")
-    parts.append(f"{final_failed} failed")
-    if final_skipped > 0:
-        parts.append(f"{final_skipped} skipped")
-    console.print(f"\n🚀 Final Results: {', '.join(parts)}")
-    if final_skipped > 0:
-        console.print(f"⏭️ Skipped {final_skipped} PRs")
-    if final_blocked > 0:
-        console.print(f"🛑 Blocked {final_blocked} PRs")
-    if final_auto_merge > 0:
-        console.print(f"⏳ Auto-merge pending for {final_auto_merge} PRs")
-
-    _print_failed_pr_details(real_results)
+    _print_final_merge_summary(real_results)
 
 
 def _repo_merge_order(
@@ -1540,7 +1526,6 @@ def _handle_org_merge(
     # stack — deliberately not re-checked here so there is no second
     # guard to drift out of sync.
 
-    # --- Initialise GitHub client & token ---
     ctx.github_client = GitHubClient(ctx.token)
     assert ctx.github_client.token is not None
     ctx.token = ctx.github_client.token
@@ -1556,7 +1541,6 @@ def _handle_org_merge(
     # with an empty ``ctx.repo_name`` would abort every owner-wide run
     # unconditionally.
 
-    # --- Progress tracker (enumeration phase: repos fraction) ---
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
             parsed_org.owner,
@@ -1565,7 +1549,6 @@ def _handle_org_merge(
         )
         ctx.progress_tracker.start()
 
-    # --- Enumerate automation PRs across the owner ---
     only_automation = not ctx.include_human_prs
 
     async def _fetch_prs() -> tuple[list[PullRequestInfo], list[str]]:
@@ -1591,7 +1574,6 @@ def _handle_org_merge(
     if ctx.progress_tracker:
         ctx.progress_tracker.stop()
 
-    # --- Surface per-repository scan failures (run continues) ---
     if scan_errors:
         error_count = len(scan_errors)
         repo_noun = "repository" if error_count == 1 else "repositories"
@@ -1609,7 +1591,6 @@ def _handle_org_merge(
     # Both the grouped listing and the merge list derive from this order.
     owner_prs = _owner_merge_order(owner_prs)
 
-    # --- Token permission check (reuse existing helper) ---
     # Deferred from before enumeration: the helper needs a concrete repo
     # to probe, so point it at the first in-scope PR's repository as a
     # representative sample.  The common failure modes (expired/invalid
@@ -1619,7 +1600,6 @@ def _handle_org_merge(
     ctx.repo_name = owner_prs[0].repository_full_name.split("/", 1)[-1]
     _maybe_check_merge_permissions(ctx)
 
-    # --- Classify PRs as automation vs human ---
     # Delegated to the shared bot-identity predicate (see _handle_repo_merge).
     def _is_auto(author: str | None) -> bool:
         return is_automation_author(author)
@@ -1647,7 +1627,6 @@ def _handle_org_merge(
     # Grouped-by-repository listing keeps a large owner-wide list scannable.
     _print_prs_grouped_by_repo(owner_prs)
 
-    # --- Human PR confirmation gate ---
     needs_human_confirm = bool(human_prs) and not ctx.no_confirm and not ctx.dry_run
     if needs_human_confirm:
         console.print(
@@ -1685,7 +1664,6 @@ def _handle_org_merge(
             "(a real run would prompt before merging them)."
         )
 
-    # --- Build the merge list (ComparisonResult is None for owner mode) ---
     all_prs_to_merge: list[tuple[PullRequestInfo, ComparisonResult | None]] = [
         (pr, None) for pr in owner_prs
     ]
@@ -1696,7 +1674,6 @@ def _handle_org_merge(
     final_distinct_repos = {pr.repository_full_name for pr in owner_prs}
     concurrency = min(10, len(final_distinct_repos)) or 1
 
-    # --- Preview / merge using the striped scheduler ---
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
             parsed_org.owner,
@@ -1830,28 +1807,7 @@ def _execute_org_confirmed_merge(
         if ctx.show_progress and ctx.progress_tracker:
             ctx.progress_tracker.stop()
 
-    final_merged = sum(1 for r in real_results if r.status.value == "merged")
-    final_failed = sum(1 for r in real_results if r.status.value == "failed")
-    final_skipped = sum(1 for r in real_results if r.status.value == "skipped")
-    final_blocked = sum(1 for r in real_results if r.status.value == "blocked")
-    final_auto_merge = sum(
-        1 for r in real_results if r.status.value == "auto_merge_pending"
-    )
-    parts = [f"{final_merged} merged"]
-    if final_auto_merge > 0:
-        parts.append(f"{final_auto_merge} auto-merge pending")
-    parts.append(f"{final_failed} failed")
-    if final_skipped > 0:
-        parts.append(f"{final_skipped} skipped")
-    console.print(f"\n🚀 Final Results: {', '.join(parts)}")
-    if final_skipped > 0:
-        console.print(f"⏭️ Skipped {final_skipped} PRs")
-    if final_blocked > 0:
-        console.print(f"🛑 Blocked {final_blocked} PRs")
-    if final_auto_merge > 0:
-        console.print(f"⏳ Auto-merge pending for {final_auto_merge} PRs")
-
-    _print_failed_pr_details(real_results)
+    _print_final_merge_summary(real_results)
 
 
 def _handle_gerrit_merge(
@@ -1909,7 +1865,6 @@ def _handle_gerrit_merge(
     console.print(f"🔍 Examining Gerrit change on {parsed_url.host}...")
 
     try:
-        # Create Gerrit service
         service = create_gerrit_service(
             host=parsed_url.host,
             base_path=parsed_url.base_path,
@@ -1920,7 +1875,6 @@ def _handle_gerrit_merge(
         if not service.is_authenticated:
             console.print("⚠️ Warning: Service created but may not be authenticated")
 
-        # Get the source change info
         console.print(f"📋 Fetching change {parsed_url.change_number}...")
         source_change = service.get_change_info(parsed_url.change_number)
 
@@ -1975,7 +1929,6 @@ def _handle_gerrit_merge(
                 console.print(f"\n❌ Rebase failed: {rebase_result['error']}")
                 raise typer.Exit(1)
 
-        # Create comparator and find similar changes
         comparator = create_gerrit_comparator(similarity_threshold=similarity_threshold)
 
         console.print(f"\n🔍 Searching for similar changes on {parsed_url.host}...")
@@ -2037,7 +1990,6 @@ def _handle_gerrit_merge(
                 console.print("\nTo proceed, run with --no-confirm flag")
             return
 
-        # Create submit manager and submit changes
         console.print(f"\n🚀 Submitting {len(all_changes)} changes...")
 
         submit_manager = create_submit_manager(
@@ -2305,7 +2257,6 @@ def merge(
     .netrc search order: ./netrc, ~/.netrc, ~/_netrc (Windows)
     Use --netrc-file to specify an explicit path.
     """
-    # --- Input validation & logging setup ---
     github2gerrit_mode = _validate_merge_inputs(
         submit_gerrit_changes,
         skip_gerrit_changes,
@@ -2321,14 +2272,13 @@ def merge(
     # flag's behaviour stays aligned with its help text.  The isinstance
     # guard tolerates direct Python calls to ``merge`` (e.g. in tests),
     # where Typer's ``OptionInfo`` default object is passed unresolved.
-    if isinstance(max_wait, (int, float)) and max_wait < 0:
+    if isinstance(max_wait, int | float) and max_wait < 0:
         console.print(
             "❌ Invalid --max-wait: must be 0 (fire-and-forget) or a "
             "positive number of seconds"
         )
         raise typer.Exit(1)
 
-    # --- Parse URL and route to the appropriate handler ---
     # Try as a specific PR/change URL first, then an owner-wide URL
     # (bare owner / orgs/owner), then a single repository URL.
     parsed_url: ParsedUrl | None = None
@@ -2387,7 +2337,6 @@ def merge(
                     console.print(f"❌ Invalid URL: {repo_err}")
                 raise typer.Exit(1) from None
 
-    # --- Route: Gerrit change ---
     if parsed_url is not None and parsed_url.is_gerrit:
         _handle_gerrit_merge(
             parsed_url=parsed_url,
@@ -2402,7 +2351,6 @@ def merge(
         )
         return
 
-    # --- Route: GitHub owner (org/user) bulk merge ---
     if parsed_org is not None:
         org_ctx = _MergeContext(
             pr_url=parsed_org.original_url,
@@ -2471,7 +2419,6 @@ def merge(
                 )
         return
 
-    # --- Route: GitHub repository (bulk per-repo merge) ---
     if parsed_repo is not None:
         repo_ctx = _MergeContext(
             pr_url=parsed_repo.original_url,
@@ -2540,7 +2487,6 @@ def merge(
                 )
         return
 
-    # --- Route: GitHub single PR merge flow ---
     assert parsed_url is not None
     ctx = _MergeContext(
         pr_url=parsed_url.original_url,
@@ -2575,7 +2521,6 @@ def merge(
         if ctx.debug_matching:
             _print_debug_matching(ctx)
 
-        # Validate automation author / override
         _validate_automation_author(ctx)
 
         # Scan org and find similar PRs
@@ -2584,7 +2529,6 @@ def merge(
         if not ctx.no_confirm or ctx.dry_run:
             console.print("\n🔍 Dependamerge Evaluation\n")
 
-        # Build full list and run parallel merge
         assert ctx.source_pr is not None
         source_entry: tuple[PullRequestInfo, ComparisonResult | None] = (
             ctx.source_pr,
@@ -2620,7 +2564,6 @@ def merge(
             ):
                 ctx.progress_tracker.stop()
 
-        # Process and display results
         if not merge_results:
             console.print("❌ No PRs were processed")
             return
@@ -2799,11 +2742,9 @@ def close(
 
     For user generated bulk PRs, use the --override flag with SHA hash.
     """
-    # Initialize progress tracker
     progress_tracker = None
 
     try:
-        # Parse PR URL first to get organization info
         github_client = GitHubClient(token)
         # GitHubClient resolves None -> GITHUB_TOKEN env var (raises if missing)
         assert github_client.token is not None
@@ -2820,7 +2761,6 @@ def close(
         else:
             console.print(f"🔍 Examining source pull request in {owner}...")
 
-        # Get source PR details
         source_pr = github_client.get_pull_request_info(owner, repo_name, pr_number)
 
         # Display source PR info
@@ -2828,7 +2768,6 @@ def close(
             source_pr, "", github_client, progress_tracker=progress_tracker
         )
 
-        # Initialize comparator
         comparator = PRComparator(similarity_threshold)
 
         # Debug matching info for source PR
@@ -2855,7 +2794,6 @@ def close(
         override_valid = False
 
         if not is_automation:
-            # Get first commit message for SHA generation
             commit_messages = github_client.get_pull_request_commits(
                 owner, repo_name, pr_number
             )
@@ -2927,7 +2865,6 @@ def close(
 
         all_similar_prs = asyncio.run(_find_similar())
 
-        # Stop progress tracker before displaying results
         if progress_tracker:
             progress_tracker.stop()
             summary = progress_tracker.get_summary()
@@ -3033,7 +2970,6 @@ def close(
 
                 # Generate continuation SHA and prompt user
                 if closed_count > 0:
-                    # Get commit message for SHA generation
                     commit_messages = github_client.get_pull_request_commits(
                         owner, repo_name, pr_number
                     )
@@ -3127,7 +3063,6 @@ def close(
             progress_tracker.stop()
         raise
     except typer.Exit:
-        # Handle typer exits gracefully - already printed message
         if progress_tracker:
             progress_tracker.stop()
         # Re-raise without additional error messages
@@ -3231,7 +3166,6 @@ def status(
 
         status_result = asyncio.run(_run_status_check())
 
-        # Stop progress tracker before displaying results
         if progress_tracker:
             progress_tracker.stop()
             if progress_tracker.rich_available:
@@ -3349,7 +3283,6 @@ def blocked(
         )
         raise typer.Exit(1)
 
-    # Initialize progress tracker
     progress_tracker = None
 
     try:
@@ -3380,7 +3313,6 @@ def blocked(
 
         scan_result = asyncio.run(_run_blocked_check())
 
-        # Stop progress tracker before displaying results
         if progress_tracker:
             progress_tracker.stop()
             if progress_tracker.rich_available:
@@ -3407,7 +3339,6 @@ def blocked(
 
         # Optional fix workflow
         if fix:
-            # Build candidate list based on reasons
             allowed_default = {"merge_conflict", "behind_base"}
             reasons_to_attempt = (
                 allowed_default if not reason else {reason.strip().lower()}
@@ -3477,7 +3408,6 @@ def blocked(
             progress_tracker.stop()
         raise
     except typer.Exit as e:
-        # Handle typer exits gracefully
         if progress_tracker:
             progress_tracker.stop()
         raise e
@@ -3524,7 +3454,6 @@ def _display_blocked_results(scan_result, output_format: str):
         console.print("🎉 No unmergeable pull requests found!")
         return
 
-    # Create detailed blocked PRs table
     pr_table = Table(title=f"Blocked Pull Requests: {scan_result.organization}")
     pr_table.add_column("Repository", style="cyan")
     pr_table.add_column("PR", style="white")
@@ -3601,7 +3530,6 @@ def _display_status_results(status_result, output_format: str):
         console.print("❌ No repositories found in organization!")
         return
 
-    # Create status table
     status_table = Table(title=f"Organization: {status_result.organization}")
     status_table.add_column("Repository", style="cyan")
     status_table.add_column("Tag", style="white")
@@ -3654,7 +3582,6 @@ def _display_status_results(status_result, output_format: str):
             console.print(f"  • {tool.capitalize()}")
     console.print()
 
-    # Create summary table
     summary_table = Table()
     summary_table.add_column("Summary", style="cyan")
     summary_table.add_column("Value", style="white")

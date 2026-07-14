@@ -296,8 +296,8 @@ class TestHandleMergeConflict:
         assert result.status == MergeStatus.AUTO_MERGE_PENDING
 
     @pytest.mark.asyncio
-    async def test_closed_without_merge_fails(self) -> None:
-        """A PR closed without merging during the wait is a failure."""
+    async def test_closed_without_merge_reports_closed(self) -> None:
+        """A PR closed without merging during the wait reports CLOSED."""
         mgr, _client = make_merge_manager()
         pr = _make_pr()
 
@@ -318,7 +318,7 @@ class TestHandleMergeConflict:
                 pr, "lfreleng-actions", "lftools-uv", _result(pr)
             )
 
-        assert result.status == MergeStatus.FAILED
+        assert result.status == MergeStatus.CLOSED
         assert "closed without merging" in (result.error or "")
 
     @pytest.mark.asyncio

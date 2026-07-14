@@ -658,9 +658,9 @@ class GitHubAsync:
                     self.limiter = AsyncLimiter(
                         max_rate=self._current_rps, time_period=1.0
                     )
-        except Exception:
-            # Tuning is best-effort; never fail the request on tuning errors
-            pass
+        except Exception as e:
+            # Tuning is best-effort; never fail the request on tuning errors.
+            self.log.debug("Adaptive concurrency tuning skipped: %s", e)
         # Push current metrics to progress tracker (if provided)
         try:
             await _maybe_await(
@@ -668,9 +668,9 @@ class GitHubAsync:
                 self._max_concurrency,
                 float(self._current_rps),
             )
-        except Exception:
-            # Metrics reporting is best-effort
-            pass
+        except Exception as e:
+            # Metrics reporting is best-effort.
+            self.log.debug("Progress metrics reporting failed: %s", e)
         return r
 
     # -------------
@@ -1256,8 +1256,16 @@ class GitHubAsync:
                 repo_data = await self.get(f"/repos/{owner}/{repo}")
                 if isinstance(repo_data, dict):
                     default_branch = repo_data.get("default_branch")
-            except Exception:
-                pass  # Will fall through to conservative matching
+            except Exception as e:
+                # Best-effort: without the default branch we fall through
+                # to conservative ~DEFAULT_BRANCH matching. Log the cause
+                # at debug level rather than discarding it silently.
+                self.log.debug(
+                    "Could not resolve default branch for %s/%s: %s",
+                    owner,
+                    repo,
+                    e,
+                )
 
             # Paginate through all rulesets to collect their IDs.
             # The list endpoint may not include full rules/conditions,
@@ -2222,6 +2230,36 @@ class GitHubAsync:
             return (
                 f"Blocked by {unresolved_copilot_comments} unresolved Copilot comments"
             )
+
+        # No *required* check is failing, missing, or pending, and no
+        # human/Copilot review is blocking — but if any check on the head
+        # commit is still queued or in progress, the PR is only *temporarily*
+        # blocked. This matters for checks enforced through a repository
+        # ruleset's "required workflows": those never appear in the classic
+        # required-status-checks list, so the pending_required_checks branch
+        # above cannot see them. Surface them as pending here, *before* the
+        # "requires approval" fallback, so the merge pipeline waits for them
+        # (and arms auto-merge) instead of failing the PR outright while its
+        # workflows are still running.
+        # Any name in ``pending_check_names`` has a queued/in-progress run
+        # and is therefore still running. We must NOT subtract
+        # ``completed_check_names``: GitHub can report two runs with the
+        # same name (a re-run leaves one ``completed`` entry and a fresh
+        # ``in_progress`` one), and the set difference would cancel the
+        # name out and hide a check that is genuinely still running.
+        #
+        # Defensively filter to non-empty strings: a malformed API
+        # payload can report ``name``/``context`` as ``null``, and mixing
+        # ``None`` with strings would make ``sorted``/``join`` raise. This
+        # branch is best-effort, so drop anything that is not a usable name.
+        pending_only = sorted(
+            name for name in pending_check_names if isinstance(name, str) and name
+        )
+        if pending_only:
+            if len(pending_only) == 1:
+                return f"Blocked by pending check: {pending_only[0]}"
+            names = ", ".join(pending_only)
+            return f"Blocked by {len(pending_only)} pending checks: {names}"
 
         if not approved:
             return "Blocked by branch protection (requires approval)"

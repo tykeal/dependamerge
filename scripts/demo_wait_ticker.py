@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -144,7 +145,10 @@ async def _amain(plain: bool) -> int:
     tracker.start()
 
     manager = AsyncMergeManager(
-        token="demo-token-not-used-no-api-calls",
+        # The demo issues no network calls, so any value works. Read from
+        # the environment (with a harmless placeholder default) rather than
+        # embedding a token-shaped literal that secret scanners flag.
+        token=os.environ.get("DEMO_GITHUB_TOKEN", "unused-placeholder-no-api-calls"),
         progress_tracker=tracker,
     )
 
