@@ -45,7 +45,6 @@ from .output_utils import log_and_print
 from .progress_tracker import MergeProgressTracker
 from .slot_lease import holding_slot, parked
 
-# ---------------------------------------------------------------------------
 # Centralised timing constants for all async merge operations.
 #
 # Every polling loop in this module (post-rebase status checks,
@@ -53,7 +52,6 @@ from .slot_lease import holding_slot, parked
 # derives its iteration count from these two values so that the timeout
 # is consistent and easy to adjust from a single place or via the
 # ``--merge-timeout`` CLI flag.
-# ---------------------------------------------------------------------------
 DEFAULT_MERGE_TIMEOUT: float = 300.0  # seconds (5 minutes)
 DEFAULT_MERGE_RECHECK_INTERVAL: float = 10.0  # seconds between polls
 
@@ -372,7 +370,6 @@ class AsyncMergeManager:
         self._github_client = GitHubAsync(token=self.token)
         await self._github_client.__aenter__()
 
-        # Initialize GitHubService for branch protection detection
         self._github_service = GitHubService(token=self.token)
 
         # Initialize Copilot handler if dismissal is enabled
@@ -938,7 +935,6 @@ class AsyncMergeManager:
             return False
 
         try:
-            # Create service and look up the change by Change-ID
             service = create_gerrit_service(
                 host=gerrit_host,
                 base_path=gerrit_base_path,
@@ -977,7 +973,6 @@ class AsyncMergeManager:
                 change_id,
             )
 
-            # Create submit manager and submit the change
             submit_manager = create_submit_manager(
                 host=gerrit_host,
                 base_path=gerrit_base_path,
@@ -1205,7 +1200,6 @@ class AsyncMergeManager:
         result = MergeResult(pr_info=pr_info, status=MergeStatus.PENDING)
 
         try:
-            # --- GitHub2Gerrit detection (before any merge attempt) ---
             if self.github2gerrit_mode != "ignore":
                 g2g_result = await self._detect_github2gerrit(
                     repo_owner, repo_name, pr_info.number
@@ -1325,7 +1319,7 @@ class AsyncMergeManager:
                             f"⚠️ Overriding blocking reviews for {pr_info.repository_full_name}#{pr_info.number} (--force=all)"
                         )
 
-            # Step 0.5: If the PR is blocked, check for stale pre-commit.ci
+            # If the PR is blocked, check for stale pre-commit.ci
             # and trigger a re-run before evaluating merge requirements.
             # Avoid triggering side effects when running in preview mode.
             if (
@@ -1351,7 +1345,6 @@ class AsyncMergeManager:
                             e,
                         )
 
-            # Step 1: Check merge requirements (including branch protection)
             can_merge, merge_check_reason = await self._check_merge_requirements(
                 pr_info
             )
@@ -1365,7 +1358,6 @@ class AsyncMergeManager:
                 )
                 return result
 
-            # Step 2: Dismiss Copilot comments if enabled
             copilot_processing_successful = True
             if self.dismiss_copilot and self._copilot_handler:
                 # Analyze what types of reviews we have
@@ -1387,7 +1379,7 @@ class AsyncMergeManager:
                     )
                     copilot_processing_successful = False
 
-            # Step 3: Gate on Copilot processing, but DO NOT approve
+            # Gate on Copilot processing, but DO NOT approve
             # up-front. Approval is now performed on demand (approve-on-
             # demand): either just before arming auto-merge (see
             # _enable_auto_merge_with_approval) or after a direct merge is
@@ -1405,7 +1397,7 @@ class AsyncMergeManager:
                 )
                 return result
 
-            # Step 5: Handle rebase if needed before merge.
+            # Handle rebase if needed before merge.
             #
             # Dispatched to the dedicated ``rebase`` module so the
             # local-vs-REST decision tree, the local-git workflow,
@@ -1459,7 +1451,7 @@ class AsyncMergeManager:
                     result.error = outcome.error_message
                     return result
 
-            # Step 5.5: If the PR is still blocked (e.g. by a pending
+            # If the PR is still blocked (e.g. by a pending
             # required status check such as pre-commit.ci), behind
             # base branch, or unstable (a non-required check failed),
             # enable auto-merge and wait for required checks to
@@ -1622,7 +1614,6 @@ class AsyncMergeManager:
                         )
                     return result
 
-            # Step 6: Attempt merge
             result.status = MergeStatus.MERGING
             if self.preview_mode:
                 self._simulate_preview_merge(pr_info, result)
@@ -1925,8 +1916,8 @@ class AsyncMergeManager:
                         if should_recreate:
                             self._track_pr_state(pr_info, "recreating")
                             try:
-                                recreated_pr = (
-                                    await self._trigger_dependabot_recreate(pr_info)
+                                recreated_pr = await self._trigger_dependabot_recreate(
+                                    pr_info
                                 )
                             finally:
                                 self._track_pr_state(pr_info, None)
@@ -2017,7 +2008,6 @@ class AsyncMergeManager:
             )
             self._permission_failed_repos.add(pr_info.repository_full_name)
 
-            # Extract operation-specific error message
             operation_desc = e.operation.replace("_", " ")
             self._pr_status(
                 f"❌ Failed: {pr_info.html_url} [permission denied: {operation_desc}]",
@@ -2926,14 +2916,12 @@ class AsyncMergeManager:
         repo_owner, repo_name = pr_info.repository_full_name.split("/")
 
         try:
-            # Check branch protection rules
             base_branch = pr_info.base_branch or "main"
             protection_rules = await self._github_client.get_branch_protection(
                 repo_owner, repo_name, base_branch
             )
 
             if protection_rules:
-                # Check required reviews
                 required_reviews = protection_rules.get(
                     "required_pull_request_reviews", {}
                 )
@@ -3000,7 +2988,6 @@ class AsyncMergeManager:
                         "protection-rules",
                         "all",
                     ]:
-                        # Check bypass permissions before reporting success
                         if self._github_client:
                             self.log.debug(
                                 f"Checking bypass permissions for {repo_owner}/{repo_name} with force_level={self.force_level}"
@@ -3753,10 +3740,8 @@ class AsyncMergeManager:
                                     continue
 
                                 # Found a replacement — now wait for checks to pass
-                                new_pr_info = (
-                                    await self._wait_for_recreated_pr_checks(
-                                        repo_owner, repo_name, new_number, pr_data
-                                    )
+                                new_pr_info = await self._wait_for_recreated_pr_checks(
+                                    repo_owner, repo_name, new_number, pr_data
                                 )
                                 # Always return after the first wait attempt to avoid
                                 # performing multiple long waits for the same PR.
@@ -3867,7 +3852,6 @@ class AsyncMergeManager:
                         f"✅ Recreated PR is ready to merge: {html_url}",
                         level="info",
                     )
-                    # Build a PullRequestInfo for the new PR
                     from .models import FileChange
 
                     files_changed: list[FileChange] = []
@@ -3976,12 +3960,9 @@ class AsyncMergeManager:
                 # Get current user login (cached on the client after the
                 # first call — the login is session-constant, so this
                 # costs one round-trip per run instead of one per PR).
-                current_user = (
-                    await self._github_client.get_authenticated_user_login()
-                )
+                current_user = await self._github_client.get_authenticated_user_login()
 
                 if current_user:
-                    # Check existing reviews
                     reviews_data = await self._github_client.get(
                         f"/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
                     )
@@ -4010,7 +3991,6 @@ class AsyncMergeManager:
                             approved_reviews
                             and pr_data.get("mergeable_state") == "clean"
                         ):
-                            # Get list of approvers
                             approvers = [
                                 review.get("user", {}).get("login", "unknown")
                                 for review in approved_reviews
@@ -4038,7 +4018,6 @@ class AsyncMergeManager:
             # every PR in the batch.
             raise
         except Exception as e:
-            # Handle specific error codes
             error_str = str(e)
 
             # Check for 403 Forbidden - missing pull request review permissions
@@ -4974,7 +4953,7 @@ class AsyncMergeManager:
         # phases (waiting for the rebase, then for checks).
         deadline = asyncio.get_running_loop().time() + self._merge_timeout
 
-        # Phase 1: wait for dependabot's rebase to clear the conflict.
+        # Wait for dependabot's rebase to clear the conflict.
         # Keep waiting while still ``dirty`` or while GitHub recomputes
         # mergeability (a transient null is preserved as the prior
         # ``dirty`` by ``_wait_for_auto_merge``).
@@ -5030,7 +5009,7 @@ class AsyncMergeManager:
                 level="debug",
             )
 
-        # Phase 2: wait (sharing the deadline) for required checks to
+        # Wait (sharing the deadline) for required checks to
         # land.  When auto-merge is armed we wait *through* ``clean``
         # (``stop_on_clean=False``) so we can observe GitHub actually
         # close the PR and report MERGED.  When auto-merge could NOT be
@@ -5215,7 +5194,6 @@ class AsyncMergeManager:
                     "workflow update blocked by repository ruleset or SSO "
                     "(token already has 'workflow' scope)"
                 )
-            # Check for other permission errors
             elif "403" in error_msg and "forbidden" in error_lower:
                 return "insufficient permissions"
             # Surface transient HTTP errors (502, 405 etc.) accurately instead
@@ -5322,7 +5300,6 @@ class AsyncMergeManager:
             return self.default_merge_method
 
         try:
-            # Get branch protection settings for main branch
             protection_settings = (
                 await self._github_service.get_branch_protection_settings(
                     owner, repo, "main"
@@ -5846,7 +5823,6 @@ class AsyncMergeManager:
             # web-based commits, not PR merges. DCO enforcement for PRs is handled by
             # status checks/apps, not repository settings.
 
-            # Check the PR's merge status through the API
             pr_data = await self._github_client.get(
                 f"/repos/{owner}/{repo}/pulls/{pr_number}"
             )
@@ -5877,9 +5853,7 @@ class AsyncMergeManager:
                                     repo,
                                     pr_number,
                                     head_sha,
-                                    base_branch=(pr_data.get("base") or {}).get(
-                                        "ref"
-                                    ),
+                                    base_branch=(pr_data.get("base") or {}).get("ref"),
                                 )
                             )
                             self.log.debug(
