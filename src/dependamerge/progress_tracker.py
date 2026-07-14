@@ -185,8 +185,13 @@ class ProgressTracker:
                 transient=False,
             )
             if self.live:
-                self.live.start()
+                # Quiet terminal logging *before* starting Live: if quieting
+                # raised after the start, the ``except`` path would drop the
+                # reference without stopping the already-started display,
+                # leaving it orphaned. Ordering it first also closes the
+                # window where a log could slip past Rich right after start.
                 self._quiet_terminal_logging()
+                self.live.start()
         except Exception:
             # Fallback if Rich display fails (e.g., unsupported terminal)
             self._restore_terminal_logging()
@@ -244,8 +249,11 @@ class ProgressTracker:
                     transient=False,
                 )
                 if self.live:
-                    self.live.start()
+                    # Quiet before starting Live for the same reason as
+                    # ``start()``: avoid orphaning a started display if
+                    # quieting raises, and close the log-slip window.
                     self._quiet_terminal_logging()
+                    self.live.start()
             except Exception:
                 self._restore_terminal_logging()
                 self.live = None

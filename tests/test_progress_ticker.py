@@ -290,6 +290,62 @@ class TestTerminalLoggingQuieted:
             tracker.stop()
             root.removeHandler(handler)
 
+    def test_start_quiets_handlers_before_starting_live(self, monkeypatch) -> None:
+        """``start()`` must quiet terminal handlers before ``Live.start()``.
+
+        Starting the live display first and quieting afterwards leaves a
+        window where a stray log writes past Rich, and — if quieting
+        raises — orphans an already-started display. The handler level
+        captured inside ``Live.start()`` must therefore already be above
+        CRITICAL.
+        """
+        handler, _original_level = self._make_terminal_handler()
+        recorded: dict[str, int] = {}
+
+        class _StartRecordingLive(_RecordingLive):
+            def start(self) -> None:
+                recorded["level_at_start"] = handler.level
+                super().start()
+
+        monkeypatch.setattr(pt, "Live", _StartRecordingLive)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+        root = logging.getLogger()
+        root.addHandler(handler)
+        tracker = MergeProgressTracker("owner")
+        tracker.rich_available = True
+        try:
+            tracker.start()
+            assert recorded["level_at_start"] > logging.CRITICAL
+        finally:
+            tracker.stop()
+            root.removeHandler(handler)
+
+    def test_resume_quiets_handlers_before_starting_live(self, monkeypatch) -> None:
+        """``resume()`` has the same start-ordering guarantee as ``start()``."""
+        handler, _original_level = self._make_terminal_handler()
+        recorded: dict[str, int] = {}
+
+        class _StartRecordingLive(_RecordingLive):
+            def start(self) -> None:
+                recorded["level_at_start"] = handler.level
+                super().start()
+
+        monkeypatch.setattr(pt, "Live", _StartRecordingLive)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+        root = logging.getLogger()
+        root.addHandler(handler)
+        tracker = MergeProgressTracker("owner")
+        tracker.rich_available = True
+        try:
+            tracker.start()
+            tracker.suspend()
+            recorded.clear()
+            tracker.resume()
+            assert recorded["level_at_start"] > logging.CRITICAL
+        finally:
+            tracker.stop()
+            root.removeHandler(handler)
+
 
 class TestSafeStdoutIsTty:
     """``_stdout_is_tty`` must never raise when stdout lacks ``isatty``.

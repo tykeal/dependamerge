@@ -160,6 +160,43 @@ class TestFetchPrStateNow:
         assert state is None
         assert merged is None
 
+    @pytest.mark.asyncio
+    async def test_derives_merged_true_from_merged_at(self) -> None:
+        # ``merged`` boolean absent, but ``merged_at`` present as a
+        # timestamp -> treated as merged externally.
+        mgr, client = make_merge_manager()
+        client.get = AsyncMock(
+            return_value={"state": "closed", "merged_at": "2026-01-01T00:00:00Z"}
+        )
+
+        state, merged = await mgr._fetch_pr_state_now(_make_pr(), "o", "r")
+
+        assert state == "closed"
+        assert merged is True
+
+    @pytest.mark.asyncio
+    async def test_derives_merged_false_from_null_merged_at(self) -> None:
+        # ``merged`` boolean absent and ``merged_at`` null -> closed
+        # without merging.
+        mgr, client = make_merge_manager()
+        client.get = AsyncMock(return_value={"state": "closed", "merged_at": None})
+
+        state, merged = await mgr._fetch_pr_state_now(_make_pr(), "o", "r")
+
+        assert state == "closed"
+        assert merged is False
+
+    @pytest.mark.asyncio
+    async def test_absent_merged_and_merged_at_degrades_to_none(self) -> None:
+        # Neither ``merged`` nor ``merged_at`` present -> cannot classify.
+        mgr, client = make_merge_manager()
+        client.get = AsyncMock(return_value={"state": "closed"})
+
+        state, merged = await mgr._fetch_pr_state_now(_make_pr(), "o", "r")
+
+        assert state is None
+        assert merged is None
+
 
 class TestEarlyExitClosedPrPath:
     """``_merge_single_pr`` PR-already-closed branch tests.

@@ -1614,7 +1614,7 @@ class AsyncMergeManager:
                         result.status = MergeStatus.CLOSED
                         result.error = (
                             "PR closed without merging during auto-merge wait "
-                            "(superseded or no longer needed)"
+                            "(no operator follow-up needed)"
                         )
                         self._pr_status(
                             f"🚪 Closed without merging: {pr_info.html_url}",
@@ -1849,7 +1849,7 @@ class AsyncMergeManager:
                         result.status = MergeStatus.CLOSED
                         result.error = (
                             "PR closed without merging during the run "
-                            "(superseded or no longer needed)"
+                            "(no operator follow-up needed)"
                         )
                         self._pr_status(
                             f"🚪 Closed without merging: {pr_info.html_url}",
@@ -4368,12 +4368,22 @@ class AsyncMergeManager:
         if not isinstance(pr_data, dict):
             return None, None
         state = pr_data.get("state")
-        merged = pr_data.get("merged")
-        if not isinstance(state, str) or not isinstance(merged, bool):
-            # Malformed payload — degrade to unknown rather than
-            # coercing a missing/mistyped field into a concrete
-            # verdict the callers would act on.
+        if not isinstance(state, str):
             return None, None
+        merged = pr_data.get("merged")
+        if not isinstance(merged, bool):
+            # The full PR object always carries ``merged`` and ``merged_at``,
+            # but a proxy or trimmed payload may omit the boolean. Derive it
+            # from ``merged_at`` (an ISO timestamp when merged, ``null``
+            # otherwise) when present rather than degrading a recoverable
+            # payload to unknown; only a genuinely absent ``merged_at`` or an
+            # unexpected type falls through to the conservative default.
+            if "merged_at" not in pr_data:
+                return None, None
+            merged_at = pr_data.get("merged_at")
+            if merged_at is not None and not isinstance(merged_at, str):
+                return None, None
+            merged = merged_at is not None
         return state, merged
 
     async def _is_pr_dirty_now(
@@ -4831,7 +4841,7 @@ class AsyncMergeManager:
             result.status = MergeStatus.CLOSED
             result.error = (
                 "PR closed without merging during conflict rebase "
-                "(superseded or no longer needed)"
+                "(no operator follow-up needed)"
             )
             self._pr_status(
                 f"🚪 Closed without merging: {pr_info.html_url}",
