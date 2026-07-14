@@ -1673,10 +1673,18 @@ class AsyncMergeManager:
                                         level="warning",
                                     )
                                 return result
-                            pr_info.mergeable = late_updated.get("mergeable")
-                            pr_info.mergeable_state = late_updated.get(
-                                "mergeable_state"
-                            )
+                            # Only accept concrete values: GitHub
+                            # returns null / "" / "unknown" while it
+                            # recomputes mergeability right after the
+                            # check lands, and clobbering the known
+                            # snapshot with those would change the
+                            # downstream routing (mirrors the guards in
+                            # the ``_wait_for_auto_merge`` refresh).
+                            if late_updated.get("mergeable") is not None:
+                                pr_info.mergeable = late_updated.get("mergeable")
+                            late_state = late_updated.get("mergeable_state")
+                            if late_state not in (None, "", "unknown"):
+                                pr_info.mergeable_state = late_state
                             updated_head = (late_updated.get("head") or {}).get("sha")
                             if updated_head:
                                 pr_info.head_sha = updated_head

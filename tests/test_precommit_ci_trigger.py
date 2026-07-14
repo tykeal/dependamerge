@@ -839,3 +839,47 @@ class TestPostWaitRetrigger:
         # Clean state bypasses the auto-merge skip gate: manual merge.
         merge_retry.assert_called_once()
         assert result.status == MergeStatus.MERGED
+
+    @pytest.mark.asyncio
+    async def test_refresh_ignores_still_computing_payload(self):
+        """A null/unknown refresh payload must not clobber the snapshot.
+
+        GitHub returns ``mergeable: null`` / ``mergeable_state:
+        "unknown"`` while recomputing mergeability right after the
+        check lands; the post-wait refresh must keep the known
+        concrete values so downstream routing is unchanged.
+        """
+        mgr, client = _make_manager()
+        pr = self._make_blocked_pr()
+
+        client.enable_auto_merge = AsyncMock(return_value=True)
+        client.analyze_block_reason = AsyncMock(
+            return_value="Blocked by pending required check: pre-commit.ci - pr"
+        )
+        # Post-retrigger refresh: GitHub is still recomputing.
+        client.get = AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "mergeable": None,
+                "mergeable_state": "unknown",
+            }
+        )
+
+        trigger = AsyncMock(side_effect=[False, True])
+        merge_retry = AsyncMock(return_value=True)
+
+        patches = self._step5_5_patches(mgr, trigger, merge_retry)
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            result = await mgr._merge_single_pr(pr)
+
+        assert trigger.await_count == 2
+        # The concrete snapshot survives the transient payload.
+        assert pr.mergeable is True
+        assert pr.mergeable_state == "blocked"
+        # Still blocked with auto-merge armed and a pending-checks
+        # block reason: the run defers to auto-merge.
+        assert result.status == MergeStatus.AUTO_MERGE_PENDING
+        merge_retry.assert_not_called()
