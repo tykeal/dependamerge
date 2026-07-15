@@ -940,7 +940,6 @@ def _execute_confirmed_merge(
         if result.status.value == "merged"
     ]
     merged_count = len(mergeable_prs)
-    console.print(f"\n🔨 Merging {merged_count} mergeable pull requests...")
 
     _restart_merge_progress_tracker(ctx, merged_count)
     try:
@@ -1405,8 +1404,6 @@ def _execute_repo_confirmed_merge(
         for i, result in enumerate(preview_results)
         if result.status.value == "merged"
     ]
-    merged_count = len(mergeable_prs)
-    console.print(f"\n🔨 Merging {merged_count} mergeable pull requests...")
 
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
@@ -1801,8 +1798,6 @@ def _execute_org_confirmed_merge(
         for i, result in enumerate(preview_results)
         if result.status.value == "merged"
     ]
-    merged_count = len(mergeable_prs)
-    console.print(f"\n🔨 Merging {merged_count} mergeable pull requests...")
 
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
