@@ -177,6 +177,53 @@ class TestDisplayRendering:
         plain = tracker._generate_display_text().plain
         assert "Polishing: 1" in plain
 
+    def test_preview_counters_use_evaluation_labels(self) -> None:
+        """Preview runs merge nothing — counters must say so.
+
+        A preview tracker showing "✅ Merged: 42" misleads the
+        operator into thinking merges happened; the run only judged
+        the PRs mergeable.  Failure counts are likewise predictions,
+        not events.
+        """
+        tracker = MergeProgressTracker(
+            "org",
+            operation_label="Evaluating PRs",
+            operation_icon="\U0001f50d",
+            preview=True,
+        )
+        tracker.rich_available = True
+        tracker.set_total_prs(3)
+        tracker.merge_success("org/repo#1")
+        tracker.merge_failure("org/repo#2")
+        tracker.merge_blocked("org/repo#3")
+
+        plain = tracker._generate_display_text().plain
+        assert "\U0001f50d Evaluating PRs in" in plain
+        assert "\u2705 Mergeable: 1" in plain
+        assert "\u274c Would fail: 1" in plain
+        # Neutral labels stay unchanged.
+        assert "\U0001f6d1 Blocked: 1" in plain
+        # Execution labels must not appear anywhere in preview.
+        assert "Merged:" not in plain
+        assert "Failed:" not in plain
+
+    def test_execute_counters_keep_execution_labels(self) -> None:
+        tracker = MergeProgressTracker(
+            "org",
+            operation_label="Merging PRs",
+            operation_icon="\u25b6\ufe0f",
+        )
+        tracker.rich_available = True
+        tracker.set_total_prs(2)
+        tracker.merge_success("org/repo#1")
+        tracker.merge_failure("org/repo#2")
+
+        plain = tracker._generate_display_text().plain
+        assert "\u2705 Merged: 1" in plain
+        assert "\u274c Failed: 1" in plain
+        assert "Mergeable" not in plain
+        assert "Would fail" not in plain
+
 
 class TestRecordTerminalOutcome:
     """_record_terminal_outcome maps MergeStatus onto tracker methods."""

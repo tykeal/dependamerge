@@ -891,9 +891,12 @@ def _handle_preview_confirmation(
     assert ctx.source_pr is not None
 
     console.print(f"\nMergeable {merged_count}/{total_to_merge} PRs")
+    # Per-PR preview lines are no longer printed during the run, so
+    # report the not-mergeable PRs (and why) here before prompting.
+    _print_failed_pr_details(merge_results)
 
     if merged_count == 0:
-        console.print("\n💡 No PRs are mergeable at this time.")
+        console.print("\n\U0001f4a1 No PRs are mergeable at this time.")
         return
 
     commit_messages = ctx.github_client.get_pull_request_commits(
@@ -1279,11 +1282,16 @@ def _handle_repo_merge(
         (pr, None) for pr in repo_prs
     ]
 
+    # Without --no-confirm this first pass is a preview (evaluation)
+    # run — label the tracker accordingly so its counters ("Mergeable")
+    # don't claim merges that never happened.
+    preview_run = ctx.dry_run or not ctx.no_confirm
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
             f"{ctx.owner}/{ctx.repo_name}",
-            operation_label="Merging PRs",
-            operation_icon="▶️",
+            operation_label="Evaluating PRs" if preview_run else "Merging PRs",
+            operation_icon="\U0001f50d" if preview_run else "\u25b6\ufe0f",
+            preview=preview_run,
         )
         ctx.progress_tracker.set_total_prs(len(all_prs_to_merge))
         ctx.progress_tracker.start()
@@ -1299,7 +1307,7 @@ def _handle_repo_merge(
         merge_results = _run_parallel_merge(
             ctx,
             all_prs_to_merge,
-            preview=ctx.dry_run or not ctx.no_confirm,
+            preview=preview_run,
             # Allow parallel workers; the merge dispatch itself is
             # serialised per repo by ``AsyncMergeManager`` so PRs
             # parked in Step 5.5's wait loop no longer block other
@@ -1354,9 +1362,12 @@ def _handle_repo_preview_confirmation(
     source PR for SHA generation — it uses the repository name instead.
     """
     console.print(f"\nMergeable {merged_count}/{total_to_merge} PRs")
+    # Per-PR preview lines are no longer printed during the run, so
+    # report the not-mergeable PRs (and why) here before prompting.
+    _print_failed_pr_details(merge_results)
 
     if merged_count == 0:
-        console.print("\n💡 No PRs are mergeable at this time.")
+        console.print("\n\U0001f4a1 No PRs are mergeable at this time.")
         return
 
     # Generate a confirmation token from the repo context
@@ -1674,11 +1685,16 @@ def _handle_org_merge(
     final_distinct_repos = {pr.repository_full_name for pr in owner_prs}
     concurrency = min(10, len(final_distinct_repos)) or 1
 
+    # Without --no-confirm this first pass is a preview (evaluation)
+    # run — label the tracker accordingly so its counters ("Mergeable")
+    # don't claim merges that never happened.
+    preview_run = ctx.dry_run or not ctx.no_confirm
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
             parsed_org.owner,
-            operation_label="Merging PRs",
-            operation_icon="▶️",
+            operation_label="Evaluating PRs" if preview_run else "Merging PRs",
+            operation_icon="\U0001f50d" if preview_run else "\u25b6\ufe0f",
+            preview=preview_run,
         )
         ctx.progress_tracker.set_total_prs(len(all_prs_to_merge))
         ctx.progress_tracker.start()
@@ -1687,7 +1703,7 @@ def _handle_org_merge(
         merge_results = _run_parallel_merge(
             ctx,
             all_prs_to_merge,
-            preview=ctx.dry_run or not ctx.no_confirm,
+            preview=preview_run,
             concurrency=concurrency,
             # Owner-wide batches mix many repositories and often contain
             # multiple PRs per repository; stripe to avoid stacking and
@@ -1740,9 +1756,12 @@ def _handle_org_preview_confirmation(
     confirmation token from the owner login instead of a repository.
     """
     console.print(f"\nMergeable {merged_count}/{total_to_merge} PRs")
+    # Per-PR preview lines are no longer printed during the run, so
+    # report the not-mergeable PRs (and why) here before prompting.
+    _print_failed_pr_details(merge_results)
 
     if merged_count == 0:
-        console.print("\n💡 No PRs are mergeable at this time.")
+        console.print("\n\U0001f4a1 No PRs are mergeable at this time.")
         return
 
     combined = f"org-merge:{parsed_org.owner}:{merged_count}"

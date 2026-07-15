@@ -680,19 +680,18 @@ class AsyncMergeManager:
         tracker.track_pr_state(pr_key, state)
 
     def _pr_status(self, message: str, *, level: str = "info") -> None:
-        """Emit a per-PR status line.
+        """Emit a per-PR status line to the log.
 
-        Preview mode prints the line (the \"\U0001f50d Dependamerge
-        Evaluation\" section requires exactly one line per PR).  Real
-        merges keep the console clean — progress is conveyed by the
-        Rich tracker counters and the reasons are reported in the
-        end-of-run summary — so the message goes to the log only.
+        Per-PR lines go to the log only — in both preview and real
+        runs.  Progress is conveyed by the Rich tracker counters
+        ("Mergeable" in preview, "Merged" in real runs) and the
+        per-PR reasons are reported in the end-of-run summary
+        (:func:`cli._print_failed_pr_details`), so printing one
+        console line per PR here would only duplicate the grouped
+        PR listing already shown before the run.
         """
-        if self.preview_mode:
-            log_and_print(self.log, self._console, message, level=level)
-        else:
-            log_func = getattr(self.log, level.lower(), self.log.info)
-            log_func(message)
+        log_func = getattr(self.log, level.lower(), self.log.info)
+        log_func(message)
 
     async def _merge_single_pr_with_semaphore(
         self, pr_info: PullRequestInfo
@@ -2325,16 +2324,18 @@ class AsyncMergeManager:
     ) -> None:
         """Simulate the Step 6 merge outcome for preview mode.
 
-        Preview output must be SINGLE LINE per PR for clean evaluation
-        display: each PR should produce exactly one line under the
-        "\U0001f50d Dependamerge Evaluation" heading. Mutates ``result`` in place.
+        Mutates ``result`` in place.  No console output: preview
+        progress is conveyed by the Rich tracker counters (with
+        preview-accurate labels such as "Mergeable") and the per-PR
+        outcomes/reasons are reported in the end-of-run summary, so
+        per-PR lines here go to the log only.
         """
         if pr_info.mergeable_state == "behind" and not self.fix_out_of_date:
             result.status = MergeStatus.SKIPPED
             result.error = "PR is behind base branch and --no-fix option is set"
-            self._console.print(
+            self._pr_status(
                 f"\u23ed\ufe0f Skipped: {pr_info.html_url} [behind, rebase disabled]",
-                markup=False,
+                level="debug",
             )
         elif pr_info.mergeable_state == "behind" and self.fix_out_of_date:
             # Behind PRs merge directly unless branch protection
@@ -2345,31 +2346,28 @@ class AsyncMergeManager:
             # Use ``warning`` (not ``error``) so the MERGED result
             # does not carry a contradictory error message.
             result.warning = "behind base branch"
-            self._console.print(
-                f"\u26a0\ufe0f Rebase/merge: {pr_info.html_url} [behind base branch]",
-                markup=False,
+            self._pr_status(
+                f"\u2611\ufe0f Approve/merge: {pr_info.html_url} [behind base branch]",
+                level="debug",
             )
         elif pr_info.mergeable_state == "dirty":
             result.status = MergeStatus.BLOCKED
             result.error = "PR has merge conflicts"
-            self._console.print(
+            self._pr_status(
                 f"\U0001f6d1 Blocked: {pr_info.html_url} [merge conflicts]",
-                markup=False,
+                level="debug",
             )
         elif pr_info.mergeable is False and pr_info.mergeable_state == "blocked":
             result.status = MergeStatus.BLOCKED
             result.error = "PR blocked by failing checks"
-            self._console.print(
+            self._pr_status(
                 f"\U0001f6d1 Blocked: {pr_info.html_url} [blocked by failing checks]",
-                markup=False,
+                level="debug",
             )
         else:
             # Simulate successful merge in preview mode
             result.status = MergeStatus.MERGED
-            # Single line summary for successful preview
-            log_and_print(
-                self.log,
-                self._console,
+            self._pr_status(
                 f"\u2611\ufe0f Approve/merge: {pr_info.html_url}",
                 level="debug",
             )

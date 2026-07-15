@@ -567,8 +567,14 @@ class TestBehindPRHandling:
         assert call_count > 1
 
     @pytest.mark.asyncio
-    async def test_single_line_preview_output_format(self):
-        """Test that preview produces exactly one line of output per PR."""
+    async def test_preview_produces_no_per_pr_console_output(self):
+        """Preview emits NO per-PR console lines.
+
+        Preview progress is conveyed by the Rich tracker counters
+        ("Mergeable") and the end-of-run summary reports per-PR
+        reasons, so printing a line per PR here would only duplicate
+        the grouped PR listing shown before the run.
+        """
 
         pr_info = PullRequestInfo(
             number=123,
@@ -616,17 +622,10 @@ class TestBehindPRHandling:
                 return_value=(True, "PR is behind - will rebase before merge"),
             ):
                 with patch.object(merge_manager, "_approve_pr", return_value=None):
-                    await merge_manager._merge_single_pr(pr_info)
+                    result = await merge_manager._merge_single_pr(pr_info)
 
-        # Verify exactly one print call was made (single-line output)
-        assert mock_console.print.call_count == 1
-
-        # Verify the *semantic content* of the single-line preview rather
-        # than its exact structure/wording. This keeps the test robust to
-        # cosmetic output changes (reordering, relabelling, emoji tweaks):
-        # the line must be surfaced as a warning, identify the PR, and
-        # explain that it is behind its base branch.
-        call_args = mock_console.print.call_args[0][0]
-        assert "\u26a0\ufe0f" in call_args  # surfaced as a warning
-        assert pr_info.html_url in call_args  # identifies the PR
-        assert "behind" in call_args.lower()  # explains the reason
+        # No per-PR console lines; the outcome carries the details
+        # for the end-of-run summary instead.
+        assert mock_console.print.call_count == 0
+        assert result.status == MergeStatus.MERGED
+        assert result.warning == "behind base branch"

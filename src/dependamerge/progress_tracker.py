@@ -490,6 +490,7 @@ class MergeProgressTracker(ProgressTracker):
         is_close_operation: bool = False,
         operation_label: str | None = None,
         operation_icon: str | None = None,
+        preview: bool = False,
     ):
         """Initialize merge progress tracker.
 
@@ -501,8 +502,14 @@ class MergeProgressTracker(ProgressTracker):
                 ``"Searching for similar PRs"`` (merge) or
                 ``"Closing PRs"`` (close).
             operation_icon: Custom emoji icon for the heading.  When
-                ``None``, defaults to ``"🔀"`` / ``"🔍"`` (merge) or
-                ``"🚪"`` (close) depending on context.
+                ``None``, defaults to ``"\U0001f500"`` / ``"\U0001f50d"`` (merge) or
+                ``"\U0001f6aa"`` (close) depending on context.
+            preview: Whether this tracks a preview (evaluation) run.
+                Preview runs perform no merges, so the terminal
+                counters render with evaluation labels ("Mergeable" /
+                "Would fail") instead of the execution labels
+                ("Merged" / "Failed") that would misstate what
+                happened.
         """
         super().__init__(organization, show_pr_stats=True)
         self.similar_prs_found = 0
@@ -516,6 +523,7 @@ class MergeProgressTracker(ProgressTracker):
         # PRs that are blocked and cannot be merged by this run.
         self.prs_blocked = 0
         self.is_close_operation = is_close_operation
+        self.preview = preview
         self._custom_label = operation_label
         self._custom_icon = operation_icon
         # PR-level progress (used for repo-scoped operations)
@@ -700,13 +708,17 @@ class MergeProgressTracker(ProgressTracker):
                     f"{state_key.capitalize()}: {state_counts[state_key]}"
                 )
         if self.prs_merged > 0:
-            stats_parts.append(f"✅ Merged: {self.prs_merged}")
+            # A preview run merges nothing — the counter records PRs
+            # judged mergeable, so label it accordingly.
+            merged_label = "\u2705 Mergeable" if self.preview else "\u2705 Merged"
+            stats_parts.append(f"{merged_label}: {self.prs_merged}")
         if self.prs_pending > 0:
-            stats_parts.append(f"🤖 Pending: {self.prs_pending}")
+            stats_parts.append(f"\U0001f916 Pending: {self.prs_pending}")
         if self.prs_closed > 0:
-            stats_parts.append(f"🚪 Closed: {self.prs_closed}")
+            stats_parts.append(f"\U0001f6aa Closed: {self.prs_closed}")
         if self.prs_failed > 0:
-            stats_parts.append(f"❌ Failed: {self.prs_failed}")
+            failed_label = "\u274c Would fail" if self.preview else "\u274c Failed"
+            stats_parts.append(f"{failed_label}: {self.prs_failed}")
         if self.prs_skipped > 0:
             stats_parts.append(f"⏭️ Skipped: {self.prs_skipped}")
         if self.prs_blocked > 0:
@@ -776,6 +788,7 @@ class DummyProgressTracker(ProgressTracker):
         self.prs_pending = 0
         self.prs_closed = 0
         self.is_close_operation = False
+        self.preview = False
         self._custom_label: str | None = None
         self._custom_icon: str | None = None
         self.total_prs = 0
