@@ -18,6 +18,7 @@ tests cover:
 """
 
 from contextlib import ExitStack
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -189,7 +190,7 @@ class TestBlockedPrNeedsRebase:
 # ---------------------------------------------------------------------------
 
 
-def _step5_patches(mgr: AsyncMergeManager) -> list:
+def _step5_patches(mgr: AsyncMergeManager) -> list[Any]:
     """Common patches to drive _merge_single_pr up to Step 5."""
     no_g2g = GitHub2GerritDetectionResult()
     return [

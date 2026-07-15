@@ -12,10 +12,12 @@ Covers:
 - Invalid merge-timeout fallback to the default.
 """
 
+from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from dependamerge import rebase as rebase_module
 from dependamerge.github2gerrit_detector import GitHub2GerritDetectionResult
 from dependamerge.merge_manager import MergeStatus
 from dependamerge.models import PullRequestInfo
@@ -1091,6 +1093,229 @@ class TestStep5_5BehindWithoutFix:
         # itself is the arbiter for behind PRs.
         client.enable_auto_merge.assert_not_awaited()
         assert "owner/repo#42" not in mgr._auto_merge_enabled
+        assert result.status == MergeStatus.MERGED
+        mock_merge_retry.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# 18b. Step 5.5: behind + asynchronous Step 5 rebase → bounded wait
+# ---------------------------------------------------------------------------
+
+
+class TestStep5_5BehindAfterAsyncRebase:
+    """``behind`` PRs wait in Step 5.5 after an *asynchronous* rebase.
+
+    The local force-push and ``@dependabot rebase`` macro paths do
+    not refresh ``pr_info``, so the snapshot still reads ``behind``
+    when Step 5 returns.  When auto-merge could not be armed, those
+    paths deliberately leave ``_rebased_prs`` unset so Step 5.5 can
+    bridge the gap while the rebase lands and GitHub recomputes
+    mergeability; skipping the wait would fire a manual merge
+    against the stale state and 405 transiently.  When auto-merge
+    *was* armed, the rebase path marks ``_rebased_prs`` and the wait
+    is skipped (auto-merge finishes the job server-side).
+    """
+
+    @staticmethod
+    def _behind_pr() -> PullRequestInfo:
+        pr: PullRequestInfo = _DEFAULT_PR.model_copy(
+            update={
+                "mergeable_state": "behind",
+                "mergeable": True,
+                "state": "open",
+            }
+        )
+        return pr
+
+    @staticmethod
+    def _enter_common_patches(stack: ExitStack, mgr, *, requires_rebase: bool) -> None:
+        no_g2g = GitHub2GerritDetectionResult()
+        for p in (
+            patch.object(
+                mgr,
+                "_detect_github2gerrit",
+                new_callable=AsyncMock,
+                return_value=no_g2g,
+            ),
+            patch.object(
+                mgr,
+                "_get_merge_method_for_repo",
+                new_callable=AsyncMock,
+                return_value="merge",
+            ),
+            patch.object(
+                mgr,
+                "_trigger_stale_precommit_ci",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                mgr,
+                "_behind_pr_requires_rebase",
+                new_callable=AsyncMock,
+                return_value=requires_rebase,
+            ),
+            patch.object(
+                mgr,
+                "_check_merge_requirements",
+                new_callable=AsyncMock,
+                return_value=(True, ""),
+            ),
+            patch.object(
+                mgr,
+                "_approve_pr",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            stack.enter_context(p)
+
+    @pytest.mark.asyncio
+    async def test_behind_async_rebase_without_auto_merge_waits(
+        self,
+    ) -> None:
+        """Async rebase, auto-merge unavailable → Step 5.5 wait runs."""
+        mgr, client = make_merge_manager(
+            preview_mode=False,
+            merge_timeout=0.1,
+            fix_out_of_date=True,
+        )
+        pr = self._behind_pr()
+        client.post_issue_comment = AsyncMock()
+
+        # Simulate the macro/local path: rebase dispatched, auto-merge
+        # could not be armed, so ``_rebased_prs`` stays unset and
+        # ``pr_info`` is not refreshed (still ``behind``).
+        step5 = AsyncMock(return_value=rebase_module.Step5Outcome())
+
+        with ExitStack() as stack:
+            self._enter_common_patches(stack, mgr, requires_rebase=True)
+            stack.enter_context(
+                patch.object(rebase_module, "perform_step5_rebase", step5)
+            )
+            stack.enter_context(
+                patch.object(
+                    mgr,
+                    "_enable_auto_merge_with_approval",
+                    new_callable=AsyncMock,
+                    return_value=False,
+                )
+            )
+            mock_wait = stack.enter_context(
+                patch.object(
+                    mgr,
+                    "_wait_for_auto_merge",
+                    new_callable=AsyncMock,
+                    return_value=(False, False),
+                )
+            )
+            mock_merge_retry = stack.enter_context(
+                patch.object(
+                    mgr,
+                    "_merge_pr_with_retry",
+                    new_callable=AsyncMock,
+                    return_value=True,
+                )
+            )
+            result = await mgr._merge_single_pr(pr)
+
+        step5.assert_awaited_once()
+        # The Step 5.5 wait bridged the async rebase before Step 6.
+        mock_wait.assert_awaited_once()
+        assert result.status == MergeStatus.MERGED
+        mock_merge_retry.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_behind_async_rebase_with_auto_merge_skips_wait(
+        self,
+    ) -> None:
+        """Async rebase with auto-merge armed → no Step 5.5 wait."""
+        mgr, client = make_merge_manager(
+            preview_mode=False,
+            merge_timeout=0.1,
+            fix_out_of_date=True,
+        )
+        pr = self._behind_pr()
+        client.post_issue_comment = AsyncMock()
+
+        # Simulate the macro/local path arming auto-merge: the rebase
+        # helper marks ``_rebased_prs`` so Step 5.5 must be skipped
+        # (auto-merge finishes server-side; waiting here would only
+        # double the merge_timeout).
+        async def _step5(*, ctx, pr_info, owner, repo):
+            ctx.rebased_prs.add(f"{owner}/{repo}#{pr_info.number}")
+            return rebase_module.Step5Outcome()
+
+        step5 = AsyncMock(side_effect=_step5)
+
+        with ExitStack() as stack:
+            self._enter_common_patches(stack, mgr, requires_rebase=True)
+            stack.enter_context(
+                patch.object(rebase_module, "perform_step5_rebase", step5)
+            )
+            mock_wait = stack.enter_context(
+                patch.object(
+                    mgr,
+                    "_wait_for_auto_merge",
+                    new_callable=AsyncMock,
+                    return_value=(False, False),
+                )
+            )
+            mock_merge_retry = stack.enter_context(
+                patch.object(
+                    mgr,
+                    "_merge_pr_with_retry",
+                    new_callable=AsyncMock,
+                    return_value=True,
+                )
+            )
+            result = await mgr._merge_single_pr(pr)
+
+        step5.assert_awaited_once()
+        mock_wait.assert_not_awaited()
+        assert result.status == MergeStatus.MERGED
+        mock_merge_retry.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_behind_without_step5_rebase_still_skips_wait(
+        self,
+    ) -> None:
+        """behind + no strict policy (no rebase) → no Step 5.5 wait."""
+        mgr, client = make_merge_manager(
+            preview_mode=False,
+            merge_timeout=0.1,
+            fix_out_of_date=True,
+        )
+        pr = self._behind_pr()
+        client.post_issue_comment = AsyncMock()
+
+        step5 = AsyncMock(return_value=rebase_module.Step5Outcome())
+
+        with ExitStack() as stack:
+            self._enter_common_patches(stack, mgr, requires_rebase=False)
+            stack.enter_context(
+                patch.object(rebase_module, "perform_step5_rebase", step5)
+            )
+            mock_wait = stack.enter_context(
+                patch.object(
+                    mgr,
+                    "_wait_for_auto_merge",
+                    new_callable=AsyncMock,
+                    return_value=(False, False),
+                )
+            )
+            mock_merge_retry = stack.enter_context(
+                patch.object(
+                    mgr,
+                    "_merge_pr_with_retry",
+                    new_callable=AsyncMock,
+                    return_value=True,
+                )
+            )
+            result = await mgr._merge_single_pr(pr)
+
+        step5.assert_not_awaited()
+        mock_wait.assert_not_awaited()
         assert result.status == MergeStatus.MERGED
         mock_merge_retry.assert_awaited_once()
 

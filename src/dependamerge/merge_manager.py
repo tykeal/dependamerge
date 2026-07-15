@@ -1525,6 +1525,19 @@ class AsyncMergeManager:
             # own — would just burn the full ``merge_timeout`` before
             # the merge attempt that was going to succeed anyway.
             #
+            # Exception: when Step 5 just dispatched an *asynchronous*
+            # rebase (local force-push or the ``@dependabot rebase``
+            # macro) and auto-merge could not be armed, those paths
+            # leave ``_rebased_prs`` unset precisely so this wait can
+            # bridge the gap while the rebase lands and GitHub
+            # recomputes mergeability — the snapshot still reads
+            # ``behind`` because neither path refreshes ``pr_info``.
+            # Without the wait, Step 6 would fire a manual merge
+            # against the stale state and 405.  ``needs_rebase``
+            # captures "Step 5 actually ran" and the
+            # ``not already_rebased`` guard below excludes the
+            # auto-merge-armed case.
+            #
             # We accept any ``mergeable`` value (including ``False``)
             # when the state is one of these auto-merge-rescuable
             # states, because GitHub returns ``mergeable=False``
@@ -1550,8 +1563,13 @@ class AsyncMergeManager:
             # (GitHub still computing the value, or a required check
             # transiently failing) so a genuinely not-yet-ready PR is
             # not merged prematurely.
-            state_is_waitable = pr_info.mergeable_state == "blocked" or (
-                pr_info.mergeable_state == "unstable" and pr_info.mergeable is not True
+            state_is_waitable = (
+                pr_info.mergeable_state == "blocked"
+                or (
+                    pr_info.mergeable_state == "unstable"
+                    and pr_info.mergeable is not True
+                )
+                or (pr_info.mergeable_state == "behind" and needs_rebase)
             )
             base_should_wait = (
                 not self.preview_mode
