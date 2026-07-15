@@ -891,9 +891,12 @@ def _handle_preview_confirmation(
     assert ctx.source_pr is not None
 
     console.print(f"\nMergeable {merged_count}/{total_to_merge} PRs")
+    # Per-PR preview lines are no longer printed during the run, so
+    # report the not-mergeable PRs (and why) here before prompting.
+    _print_failed_pr_details(merge_results)
 
     if merged_count == 0:
-        console.print("\n💡 No PRs are mergeable at this time.")
+        console.print("\n\U0001f4a1 No PRs are mergeable at this time.")
         return
 
     commit_messages = ctx.github_client.get_pull_request_commits(
@@ -937,7 +940,6 @@ def _execute_confirmed_merge(
         if result.status.value == "merged"
     ]
     merged_count = len(mergeable_prs)
-    console.print(f"\n🔨 Merging {merged_count} mergeable pull requests...")
 
     _restart_merge_progress_tracker(ctx, merged_count)
     try:
@@ -1279,11 +1281,16 @@ def _handle_repo_merge(
         (pr, None) for pr in repo_prs
     ]
 
+    # Without --no-confirm this first pass is a preview (evaluation)
+    # run — label the tracker accordingly so its counters ("Mergeable")
+    # don't claim merges that never happened.
+    preview_run = ctx.dry_run or not ctx.no_confirm
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
             f"{ctx.owner}/{ctx.repo_name}",
-            operation_label="Merging PRs",
-            operation_icon="▶️",
+            operation_label="Evaluating PRs" if preview_run else "Merging PRs",
+            operation_icon="\U0001f50d" if preview_run else "\u25b6\ufe0f",
+            preview=preview_run,
         )
         ctx.progress_tracker.set_total_prs(len(all_prs_to_merge))
         ctx.progress_tracker.start()
@@ -1299,7 +1306,7 @@ def _handle_repo_merge(
         merge_results = _run_parallel_merge(
             ctx,
             all_prs_to_merge,
-            preview=ctx.dry_run or not ctx.no_confirm,
+            preview=preview_run,
             # Allow parallel workers; the merge dispatch itself is
             # serialised per repo by ``AsyncMergeManager`` so PRs
             # parked in Step 5.5's wait loop no longer block other
@@ -1354,9 +1361,12 @@ def _handle_repo_preview_confirmation(
     source PR for SHA generation — it uses the repository name instead.
     """
     console.print(f"\nMergeable {merged_count}/{total_to_merge} PRs")
+    # Per-PR preview lines are no longer printed during the run, so
+    # report the not-mergeable PRs (and why) here before prompting.
+    _print_failed_pr_details(merge_results)
 
     if merged_count == 0:
-        console.print("\n💡 No PRs are mergeable at this time.")
+        console.print("\n\U0001f4a1 No PRs are mergeable at this time.")
         return
 
     # Generate a confirmation token from the repo context
@@ -1394,8 +1404,6 @@ def _execute_repo_confirmed_merge(
         for i, result in enumerate(preview_results)
         if result.status.value == "merged"
     ]
-    merged_count = len(mergeable_prs)
-    console.print(f"\n🔨 Merging {merged_count} mergeable pull requests...")
 
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
@@ -1674,11 +1682,16 @@ def _handle_org_merge(
     final_distinct_repos = {pr.repository_full_name for pr in owner_prs}
     concurrency = min(10, len(final_distinct_repos)) or 1
 
+    # Without --no-confirm this first pass is a preview (evaluation)
+    # run — label the tracker accordingly so its counters ("Mergeable")
+    # don't claim merges that never happened.
+    preview_run = ctx.dry_run or not ctx.no_confirm
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
             parsed_org.owner,
-            operation_label="Merging PRs",
-            operation_icon="▶️",
+            operation_label="Evaluating PRs" if preview_run else "Merging PRs",
+            operation_icon="\U0001f50d" if preview_run else "\u25b6\ufe0f",
+            preview=preview_run,
         )
         ctx.progress_tracker.set_total_prs(len(all_prs_to_merge))
         ctx.progress_tracker.start()
@@ -1687,7 +1700,7 @@ def _handle_org_merge(
         merge_results = _run_parallel_merge(
             ctx,
             all_prs_to_merge,
-            preview=ctx.dry_run or not ctx.no_confirm,
+            preview=preview_run,
             concurrency=concurrency,
             # Owner-wide batches mix many repositories and often contain
             # multiple PRs per repository; stripe to avoid stacking and
@@ -1740,9 +1753,12 @@ def _handle_org_preview_confirmation(
     confirmation token from the owner login instead of a repository.
     """
     console.print(f"\nMergeable {merged_count}/{total_to_merge} PRs")
+    # Per-PR preview lines are no longer printed during the run, so
+    # report the not-mergeable PRs (and why) here before prompting.
+    _print_failed_pr_details(merge_results)
 
     if merged_count == 0:
-        console.print("\n💡 No PRs are mergeable at this time.")
+        console.print("\n\U0001f4a1 No PRs are mergeable at this time.")
         return
 
     combined = f"org-merge:{parsed_org.owner}:{merged_count}"
@@ -1782,8 +1798,6 @@ def _execute_org_confirmed_merge(
         for i, result in enumerate(preview_results)
         if result.status.value == "merged"
     ]
-    merged_count = len(mergeable_prs)
-    console.print(f"\n🔨 Merging {merged_count} mergeable pull requests...")
 
     if ctx.show_progress:
         ctx.progress_tracker = MergeProgressTracker(
@@ -2688,6 +2702,310 @@ def _display_pr_info(
         progress_tracker.resume()
 
 
+@dataclass
+class _CloseContext:
+    """Shared state for the ``close`` command pipeline."""
+
+    token: str
+    github_client: GitHubClient
+    owner: str
+    repo_name: str
+    pr_number: int
+    source_pr: PullRequestInfo
+    progress_tracker: MergeProgressTracker | None
+
+
+def _run_close_parallel(
+    ctx: _CloseContext,
+    prs: list[PullRequestInfo],
+    preview_mode: bool,
+) -> list[CloseResult]:
+    """Close (or preview-close) ``prs`` in parallel."""
+
+    async def _close_parallel() -> list[CloseResult]:
+        close_manager = AsyncCloseManager(
+            token=ctx.token,
+            progress_tracker=ctx.progress_tracker,
+            preview_mode=preview_mode,
+        )
+        async with close_manager:
+            # Convert to list of tuples (PR, None) for consistency
+            pr_tuples: list[tuple[PullRequestInfo, ComparisonResult | None]] = [
+                (pr, None) for pr in prs
+            ]
+            return await close_manager.close_prs_parallel(pr_tuples)
+
+    return asyncio.run(_close_parallel())
+
+
+def _print_close_debug_matching(
+    ctx: _CloseContext,
+    comparator: PRComparator,
+    similarity_threshold: float,
+) -> None:
+    """Show detailed matching diagnostics for the source PR."""
+    source_pr = ctx.source_pr
+    console.print("\n🔍 Debug Matching Information")
+    console.print(
+        "   Source PR automation status: "
+        f"{ctx.github_client.is_automation_author(source_pr.author)}"
+    )
+    console.print(
+        "   Extracted package: "
+        f"'{comparator._extract_package_name(source_pr.title)}'"
+    )
+    console.print(f"   Similarity threshold: {similarity_threshold}")
+    if source_pr.body:
+        console.print(f"   Body preview: {source_pr.body[:100]}...")
+        console.print(
+            "   Is dependabot body: "
+            f"{comparator._is_dependabot_body(source_pr.body)}"
+        )
+    else:
+        console.print("   ⚠️ Source PR has no body")
+    console.print()
+
+
+def _validate_close_authorization(
+    ctx: _CloseContext,
+    override: str | None,
+) -> bool:
+    """Gate non-automation source PRs behind the override SHA.
+
+    Returns True when the close may proceed; False when the caller
+    should stop (the reason has already been printed).
+    """
+    if ctx.github_client.is_automation_author(ctx.source_pr.author):
+        return True
+
+    commit_messages = ctx.github_client.get_pull_request_commits(
+        ctx.owner, ctx.repo_name, ctx.pr_number
+    )
+    first_commit_line = commit_messages[0].split("\n")[0] if commit_messages else ""
+
+    # Generate expected SHA
+    expected_sha = _generate_override_sha(ctx.source_pr, first_commit_line)
+
+    if not override:
+        console.print("Source PR is not from a recognized automation tool.")
+        console.print(
+            f"To close this and similar PRs, run again with: --override {expected_sha}"
+        )
+        console.print(
+            f"This SHA is based on the author '{ctx.source_pr.author}' and commit message '{first_commit_line[:50]}...'",
+            style="dim",
+        )
+        return False
+
+    if override != expected_sha:
+        console.print(
+            f"Error: Invalid override SHA. Expected: {expected_sha}",
+            style="bold red",
+        )
+        console.print(
+            "This prevents accidental bulk operations on non-automation PRs.",
+            style="dim",
+        )
+        return False
+
+    console.print("Override SHA validated. Proceeding with non-automation PR close.")
+    return True
+
+
+def _find_similar_prs_for_close(
+    ctx: _CloseContext,
+    comparator: PRComparator,
+    debug_matching: bool,
+) -> list[tuple[PullRequestInfo, ComparisonResult]]:
+    """Search the owner for PRs similar to the source PR."""
+    if ctx.progress_tracker:
+        console.print()
+    else:
+        console.print(f"\nChecking owner: {ctx.owner}")
+
+    # Use GitHubService for async PR finding
+    from .github_service import GitHubService
+
+    if ctx.progress_tracker:
+        ctx.progress_tracker.update_operation("Listing repositories...")
+
+    async def _find_similar():
+        svc = GitHubService(
+            token=ctx.token,
+            progress_tracker=ctx.progress_tracker,
+            debug_matching=debug_matching,
+        )
+        try:
+            only_automation = ctx.github_client.is_automation_author(
+                ctx.source_pr.author
+            )
+            return await svc.find_similar_prs(
+                ctx.owner,
+                ctx.source_pr,
+                comparator,
+                only_automation=only_automation,
+            )
+        finally:
+            await svc.close()
+
+    return asyncio.run(_find_similar())
+
+
+def _print_close_analysis_summary(
+    ctx: _CloseContext,
+    all_similar_prs: list[tuple[PullRequestInfo, ComparisonResult]],
+) -> None:
+    """Report the search outcome and list the matching PRs."""
+    if ctx.progress_tracker:
+        ctx.progress_tracker.stop()
+        summary = ctx.progress_tracker.get_summary()
+        elapsed_time = summary.get("elapsed_time")
+        total_prs_analyzed = summary.get("total_prs_analyzed")
+        completed_repositories = summary.get("completed_repositories")
+        similar_prs_found = summary.get("similar_prs_found")
+        errors_count = summary.get("errors_count", 0)
+        console.print(f"\n✅ Analysis completed in {elapsed_time}")
+        console.print(
+            f"📊 Analyzed {total_prs_analyzed} PRs across {completed_repositories} repositories"
+        )
+        console.print(f"🔍 Found {similar_prs_found} similar PRs")
+        if errors_count > 0:
+            console.print(f"⚠️ {errors_count} errors encountered during analysis")
+        console.print()
+    else:
+        console.print(f"\n🔍 Found {len(all_similar_prs)} similar PRs")
+
+    if not all_similar_prs:
+        # Not a failure: the supplied PR is simply the only one to
+        # close.  Use a neutral glyph rather than ❌ so the output
+        # does not read like an error.
+        console.print("⏩ No similar PRs found for this owner")
+
+    for target_pr, comparison in all_similar_prs:
+        console.print(f"  • {target_pr.repository_full_name} #{target_pr.number}")
+        console.print(f"    {_format_condensed_similarity(comparison)}")
+
+
+def _run_close_dry_run(
+    ctx: _CloseContext,
+    all_prs_to_close: list[PullRequestInfo],
+) -> None:
+    """Evaluate in preview mode and report what *would* be closed."""
+    if ctx.progress_tracker:
+        ctx.progress_tracker.start()
+        console.print()
+    else:
+        console.print(
+            f"\n🧪 Dry run: evaluating {len(all_prs_to_close)} " "pull requests..."
+        )
+
+    close_results = _run_close_parallel(ctx, all_prs_to_close, True)
+
+    if ctx.progress_tracker:
+        ctx.progress_tracker.stop()
+        console.print()
+
+    closeable_count = sum(1 for r in close_results if r.status.value == "closed")
+    console.print(
+        f"\n🧪 Dry run: would close {closeable_count}/"
+        f"{len(all_prs_to_close)} PRs (no changes made)"
+    )
+
+
+def _run_interactive_close(
+    ctx: _CloseContext,
+    all_prs_to_close: list[PullRequestInfo],
+) -> None:
+    """Preview the close, then prompt for SHA-gated confirmation."""
+    if ctx.progress_tracker:
+        ctx.progress_tracker.start()
+        console.print()
+    else:
+        console.print(f"\n🚀 Evaluating {len(all_prs_to_close)} pull requests...")
+
+    close_results = _run_close_parallel(ctx, all_prs_to_close, True)
+
+    if ctx.progress_tracker:
+        ctx.progress_tracker.stop()
+        console.print()
+
+    # Count closeable PRs
+    closed_count = sum(1 for r in close_results if r.status.value == "closed")
+    total_to_close = len(all_prs_to_close)
+
+    console.print(f"\nCloseable {closed_count}/{total_to_close} PRs")
+
+    if closed_count == 0:
+        console.print("\n❌ No PRs are eligible for closing")
+        return
+
+    # Generate continuation SHA and prompt user
+    commit_messages = ctx.github_client.get_pull_request_commits(
+        ctx.owner, ctx.repo_name, ctx.pr_number
+    )
+    first_commit_line = commit_messages[0].split("\n")[0] if commit_messages else ""
+    continue_sha_hash = _generate_continue_sha(ctx.source_pr, first_commit_line)
+    console.print()
+    console.print(f"To proceed with closing enter: {continue_sha_hash}")
+
+    # Check if in test mode (don't prompt during tests)
+    if "pytest" in sys.modules or os.getenv("TESTING"):
+        console.print("⚠️ Test mode detected - skipping interactive prompt")
+        return
+
+    user_input = typer.prompt(
+        "\nEnter the string above to continue (or press Enter to cancel)"
+    ).strip()
+
+    if user_input != continue_sha_hash:
+        console.print("\n❌ Operation cancelled by user")
+        return
+
+    # Run actual close on closeable PRs only
+    console.print(f"\n🔨 Closing {closed_count} closeable pull requests...")
+    closeable_prs = [
+        all_prs_to_close[i]
+        for i, result in enumerate(close_results)
+        # These were preview "closed"
+        if result.status.value == "closed"
+    ]
+
+    if ctx.progress_tracker:
+        ctx.progress_tracker.start()
+
+    final_results = _run_close_parallel(ctx, closeable_prs, False)
+
+    if ctx.progress_tracker:
+        ctx.progress_tracker.stop()
+
+    # Count final results
+    final_closed = sum(1 for r in final_results if r.status.value == "closed")
+    final_failed = sum(1 for r in final_results if r.status.value == "failed")
+
+    console.print(f"\n🚀 Final Results: {final_closed} closed, {final_failed} failed")
+
+
+def _run_immediate_close(
+    ctx: _CloseContext,
+    all_prs_to_close: list[PullRequestInfo],
+) -> None:
+    """Close all candidate PRs without confirmation."""
+    if ctx.progress_tracker:
+        ctx.progress_tracker.start()
+    console.print(f"\n🚀 Closing {len(all_prs_to_close)} pull requests...")
+
+    close_results = _run_close_parallel(ctx, all_prs_to_close, False)
+
+    if ctx.progress_tracker:
+        ctx.progress_tracker.stop()
+
+    # Count results
+    closed_count = sum(1 for r in close_results if r.status.value == "closed")
+    failed_count = sum(1 for r in close_results if r.status.value == "failed")
+
+    console.print(f"\n🚀 Final Results: {closed_count} closed, {failed_count} failed")
+
+
 @app.command()
 def close(
     pr_url: str = typer.Argument(..., help="GitHub pull request URL"),
@@ -2770,129 +3088,27 @@ def close(
 
         comparator = PRComparator(similarity_threshold)
 
+        ctx = _CloseContext(
+            token=token,
+            github_client=github_client,
+            owner=owner,
+            repo_name=repo_name,
+            pr_number=pr_number,
+            source_pr=source_pr,
+            progress_tracker=progress_tracker,
+        )
+
         # Debug matching info for source PR
         if debug_matching:
-            console.print("\n🔍 Debug Matching Information")
-            console.print(
-                f"   Source PR automation status: {github_client.is_automation_author(source_pr.author)}"
-            )
-            console.print(
-                f"   Extracted package: '{comparator._extract_package_name(source_pr.title)}'"
-            )
-            console.print(f"   Similarity threshold: {similarity_threshold}")
-            if source_pr.body:
-                console.print(f"   Body preview: {source_pr.body[:100]}...")
-                console.print(
-                    f"   Is dependabot body: {comparator._is_dependabot_body(source_pr.body)}"
-                )
-            else:
-                console.print("   ⚠️ Source PR has no body")
-            console.print()
+            _print_close_debug_matching(ctx, comparator, similarity_threshold)
 
         # Check if source PR is from automation or has valid override
-        is_automation = github_client.is_automation_author(source_pr.author)
-        override_valid = False
-
-        if not is_automation:
-            commit_messages = github_client.get_pull_request_commits(
-                owner, repo_name, pr_number
-            )
-            first_commit_line = (
-                commit_messages[0].split("\n")[0] if commit_messages else ""
-            )
-
-            # Generate expected SHA
-            expected_sha = _generate_override_sha(source_pr, first_commit_line)
-
-            # Check if override matches
-            if override == expected_sha:
-                override_valid = True
-
-            if not override:
-                console.print("Source PR is not from a recognized automation tool.")
-                console.print(
-                    f"To close this and similar PRs, run again with: --override {expected_sha}"
-                )
-                console.print(
-                    f"This SHA is based on the author '{source_pr.author}' and commit message '{first_commit_line[:50]}...'",
-                    style="dim",
-                )
-                return
-
-            if not override_valid:
-                console.print(
-                    f"Error: Invalid override SHA. Expected: {expected_sha}",
-                    style="bold red",
-                )
-                console.print(
-                    "This prevents accidental bulk operations on non-automation PRs.",
-                    style="dim",
-                )
-                return
-
-            console.print(
-                "Override SHA validated. Proceeding with non-automation PR close."
-            )
+        if not _validate_close_authorization(ctx, override):
+            return
 
         # Find similar PRs across the owner (organization or user)
-        if progress_tracker:
-            console.print()
-        else:
-            console.print(f"\nChecking owner: {owner}")
-
-        # Use GitHubService for async PR finding
-        from .github_service import GitHubService
-
-        if progress_tracker:
-            progress_tracker.update_operation("Listing repositories...")
-
-        async def _find_similar():
-            svc = GitHubService(
-                token=token,
-                progress_tracker=progress_tracker,
-                debug_matching=debug_matching,
-            )
-            try:
-                only_automation = github_client.is_automation_author(source_pr.author)
-                return await svc.find_similar_prs(
-                    owner,
-                    source_pr,
-                    comparator,
-                    only_automation=only_automation,
-                )
-            finally:
-                await svc.close()
-
-        all_similar_prs = asyncio.run(_find_similar())
-
-        if progress_tracker:
-            progress_tracker.stop()
-            summary = progress_tracker.get_summary()
-            elapsed_time = summary.get("elapsed_time")
-            total_prs_analyzed = summary.get("total_prs_analyzed")
-            completed_repositories = summary.get("completed_repositories")
-            similar_prs_found = summary.get("similar_prs_found")
-            errors_count = summary.get("errors_count", 0)
-            console.print(f"\n✅ Analysis completed in {elapsed_time}")
-            console.print(
-                f"📊 Analyzed {total_prs_analyzed} PRs across {completed_repositories} repositories"
-            )
-            console.print(f"🔍 Found {similar_prs_found} similar PRs")
-            if errors_count > 0:
-                console.print(f"⚠️ {errors_count} errors encountered during analysis")
-            console.print()
-        else:
-            console.print(f"\n🔍 Found {len(all_similar_prs)} similar PRs")
-
-        if not all_similar_prs:
-            # Not a failure: the supplied PR is simply the only one to
-            # close.  Use a neutral glyph rather than ❌ so the output
-            # does not read like an error.
-            console.print("⏩ No similar PRs found for this owner")
-
-        for target_pr, comparison in all_similar_prs:
-            console.print(f"  • {target_pr.repository_full_name} #{target_pr.number}")
-            console.print(f"    {_format_condensed_similarity(comparison)}")
+        all_similar_prs = _find_similar_prs_for_close(ctx, comparator, debug_matching)
+        _print_close_analysis_summary(ctx, all_similar_prs)
 
         if not no_confirm:
             # IMPORTANT: Each PR must produce exactly ONE line of output in this section
@@ -2901,156 +3117,18 @@ def close(
         # Determine which PRs to close
         all_prs_to_close = [source_pr] + [pr for pr, _ in all_similar_prs]
 
-        # Perform preview close operation
-        async def _close_parallel(
-            prs: list[PullRequestInfo], preview_mode: bool
-        ) -> list[CloseResult]:
-            close_manager = AsyncCloseManager(
-                token=token,
-                progress_tracker=progress_tracker,
-                preview_mode=preview_mode,
-            )
-            async with close_manager:
-                # Convert to list of tuples (PR, None) for consistency
-                pr_tuples: list[tuple[PullRequestInfo, ComparisonResult | None]] = [
-                    (pr, None) for pr in prs
-                ]
-                return await close_manager.close_prs_parallel(pr_tuples)
-
-        # Perform preview to check which PRs can be closed
         if dry_run:
             # Dry run: evaluate in preview mode and report what *would*
             # be closed, then stop.  No prompt, no actual close — safe to
             # run unattended under a read-only token.
-            if progress_tracker:
-                progress_tracker.start()
-                console.print()
-            else:
-                console.print(
-                    f"\n🧪 Dry run: evaluating {len(all_prs_to_close)} "
-                    "pull requests..."
-                )
-
-            close_results = asyncio.run(_close_parallel(all_prs_to_close, True))
-
-            if progress_tracker:
-                progress_tracker.stop()
-                console.print()
-
-            closeable_count = sum(
-                1 for r in close_results if r.status.value == "closed"
-            )
-            console.print(
-                f"\n🧪 Dry run: would close {closeable_count}/"
-                f"{len(all_prs_to_close)} PRs (no changes made)"
-            )
+            _run_close_dry_run(ctx, all_prs_to_close)
             return
 
-        if not no_confirm:
-            if progress_tracker:
-                progress_tracker.start()
-                console.print()
-            else:
-                console.print(
-                    f"\n🚀 Evaluating {len(all_prs_to_close)} pull requests..."
-                )
-
-            close_results = asyncio.run(_close_parallel(all_prs_to_close, True))
-
-            if progress_tracker:
-                progress_tracker.stop()
-                console.print()
-
-            # Count closeable PRs
-            closed_count = sum(1 for r in close_results if r.status.value == "closed")
-            total_to_close = len(all_prs_to_close)
-
-            if not no_confirm:
-                console.print(f"\nCloseable {closed_count}/{total_to_close} PRs")
-
-                # Generate continuation SHA and prompt user
-                if closed_count > 0:
-                    commit_messages = github_client.get_pull_request_commits(
-                        owner, repo_name, pr_number
-                    )
-                    first_commit_line = (
-                        commit_messages[0].split("\n")[0] if commit_messages else ""
-                    )
-                    continue_sha_hash = _generate_continue_sha(
-                        source_pr, first_commit_line
-                    )
-                    console.print()
-                    console.print(f"To proceed with closing enter: {continue_sha_hash}")
-
-                    # Check if in test mode (don't prompt during tests)
-                    if "pytest" in sys.modules or os.getenv("TESTING"):
-                        console.print(
-                            "⚠️ Test mode detected - skipping interactive prompt"
-                        )
-                        return
-
-                    user_input = typer.prompt(
-                        "\nEnter the string above to continue (or press Enter to cancel)"
-                    ).strip()
-
-                    if user_input == continue_sha_hash:
-                        # Run actual close on closeable PRs only
-                        console.print(
-                            f"\n🔨 Closing {closed_count} closeable pull requests..."
-                        )
-                        closeable_prs = []
-                        for i, result in enumerate(close_results):
-                            if (
-                                result.status.value == "closed"
-                            ):  # These were preview "closed"
-                                closeable_prs.append(all_prs_to_close[i])
-
-                        if progress_tracker:
-                            progress_tracker.start()
-
-                        final_results = asyncio.run(
-                            _close_parallel(closeable_prs, False)
-                        )
-
-                        if progress_tracker:
-                            progress_tracker.stop()
-
-                        # Count final results
-                        final_closed = sum(
-                            1 for r in final_results if r.status.value == "closed"
-                        )
-                        final_failed = sum(
-                            1 for r in final_results if r.status.value == "failed"
-                        )
-
-                        console.print(
-                            f"\n🚀 Final Results: {final_closed} closed, {final_failed} failed"
-                        )
-
-                    else:
-                        console.print("\n❌ Operation cancelled by user")
-                        return
-                else:
-                    console.print("\n❌ No PRs are eligible for closing")
-                    return
-        else:
+        if no_confirm:
             # No confirmation - close immediately
-            if progress_tracker:
-                progress_tracker.start()
-            console.print(f"\n🚀 Closing {len(all_prs_to_close)} pull requests...")
-
-            close_results = asyncio.run(_close_parallel(all_prs_to_close, False))
-
-            if progress_tracker:
-                progress_tracker.stop()
-
-            # Count results
-            closed_count = sum(1 for r in close_results if r.status.value == "closed")
-            failed_count = sum(1 for r in close_results if r.status.value == "failed")
-
-            console.print(
-                f"\n🚀 Final Results: {closed_count} closed, {failed_count} failed"
-            )
+            _run_immediate_close(ctx, all_prs_to_close)
+        else:
+            _run_interactive_close(ctx, all_prs_to_close)
 
     except DependamergeError as exc:
         # Our structured errors handle display and exit themselves

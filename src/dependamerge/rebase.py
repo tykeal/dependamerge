@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING, Any
 from rich.console import Console
 
 from . import git_ops
+from .bot_identity import is_dependabot
 from .git_ops import (
     GitError,
     add_remote,
@@ -110,6 +111,20 @@ class RebaseContext:
     # Default ``None`` keeps existing test constructions working and
     # makes the tracker strictly optional for isolated use.
     track_pr_state: Callable[[PullRequestInfo, str | None], None] | None = None
+    # Optional async callable equivalent to
+    # ``manager._request_dependabot_rebase``: posts ``@dependabot
+    # rebase`` on the PR (idempotent — the manager implementation
+    # skips duplicate comments) and returns True when the rebase is
+    # considered requested.  When provided, dependabot PRs that would
+    # otherwise take the local-rebase path use the macro instead:
+    # dependabot force-pushes a freshly *signed* rebase, so there is
+    # no need to clone + rebase + sign locally (which can require
+    # interactive key access, e.g. a YubiKey PIN prompt).  Default
+    # ``None`` preserves the local path for isolated use and existing
+    # tests.
+    request_dependabot_rebase: (
+        Callable[[PullRequestInfo, str, str], Awaitable[bool]] | None
+    ) = None
 
 
 @dataclass
@@ -600,6 +615,24 @@ async def perform_step5_rebase(
     )
 
     if use_local:
+        # For dependabot PRs, prefer the ``@dependabot rebase`` comment
+        # macro over a local clone + rebase + sign: dependabot
+        # force-pushes a freshly signed rebase itself, which satisfies
+        # the very signature requirement that routed us to the local
+        # path — without touching the operator's signing key (a local
+        # rebase on a signature-requiring repo can trigger interactive
+        # prompts, e.g. a YubiKey PIN).  Falls back to the local path
+        # when the macro cannot be posted.
+        if is_dependabot(pr_info.author) and ctx.request_dependabot_rebase is not None:
+            handled = await _run_dependabot_macro_path(
+                ctx=ctx,
+                pr_info=pr_info,
+                owner=owner,
+                repo=repo,
+                local_reason=local_reason,
+            )
+            if handled:
+                return Step5Outcome()
         await _run_local_path(
             ctx=ctx,
             pr_info=pr_info,
@@ -718,6 +751,76 @@ async def _run_local_path(
             pr_info.html_url,
         )
 
+
+
+async def _run_dependabot_macro_path(
+    *,
+    ctx: RebaseContext,
+    pr_info: PullRequestInfo,
+    owner: str,
+    repo: str,
+    local_reason: str,
+) -> bool:
+    """Request a rebase via the ``@dependabot rebase`` macro.
+
+    Used instead of the local-rebase path for dependabot PRs: the bot
+    rebases the branch onto the current base and force-pushes a
+    commit signed with its own key, preserving the ``Verified`` badge
+    that signature-requiring branch protection demands.
+
+    The rebase completes asynchronously (dependabot typically takes
+    one to a few minutes), so this path never waits for it.  It mirrors
+    the local path's auto-merge contract instead:
+
+    - Auto-merge armed → mark ``_rebased_prs`` so Step 5.5 skips the
+      PR and Step 6's skip gate routes it to ``AUTO_MERGE_PENDING``;
+      GitHub merges server-side once the rebase lands and checks pass.
+    - Auto-merge unavailable → leave the PR unmarked so Step 5.5
+      still runs its bounded wait for the rebase + checks.
+
+    Returns True when the macro was posted (or was already pending);
+    False when it could not be requested — the caller then falls back
+    to the local-rebase path.
+    """
+    if ctx.request_dependabot_rebase is None:
+        return False
+
+    ctx.log.debug(
+        "Dependabot rebase macro: %s [%s]",
+        pr_info.html_url,
+        local_reason,
+    )
+    try:
+        requested = await ctx.request_dependabot_rebase(pr_info, owner, repo)
+    except Exception as exc:
+        ctx.log.debug(
+            "Dependabot rebase request raised for %s: %s",
+            pr_info.html_url,
+            exc,
+        )
+        requested = False
+    if not requested:
+        return False
+
+    try:
+        auto_merge_ok = await ctx.enable_auto_merge(pr_info, owner, repo)
+    except Exception as exc:
+        ctx.log.debug(
+            "Could not enable auto-merge after dependabot rebase "
+            "request for %s: %s",
+            pr_info.html_url,
+            exc,
+        )
+        auto_merge_ok = False
+
+    # Same marking rule as the local path: only skip Step 5.5 when
+    # auto-merge is armed to finish the job server-side.
+    if auto_merge_ok:
+        ctx.rebased_prs.add(f"{owner}/{repo}#{pr_info.number}")
+
+    ctx.log.debug("Rebase requested (dependabot macro): %s", pr_info.html_url)
+    _set_tracker_state(ctx, pr_info, "rebased")
+    return True
 
 
 async def _run_rest_path(

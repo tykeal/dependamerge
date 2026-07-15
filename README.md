@@ -649,9 +649,10 @@ dependamerge merge https://github.com/owner/repo/pull/123
 ➡️ To proceed with merging enter: abc123def456
 Enter the string above to continue (or press Enter to cancel):
 
-🔨 Merging 2 mergeable pull requests...
-✅ Success: https://github.com/org/repo1/pull/45
-✅ Success: https://github.com/org/repo3/pull/89
+🚀 Merging 2 pull requests...
+▶️ Merging PRs in org (2/2 PRs, 100%)
+   ✅ Merged: 2
+   ⏱️ Elapsed: 16s
 
 🚀 Final Results: 2 merged, 0 failed
 ```
