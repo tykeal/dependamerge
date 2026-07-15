@@ -129,7 +129,7 @@ class TestBehindPRHandling:
 
     @pytest.mark.asyncio
     async def test_actual_run_performs_rebase_for_behind_pr(self):
-        """Test that actual run properly rebases behind PRs."""
+        """Behind PR + strict up-to-date policy → rebase before merge."""
 
         pr_info = PullRequestInfo(
             number=123,
@@ -185,6 +185,9 @@ class TestBehindPRHandling:
             mock_client = AsyncMock()
             mock_client.update_branch.return_value = None  # Successful rebase
             mock_client.merge_pull_request.return_value = True  # Successful merge
+            # Branch protection demands up-to-date heads — the only
+            # case where Step 5 still rebases proactively.
+            mock_client.requires_strict_status_checks = AsyncMock(return_value=True)
             merge_manager._github_client = mock_client
 
             # Mock the async get method for PR info refresh
@@ -208,6 +211,71 @@ class TestBehindPRHandling:
         mock_client.update_branch.assert_called_once_with("org", "repo", 123)
 
         # Verify merge was attempted after rebase
+        mock_client.merge_pull_request.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_behind_pr_without_strict_policy_merges_directly(self):
+        """Behind PR + no strict policy → direct merge, no rebase.
+
+        GitHub merges a behind-but-green PR unless branch protection
+        requires up-to-date heads, so a proactive rebase would only
+        restart CI for nothing.  This is the common case that made
+        bulk merges slow: every sibling merge put the remaining PRs
+        ``behind``, and each was rebased (and its checks re-run)
+        without GitHub ever requiring it.
+        """
+
+        pr_info = PullRequestInfo(
+            number=123,
+            title="Test PR",
+            body="Test body",
+            author="dependabot[bot]",
+            head_sha="abc123",
+            base_branch="main",
+            head_branch="feature",
+            state="open",
+            mergeable=True,
+            mergeable_state="behind",
+            behind_by=2,
+            files_changed=[],
+            repository_full_name="org/repo",
+            html_url="https://github.com/org/repo/pull/123",
+            reviews=[],
+            review_comments=[],
+        )
+
+        async with AsyncMergeManager(
+            token="fake_token",
+            merge_method="squash",
+            max_retries=1,
+            concurrency=1,
+            fix_out_of_date=True,
+            progress_tracker=None,
+            preview_mode=False,
+            dismiss_copilot=False,
+        ) as merge_manager:
+            mock_client = AsyncMock()
+            mock_client.merge_pull_request.return_value = True
+            mock_client.requires_strict_status_checks = AsyncMock(return_value=False)
+            merge_manager._github_client = mock_client
+            mock_client.get.return_value = {
+                "mergeable": True,
+                "mergeable_state": "behind",
+                "state": "open",
+            }
+            with patch.object(
+                merge_manager,
+                "_check_merge_requirements",
+                return_value=(True, ""),
+            ):
+                with patch.object(merge_manager, "_approve_pr", return_value=None):
+                    result = await merge_manager._merge_single_pr(pr_info)
+
+        assert result.status == MergeStatus.MERGED
+        # No branch refresh and no auto-merge wait — the merge call
+        # itself is the arbiter.
+        mock_client.update_branch.assert_not_called()
+        mock_client.enable_auto_merge.assert_not_called()
         mock_client.merge_pull_request.assert_called_once()
 
     @pytest.mark.asyncio
@@ -248,6 +316,8 @@ class TestBehindPRHandling:
             mock_client = AsyncMock()
             # Make rebase fail
             mock_client.update_branch.side_effect = Exception("Rebase conflict")
+            # Strict policy forces the Step 5 rebase path.
+            mock_client.requires_strict_status_checks = AsyncMock(return_value=True)
             merge_manager._github_client = mock_client
 
             # Mock other required methods
@@ -340,7 +410,7 @@ class TestBehindPRHandling:
 
     @pytest.mark.asyncio
     async def test_proactive_rebase_success(self):
-        """Test that proactive rebase works correctly for behind PRs."""
+        """Strict up-to-date policy → proactive rebase then merge."""
 
         pr_info = PullRequestInfo(
             number=123,
@@ -397,6 +467,8 @@ class TestBehindPRHandling:
             # Mock successful rebase and merge
             mock_client.update_branch.return_value = None
             mock_client.merge_pull_request.return_value = True
+            # Strict policy forces the Step 5 rebase path.
+            mock_client.requires_strict_status_checks = AsyncMock(return_value=True)
             merge_manager._github_client = mock_client
 
             # Mock PR info refresh after rebase
@@ -474,6 +546,8 @@ class TestBehindPRHandling:
             mock_client = AsyncMock()
             mock_client.update_branch.return_value = None
             mock_client.merge_pull_request.return_value = True
+            # Strict policy forces the Step 5 rebase path.
+            mock_client.requires_strict_status_checks = AsyncMock(return_value=True)
             merge_manager._github_client = mock_client
 
             # Mock the async get method for PR status polling
@@ -553,6 +627,6 @@ class TestBehindPRHandling:
         # the line must be surfaced as a warning, identify the PR, and
         # explain that it is behind its base branch.
         call_args = mock_console.print.call_args[0][0]
-        assert "⚠️" in call_args  # surfaced as a warning
+        assert "\u26a0\ufe0f" in call_args  # surfaced as a warning
         assert pr_info.html_url in call_args  # identifies the PR
         assert "behind" in call_args.lower()  # explains the reason

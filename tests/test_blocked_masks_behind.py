@@ -92,19 +92,23 @@ class TestBlockReasonIndicatesCheckBlockage:
 
 
 class TestBlockedPrNeedsRebase:
-    """Staleness probe for blocked PRs."""
+    """Staleness probe for blocked PRs.
+
+    The block reason itself is analysed once in ``_merge_single_pr``
+    and passed in, so the probe receives it as an argument and only
+    spends API budget on the compare call.
+    """
 
     @pytest.mark.asyncio
     async def test_failing_check_and_behind_triggers_rebase(self) -> None:
         """Failing check + demonstrably behind → rebase path."""
         mgr, client = make_merge_manager(fix_out_of_date=True)
-        client.analyze_block_reason = AsyncMock(
-            return_value="Blocked by failing check: Zizmor Scan 🌈"
-        )
         client.get_behind_by = AsyncMock(return_value=2)
         pr = _BLOCKED_PR.model_copy()
 
-        assert await mgr._blocked_pr_needs_rebase(pr, "owner", "repo")
+        assert await mgr._blocked_pr_needs_rebase(
+            pr, "owner", "repo", "Blocked by failing check: Zizmor Scan \U0001f308"
+        )
         # The probe records the evidence on the PR for later steps.
         assert pr.behind_by == 2
 
@@ -112,51 +116,70 @@ class TestBlockedPrNeedsRebase:
     async def test_up_to_date_head_does_not_rebase(self) -> None:
         """Failing check but head not behind → no rebase."""
         mgr, client = make_merge_manager(fix_out_of_date=True)
-        client.analyze_block_reason = AsyncMock(
-            return_value="Blocked by failing check: Zizmor Scan 🌈"
-        )
         client.get_behind_by = AsyncMock(return_value=0)
 
         assert not await mgr._blocked_pr_needs_rebase(
-            _BLOCKED_PR.model_copy(), "owner", "repo"
+            _BLOCKED_PR.model_copy(),
+            "owner",
+            "repo",
+            "Blocked by failing check: Zizmor Scan \U0001f308",
         )
 
     @pytest.mark.asyncio
     async def test_unknown_staleness_does_not_rebase(self) -> None:
         """Compare failure (None) counts as not behind, not as behind."""
         mgr, client = make_merge_manager(fix_out_of_date=True)
-        client.analyze_block_reason = AsyncMock(
-            return_value="Blocked by failing check: Zizmor Scan 🌈"
-        )
         client.get_behind_by = AsyncMock(return_value=None)
 
         assert not await mgr._blocked_pr_needs_rebase(
-            _BLOCKED_PR.model_copy(), "owner", "repo"
+            _BLOCKED_PR.model_copy(),
+            "owner",
+            "repo",
+            "Blocked by failing check: Zizmor Scan \U0001f308",
         )
 
     @pytest.mark.asyncio
     async def test_non_check_blockage_skips_compare_probe(self) -> None:
         """Approval blockage → False without spending the compare call."""
         mgr, client = make_merge_manager(fix_out_of_date=True)
-        client.analyze_block_reason = AsyncMock(
-            return_value="Blocked by branch protection (requires approval)"
-        )
         client.get_behind_by = AsyncMock(return_value=5)
 
         assert not await mgr._blocked_pr_needs_rebase(
-            _BLOCKED_PR.model_copy(), "owner", "repo"
+            _BLOCKED_PR.model_copy(),
+            "owner",
+            "repo",
+            "Blocked by branch protection (requires approval)",
         )
         client.get_behind_by.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_analyze_failure_does_not_rebase(self) -> None:
-        """analyze_block_reason raising → treat as not rebasable."""
+    async def test_pending_checks_do_not_rebase(self) -> None:
+        """Pending checks resolve on their own — never rebase for them.
+
+        A rebase restarts every required check, and in a same-repo
+        batch each sibling merge advances the base again — so
+        rebasing a PR whose checks are merely *pending* causes the
+        CI-restart churn this probe exists to avoid.
+        """
         mgr, client = make_merge_manager(fix_out_of_date=True)
-        client.analyze_block_reason = AsyncMock(side_effect=RuntimeError("boom"))
         client.get_behind_by = AsyncMock(return_value=5)
 
         assert not await mgr._blocked_pr_needs_rebase(
-            _BLOCKED_PR.model_copy(), "owner", "repo"
+            _BLOCKED_PR.model_copy(),
+            "owner",
+            "repo",
+            "Blocked by pending required check: DCO",
+        )
+        client.get_behind_by.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_analysis_does_not_rebase(self) -> None:
+        """``None`` block reason (analysis empty) → not rebasable."""
+        mgr, client = make_merge_manager(fix_out_of_date=True)
+        client.get_behind_by = AsyncMock(return_value=5)
+
+        assert not await mgr._blocked_pr_needs_rebase(
+            _BLOCKED_PR.model_copy(), "owner", "repo", None
         )
         client.get_behind_by.assert_not_awaited()
 

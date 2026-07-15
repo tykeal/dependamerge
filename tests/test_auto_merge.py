@@ -1004,25 +1004,23 @@ class TestStep5_5HandlesMergeableNone:
 
 
 class TestStep5_5BehindWithoutFix:
-    """``behind`` PRs route through Step 5.5 regardless of ``fix_out_of_date``.
+    """``behind`` PRs skip Step 5.5 and go straight to the merge attempt.
 
-    A common real-world pattern: Dependabot or pre-commit-ci has just
-    rebased the PR. GitHub briefly reports ``mergeable_state: "behind"``
-    while it recomputes mergeability, and the new commit's required
-    checks are still running. Without this routing, dependamerge would
-    immediately fail those PRs with a 405 instead of enabling
-    auto-merge and letting GitHub finish the merge once checks pass.
-
-    The user's ``--no-fix`` intent is preserved by *not rebasing the
-    branch ourselves*; enabling auto-merge is a separate, non-rewriting
-    operation that has no effect unless branch protection is satisfied.
+    GitHub merges a behind-but-green PR directly unless branch
+    protection enforces the strict up-to-date policy (which Step 5
+    handles by refreshing the branch first).  Parking a behind PR in
+    the Step 5.5 wait loop — where the state never advances on its
+    own — would just burn the full ``merge_timeout`` before a merge
+    attempt that was going to succeed anyway.  If GitHub does reject
+    the merge, the reactive path in ``_handle_merge_failure``
+    recovers (dependabot rebase macro / REST update-branch).
     """
 
     @pytest.mark.asyncio
-    async def test_step_5_5_routes_behind_no_fix_to_auto_merge_pending(
+    async def test_behind_no_fix_routes_straight_to_merge(
         self,
     ) -> None:
-        """behind + fix_out_of_date=False → AUTO_MERGE_PENDING (not FAILED)."""
+        """behind + fix_out_of_date=False → direct merge, no wait."""
         mgr, client = make_merge_manager(
             preview_mode=False,
             merge_timeout=0.1,
@@ -1036,8 +1034,6 @@ class TestStep5_5BehindWithoutFix:
             }
         )
 
-        # Auto-merge can be enabled, but the PR stays ``behind`` for
-        # the duration of the (very short) wait loop.
         client.enable_auto_merge = AsyncMock(return_value=True)
         client.post_issue_comment = AsyncMock()
         client.get = AsyncMock(
@@ -1048,10 +1044,6 @@ class TestStep5_5BehindWithoutFix:
             }
         )
         client.get_required_status_checks = AsyncMock(return_value=[])
-        # ``behind`` PRs do not consult analyze_block_reason in the
-        # Step 5.5 pre-check (only ``blocked`` does), but the Step 6
-        # skip gate treats ``behind`` as auto-merge-eligible without
-        # calling it either, so we don't need a return value.
         client.analyze_block_reason = AsyncMock(return_value="behind base branch")
 
         no_g2g = GitHub2GerritDetectionResult()
@@ -1095,15 +1087,12 @@ class TestStep5_5BehindWithoutFix:
         ):
             result = await mgr._merge_single_pr(pr)
 
-        # Auto-merge was enabled despite fix_out_of_date=False.
-        client.enable_auto_merge.assert_awaited_once_with("PR_kwDOTestNode42", "merge")
-        assert "owner/repo#42" in mgr._auto_merge_enabled
-        # Wait timed out while still ``behind``; the Step 6 skip gate
-        # routes to AUTO_MERGE_PENDING and the manual merge does NOT
-        # run (which would otherwise 405 against the unfinished
-        # required checks).
-        assert result.status == MergeStatus.AUTO_MERGE_PENDING
-        mock_merge_retry.assert_not_called()
+        # No Step 5.5 wait, no auto-merge arming — the merge attempt
+        # itself is the arbiter for behind PRs.
+        client.enable_auto_merge.assert_not_awaited()
+        assert "owner/repo#42" not in mgr._auto_merge_enabled
+        assert result.status == MergeStatus.MERGED
+        mock_merge_retry.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

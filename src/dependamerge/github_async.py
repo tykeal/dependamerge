@@ -281,6 +281,7 @@ class GitHubAsync:
         self._required_checks_cache: dict[str, list[dict[str, Any]]] = {}
         self._branch_protection_cache: dict[str, dict[str, Any]] = {}
         self._requires_signatures_cache: dict[str, bool] = {}
+        self._requires_strict_checks_cache: dict[str, bool] = {}
 
         # Cache for the token's OAuth scopes.  ``_token_scopes_fetched``
         # distinguishes "not looked up yet" from "looked up, but this token
@@ -1340,6 +1341,182 @@ class GitHubAsync:
             reliable = False
             self.log.debug(
                 "Error checking rulesets for signature requirement on %s/%s:%s: %s",
+                owner,
+                repo,
+                branch,
+                e,
+            )
+
+        return False, reliable
+
+    async def requires_strict_status_checks(
+        self, owner: str, repo: str, branch: str = "main"
+    ) -> bool:
+        """Check whether a branch requires PR heads to be up to date.
+
+        GitHub only rejects the merge of a ``behind`` PR when the
+        branch's protection enforces the *strict* status-check policy
+        ("Require branches to be up to date before merging").  Without
+        it, a behind-but-green PR merges fine and any proactive rebase
+        is wasted work (plus a full CI re-run).  The merge pipeline
+        uses this to rebase **only when GitHub would actually demand
+        it**.
+
+        Uses two complementary sources:
+
+        1. **Classic branch protection** –
+           ``required_status_checks.strict`` on the branch protection
+           REST payload (already cached by :meth:`get_branch_protection`).
+        2. **Repository rulesets** – any active ruleset targeting the
+           branch whose ``required_status_checks`` rule sets
+           ``strict_required_status_checks_policy``.
+
+        Returns:
+            True if either mechanism requires the branch to be up to
+            date before merging.
+
+        Results are cached per ``owner/repo@branch`` for the session;
+        verdicts derived from transient API errors are not cached so a
+        momentary outage cannot pin a wrong answer for the whole run.
+        """
+        cache_key = f"{owner}/{repo}@{branch}"
+        cached = self._requires_strict_checks_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        result, reliable = await self._requires_strict_status_checks_uncached(
+            owner, repo, branch
+        )
+        if reliable:
+            self._requires_strict_checks_cache[cache_key] = result
+        return result
+
+    async def _requires_strict_status_checks_uncached(
+        self, owner: str, repo: str, branch: str
+    ) -> tuple[bool, bool]:
+        """Uncached implementation of :meth:`requires_strict_status_checks`.
+
+        Returns:
+            Tuple of ``(requires_strict, reliable)``.  ``reliable`` is
+            False when a transient API error prevented a definitive
+            verdict — a ``True`` verdict is always reliable (positive
+            evidence), but an error-derived ``False`` must not be
+            cached because the requirement may simply have been
+            unreadable at that moment.
+        """
+        reliable = True
+        # --- 1. Classic branch protection ---
+        try:
+            protection = await self.get_branch_protection(owner, repo, branch)
+            checks = protection.get("required_status_checks")
+            if isinstance(checks, dict) and checks.get("strict") is True:
+                self.log.debug(
+                    "Branch %s/%s:%s requires up-to-date heads "
+                    "(classic protection strict checks)",
+                    owner,
+                    repo,
+                    branch,
+                )
+                return True, True
+        except Exception as e:
+            # get_branch_protection already maps 404 to {}; anything
+            # surfacing here is a transient failure.
+            reliable = False
+            self.log.debug(
+                "Error checking classic strict-checks policy for %s/%s:%s: %s",
+                owner,
+                repo,
+                branch,
+                e,
+            )
+
+        # --- 2. Repository rulesets ---
+        try:
+            default_branch: str | None = None
+            try:
+                repo_data = await self.get(f"/repos/{owner}/{repo}")
+                if isinstance(repo_data, dict):
+                    default_branch = repo_data.get("default_branch")
+            except Exception as e:
+                self.log.debug(
+                    "Could not resolve default branch for %s/%s: %s",
+                    owner,
+                    repo,
+                    e,
+                )
+
+            ruleset_ids: list[int] = []
+            page = 1
+            per_page = 100
+            while True:
+                page_rulesets = await self.get(
+                    f"/repos/{owner}/{repo}/rulesets?per_page={per_page}&page={page}"
+                )
+                if not isinstance(page_rulesets, list) or not page_rulesets:
+                    break
+                for rs in page_rulesets:
+                    if isinstance(rs, dict):
+                        rs_id = rs.get("id")
+                        if rs_id is not None:
+                            ruleset_ids.append(int(rs_id))
+                if len(page_rulesets) < per_page:
+                    break
+                page += 1
+
+            for ruleset_id in ruleset_ids:
+                try:
+                    detail = await self.get(
+                        f"/repos/{owner}/{repo}/rulesets/{ruleset_id}"
+                    )
+                    if not isinstance(detail, dict):
+                        continue
+                except Exception as detail_err:
+                    # An unreadable ruleset could hide a strict
+                    # required_status_checks rule — the eventual False
+                    # verdict is no longer definitive.
+                    reliable = False
+                    self.log.debug(
+                        "Could not fetch ruleset %s for %s/%s: %s",
+                        ruleset_id,
+                        owner,
+                        repo,
+                        detail_err,
+                    )
+                    continue
+
+                if detail.get("enforcement") != "active":
+                    continue
+                conditions = detail.get("conditions", {})
+                if isinstance(conditions, dict) and not self._ruleset_applies_to_branch(
+                    conditions, branch, default_branch
+                ):
+                    continue
+                rules = detail.get("rules", [])
+                if not isinstance(rules, list):
+                    continue
+                for rule in rules:
+                    if (
+                        isinstance(rule, dict)
+                        and rule.get("type") == "required_status_checks"
+                    ):
+                        params = rule.get("parameters")
+                        if (
+                            isinstance(params, dict)
+                            and params.get("strict_required_status_checks_policy")
+                            is True
+                        ):
+                            self.log.debug(
+                                "Branch %s/%s:%s requires up-to-date "
+                                "heads (ruleset: %s)",
+                                owner,
+                                repo,
+                                branch,
+                                detail.get("name", "unknown"),
+                            )
+                            return True, True
+        except Exception as e:
+            reliable = False
+            self.log.debug(
+                "Error checking rulesets for strict-checks policy on %s/%s:%s: %s",
                 owner,
                 repo,
                 branch,

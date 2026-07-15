@@ -682,7 +682,7 @@ class AsyncMergeManager:
     def _pr_status(self, message: str, *, level: str = "info") -> None:
         """Emit a per-PR status line.
 
-        Preview mode prints the line (the \"🔍 Dependamerge
+        Preview mode prints the line (the \"\U0001f50d Dependamerge
         Evaluation\" section requires exactly one line per PR).  Real
         merges keep the console clean — progress is conveyed by the
         Rich tracker counters and the reasons are reported in the
@@ -1397,36 +1397,87 @@ class AsyncMergeManager:
                 )
                 return result
 
-            # Handle rebase if needed before merge.
-            #
-            # Dispatched to the dedicated ``rebase`` module so the
-            # local-vs-REST decision tree, the local-git workflow,
-            # and the post-rebase polling loop all live in one
-            # place where they can be tested in isolation.
-            #
-            # ``mergeable_state`` is a single value, so ``blocked``
-            # (failing required check) masks ``behind`` (stale head).
-            # A required check that *failed* on a branch that is
-            # *behind base* was judged against pre-rebase content —
-            # e.g. an org-required workflow audit that the base branch
-            # has since fixed — and only a rebase re-runs it against
-            # the current base.  Mirror the engine ladder's
-            # "stale failing verdict" rung here: when a blocked PR's
-            # block reason is check-related and the compare API shows
-            # the head demonstrably behind, refresh the branch before
-            # treating the failure as terminal.
-            needs_rebase = pr_info.mergeable_state == "behind"
+            # Analyse the block reason once per PR snapshot.  Step 5's
+            # staleness probe, Step 5.5's wait pre-check, and Step 6's
+            # auto-merge skip gate all consult the same analysis, and
+            # each call costs ~4 API requests (reviews, comments,
+            # check runs, combined status).  Fetching it once here and
+            # passing the result through collapses the previous two to
+            # three calls per blocked PR into one.
+            # ``blocked_analysis_ok`` records whether the analysis
+            # itself succeeded: the Step 5.5 pre-check treats an
+            # analysis *failure* (as opposed to a None/inconclusive
+            # reason) as "do not wait".
+            blocked_reason: str | None = None
+            blocked_analysis_ok = False
             if (
-                not needs_rebase
-                and self.fix_out_of_date
+                pr_info.mergeable_state == "blocked"
                 and not self.preview_mode
-                and pr_info.mergeable_state == "blocked"
                 and self._github_client is not None
             ):
-                needs_rebase = await self._blocked_pr_needs_rebase(
-                    pr_info, repo_owner, repo_name
-                )
-            if needs_rebase and self.fix_out_of_date:
+                try:
+                    blocked_reason = await self._github_client.analyze_block_reason(
+                        repo_owner,
+                        repo_name,
+                        pr_info.number,
+                        pr_info.head_sha,
+                        base_branch=pr_info.base_branch,
+                    )
+                    blocked_analysis_ok = True
+                except Exception as exc:
+                    self.log.debug(
+                        "analyze_block_reason failed for %s/%s#%s: %s",
+                        repo_owner,
+                        repo_name,
+                        pr_info.number,
+                        exc,
+                    )
+
+            # Handle rebase if needed before merge.
+            #
+            # Rebases are expensive: they restart every required CI
+            # check (minutes of wall-clock time per PR), and same-repo
+            # batches compound the cost because every sibling merge
+            # moves the base again.  So Step 5 rebases **only when
+            # GitHub actually requires it**:
+            #
+            # - ``behind`` alone is NOT enough.  GitHub happily merges
+            #   a behind-but-green PR unless the branch's protection
+            #   enforces the *strict* status-check policy ("require
+            #   branches to be up to date before merging"), so we
+            #   probe that policy (cached per repo/branch) and
+            #   otherwise send the PR straight to the merge attempt.
+            #   Should a merge still be rejected for staleness, the
+            #   reactive path in ``_handle_merge_failure`` recovers.
+            # - ``blocked`` masks ``behind`` (``mergeable_state`` is a
+            #   single value).  A required check that *failed* on a
+            #   head demonstrably behind base was judged against
+            #   pre-rebase content — e.g. an org-required workflow
+            #   audit that the base branch has since fixed — and only
+            #   a rebase re-runs it against the current base.  Pending
+            #   checks are excluded: they resolve on their own, no
+            #   rebase required.
+            #
+            # The rebase itself is dispatched to the dedicated
+            # ``rebase`` module so the macro-vs-local-vs-REST decision
+            # tree, the local-git workflow, and the post-rebase
+            # polling loop all live in one place where they can be
+            # tested in isolation.
+            needs_rebase = False
+            if (
+                self.fix_out_of_date
+                and not self.preview_mode
+                and self._github_client is not None
+            ):
+                if pr_info.mergeable_state == "behind":
+                    needs_rebase = await self._behind_pr_requires_rebase(
+                        pr_info, repo_owner, repo_name
+                    )
+                elif pr_info.mergeable_state == "blocked" and blocked_analysis_ok:
+                    needs_rebase = await self._blocked_pr_needs_rebase(
+                        pr_info, repo_owner, repo_name, blocked_reason
+                    )
+            if needs_rebase:
                 rebase_ctx = rebase.RebaseContext(
                     github_client=self._github_client,
                     token=self.token,
@@ -1439,6 +1490,7 @@ class AsyncMergeManager:
                     rebased_prs=self._rebased_prs,
                     enable_auto_merge=self._enable_auto_merge_with_approval,
                     track_pr_state=self._track_pr_state,
+                    request_dependabot_rebase=self._request_dependabot_rebase,
                 )
                 outcome = await rebase.perform_step5_rebase(
                     ctx=rebase_ctx,
@@ -1452,9 +1504,9 @@ class AsyncMergeManager:
                     return result
 
             # If the PR is still blocked (e.g. by a pending
-            # required status check such as pre-commit.ci), behind
-            # base branch, or unstable (a non-required check failed),
-            # enable auto-merge and wait for required checks to
+            # required status check such as pre-commit.ci) or
+            # unstable (a non-required check failed), enable
+            # auto-merge and wait for required checks to
             # complete. Skipped when:
             #   * preview_mode (no side effects)
             #   * force_level == "all" (force semantics bypass wait)
@@ -1466,15 +1518,13 @@ class AsyncMergeManager:
             #     delay the inevitable failure/merge by up to
             #     merge_timeout.
             #
-            # Note that ``behind`` PRs go through Step 5.5 regardless
-            # of ``fix_out_of_date``: even when we will not rebase the
-            # PR ourselves, enabling auto-merge gives GitHub the chance
-            # to finish merging once required checks land, and the
-            # resulting AUTO_MERGE_PENDING outcome is friendlier than
-            # a 405 manual-merge failure. This also covers the brief
-            # window after Dependabot/pre-commit-ci rebase a PR where
-            # GitHub still reports ``behind`` while it recomputes
-            # mergeability.
+            # ``behind`` PRs deliberately do NOT wait here: unless
+            # branch protection enforces the strict up-to-date policy
+            # (in which case Step 5 already refreshed the branch), a
+            # behind-but-green PR merges directly, so parking it in
+            # the wait loop — where the state never advances on its
+            # own — would just burn the full ``merge_timeout`` before
+            # the merge attempt that was going to succeed anyway.
             #
             # We accept any ``mergeable`` value (including ``False``)
             # when the state is one of these auto-merge-rescuable
@@ -1501,7 +1551,7 @@ class AsyncMergeManager:
             # (GitHub still computing the value, or a required check
             # transiently failing) so a genuinely not-yet-ready PR is
             # not merged prematurely.
-            state_is_waitable = pr_info.mergeable_state in ("blocked", "behind") or (
+            state_is_waitable = pr_info.mergeable_state == "blocked" or (
                 pr_info.mergeable_state == "unstable" and pr_info.mergeable is not True
             )
             base_should_wait = (
@@ -1512,51 +1562,30 @@ class AsyncMergeManager:
                 and not already_rebased
             )
 
-            # For ``blocked`` PRs (but not ``behind``, which only
-            # needs a rebase to clear), consult analyze_block_reason
-            # before entering the wait loop so we don't burn the
-            # full merge_timeout on PRs blocked for reasons that
-            # cannot resolve on their own.
+            # For ``blocked`` PRs, consult the block-reason analysis
+            # (computed once above) before entering the wait loop so
+            # we don't burn the full merge_timeout on PRs blocked for
+            # reasons that cannot resolve on their own.
             should_wait = base_should_wait
-            if (
-                base_should_wait
-                and pr_info.mergeable_state == "blocked"
-                and self._github_client is not None
-            ):
-                pre_block_reason: str | None = None
-                try:
-                    pre_block_reason = await self._github_client.analyze_block_reason(
-                        repo_owner,
-                        repo_name,
-                        pr_info.number,
-                        pr_info.head_sha,
-                        base_branch=pr_info.base_branch,
-                    )
-                except Exception as exc:
-                    self.log.debug(
-                        "analyze_block_reason failed for %s during "
-                        "Step 5.5 pre-check: %s",
-                        pr_key_for_wait,
-                        exc,
-                    )
+            if base_should_wait and pr_info.mergeable_state == "blocked":
+                if not blocked_analysis_ok:
                     # Treat analysis failures as 'do not wait' so we
                     # don't burn the full ``merge_timeout`` on a PR
                     # whose block reason we cannot classify. The PR
                     # will fall through to the Step 6 skip gate (which
-                    # also calls ``analyze_block_reason``) and either
-                    # defer to auto-merge or surface a manual-merge
-                    # error promptly.
+                    # re-consults the analysis) and either defer to
+                    # auto-merge or surface a manual-merge error
+                    # promptly.
                     should_wait = False
-
-                if should_wait and pre_block_reason is not None:
+                elif blocked_reason is not None:
                     if not self._block_reason_indicates_pending_checks(
-                        pre_block_reason
+                        blocked_reason
                     ):
                         self.log.debug(
                             "Skipping Step 5.5 wait for %s: block "
                             "reason '%s' will not resolve on its own",
                             pr_key_for_wait,
-                            pre_block_reason,
+                            blocked_reason,
                         )
                         should_wait = False
 
@@ -1750,7 +1779,19 @@ class AsyncMergeManager:
                         auto_merge_pending_checks = True
                     else:
                         block_reason: str | None = None
-                        if self._github_client is not None:
+                        analysis_fresh = False
+                        if (
+                            blocked_analysis_ok
+                            and not should_wait
+                            and not already_rebased
+                        ):
+                            # Nothing has changed since the analysis
+                            # at the top of the flow (no Step 5
+                            # rebase, no Step 5.5 wait), so reuse it
+                            # instead of re-spending its ~4 API calls.
+                            block_reason = blocked_reason
+                            analysis_fresh = True
+                        if not analysis_fresh and self._github_client is not None:
                             try:
                                 block_reason = (
                                     await self._github_client.analyze_block_reason(
@@ -1947,8 +1988,31 @@ class AsyncMergeManager:
                             "(no operator follow-up needed)"
                         )
                         self._pr_status(
-                            f"🚪 Closed without merging: {pr_info.html_url}",
+                            f"\U0001f6aa Closed without merging: {pr_info.html_url}",
                             level="info",
+                        )
+                        return result
+
+                    # A ``behind`` PR whose merge was rejected but that
+                    # has auto-merge armed is not a failure: the
+                    # reactive recovery in ``_handle_merge_failure``
+                    # requested a dependabot rebase and armed
+                    # auto-merge, so GitHub completes the merge
+                    # server-side once the rebase lands and required
+                    # checks pass.
+                    if (
+                        pr_info.mergeable_state == "behind"
+                        and pr_key in self._auto_merge_enabled
+                    ):
+                        result.status = MergeStatus.AUTO_MERGE_PENDING
+                        result.error = (
+                            "auto-merge pending: behind base branch "
+                            "(rebase requested)"
+                        )
+                        self._pr_status(
+                            f"\u23f3 Waiting: {pr_info.html_url} "
+                            "[behind base branch; rebase requested]",
+                            level="debug",
                         )
                         return result
 
@@ -2263,37 +2327,40 @@ class AsyncMergeManager:
 
         Preview output must be SINGLE LINE per PR for clean evaluation
         display: each PR should produce exactly one line under the
-        "🔍 Dependamerge Evaluation" heading. Mutates ``result`` in place.
+        "\U0001f50d Dependamerge Evaluation" heading. Mutates ``result`` in place.
         """
         if pr_info.mergeable_state == "behind" and not self.fix_out_of_date:
             result.status = MergeStatus.SKIPPED
             result.error = "PR is behind base branch and --no-fix option is set"
             self._console.print(
-                f"⏭️ Skipped: {pr_info.html_url} [behind, rebase disabled]",
+                f"\u23ed\ufe0f Skipped: {pr_info.html_url} [behind, rebase disabled]",
                 markup=False,
             )
         elif pr_info.mergeable_state == "behind" and self.fix_out_of_date:
-            # For behind PRs with fix enabled, show warning with rebase info
-            result.status = MergeStatus.MERGED  # Would succeed after rebase
+            # Behind PRs merge directly unless branch protection
+            # requires up-to-date heads, in which case the real run
+            # refreshes the branch first — either way the PR counts
+            # as mergeable.
+            result.status = MergeStatus.MERGED
             # Use ``warning`` (not ``error``) so the MERGED result
             # does not carry a contradictory error message.
             result.warning = "behind base branch"
             self._console.print(
-                f"⚠️ Rebase/merge: {pr_info.html_url} [behind base branch]",
+                f"\u26a0\ufe0f Rebase/merge: {pr_info.html_url} [behind base branch]",
                 markup=False,
             )
         elif pr_info.mergeable_state == "dirty":
             result.status = MergeStatus.BLOCKED
             result.error = "PR has merge conflicts"
             self._console.print(
-                f"🛑 Blocked: {pr_info.html_url} [merge conflicts]",
+                f"\U0001f6d1 Blocked: {pr_info.html_url} [merge conflicts]",
                 markup=False,
             )
         elif pr_info.mergeable is False and pr_info.mergeable_state == "blocked":
             result.status = MergeStatus.BLOCKED
             result.error = "PR blocked by failing checks"
             self._console.print(
-                f"🛑 Blocked: {pr_info.html_url} [blocked by failing checks]",
+                f"\U0001f6d1 Blocked: {pr_info.html_url} [blocked by failing checks]",
                 markup=False,
             )
         else:
@@ -2303,7 +2370,7 @@ class AsyncMergeManager:
             log_and_print(
                 self.log,
                 self._console,
-                f"☑️ Approve/merge: {pr_info.html_url}",
+                f"\u2611\ufe0f Approve/merge: {pr_info.html_url}",
                 level="debug",
             )
 
@@ -2408,59 +2475,101 @@ class AsyncMergeManager:
             or "queued" in reason_lower
         )
 
-    async def _blocked_pr_needs_rebase(
+    async def _behind_pr_requires_rebase(
         self,
         pr_info: PullRequestInfo,
         repo_owner: str,
         repo_name: str,
     ) -> bool:
+        """Return True when GitHub would refuse to merge this behind PR.
+
+        A ``behind`` PR only needs a branch refresh before merging
+        when the base branch's protection enforces the *strict*
+        status-check policy ("require branches to be up to date
+        before merging").  Everywhere else GitHub merges a
+        behind-but-green PR directly, and a proactive rebase would
+        just restart CI (minutes per PR), invalidate sibling merges'
+        check runs, and — on signature-requiring repos — drag in the
+        signing workflow.  The policy probe is cached per
+        repo/branch, so same-repo batches pay for it once.
+
+        Any probe failure counts as "not required": the merge attempt
+        itself is the authoritative test, and the reactive path in
+        ``_handle_merge_failure`` recovers if GitHub rejects it.
+        """
+        if self._github_client is None:
+            return False
+        try:
+            strict = await self._github_client.requires_strict_status_checks(
+                repo_owner,
+                repo_name,
+                pr_info.base_branch or "main",
+            )
+        except Exception as exc:
+            self.log.debug(
+                "requires_strict_status_checks failed for %s/%s: %s",
+                repo_owner,
+                repo_name,
+                exc,
+            )
+            return False
+        # Strict ``is True`` comparison so AsyncMock defaults in tests
+        # (truthy Mock objects) never route PRs into the rebase path.
+        if strict is not True:
+            return False
+        self._pr_status(
+            f"\U0001f504 Stale head: {pr_info.html_url} "
+            "[behind base; branch protection requires up-to-date "
+            "heads — refreshing before merge]",
+            level="debug",
+        )
+        return True
+
+    async def _blocked_pr_needs_rebase(
+        self,
+        pr_info: PullRequestInfo,
+        repo_owner: str,
+        repo_name: str,
+        block_reason: str | None,
+    ) -> bool:
         """Decide whether a ``blocked`` PR is really stale-and-fixable.
 
         Implements the staleness probe behind Step 5's
         blocked-masks-behind handling: a ``blocked`` PR is treated
-        like ``behind`` when **both** hold:
+        like ``behind`` when **all** hold:
 
-        1. Its block reason is check-related (failing, missing, or
-           pending checks) — the only class of blockage a branch
-           refresh can cure, because the refresh re-runs checks
-           against the current base.
-        2. The compare API confirms the head is at least one commit
+        1. Its block reason is check-related (failing or missing
+           checks) — the only class of blockage a branch refresh can
+           cure, because the refresh re-runs checks against the
+           current base.
+        2. The block reason is NOT merely *pending* checks: those
+           resolve on their own once the checks finish, so a rebase
+           would restart them for nothing (and, mid-batch, restart
+           them repeatedly as sibling merges advance the base).
+        3. The compare API confirms the head is at least one commit
            behind the base branch.  ``None`` (comparison failed)
            counts as "not behind": a rebase is a write action and a
            CI-time expense, so it must rest on positive evidence.
 
-        The two probes run in this order so the cheaper classification
-        gates the extra compare call.
+        The classification gates run first so the extra compare call
+        is only spent on plausible candidates.
 
         Args:
             pr_info: The pull request under evaluation.
             repo_owner: Base repository owner.
             repo_name: Base repository name.
+            block_reason: The result of ``analyze_block_reason()``
+                computed once at the top of ``_merge_single_pr`` (may
+                be ``None`` when the analysis returned nothing).
 
         Returns:
             True when the PR should take the Step 5 rebase path.
         """
         if self._github_client is None:
             return False
-        pr_key = f"{repo_owner}/{repo_name}#{pr_info.number}"
-        block_reason: str | None = None
-        try:
-            block_reason = await self._github_client.analyze_block_reason(
-                repo_owner,
-                repo_name,
-                pr_info.number,
-                pr_info.head_sha,
-                base_branch=pr_info.base_branch,
-            )
-        except Exception as exc:
-            self.log.debug(
-                "analyze_block_reason failed for %s during Step 5 "
-                "staleness probe: %s",
-                pr_key,
-                exc,
-            )
-            return False
         if not self._block_reason_indicates_check_blockage(block_reason):
+            return False
+        if self._block_reason_indicates_pending_checks(block_reason):
             return False
 
         behind_by = await self._github_client.get_behind_by(
@@ -5585,6 +5694,26 @@ class AsyncMergeManager:
 
         # Check if the branch is out of date and we can fix it
         if self.fix_out_of_date and pr_info.mergeable_state == "behind":
+            if is_dependabot(pr_info.author):
+                # Prefer the ``@dependabot rebase`` macro over REST
+                # ``update-branch``: the REST endpoint creates an
+                # unsigned merge commit that can violate
+                # signature-requiring branch protection, while
+                # dependabot force-pushes a freshly signed rebase.
+                # The macro completes asynchronously (minutes), so an
+                # immediate retry is pointless — arm auto-merge so
+                # GitHub finishes the merge server-side once the
+                # rebase lands and checks pass, and let the caller's
+                # not-merged classification report AUTO_MERGE_PENDING.
+                self.log.info(
+                    f"PR {owner}/{repo}#{pr_info.number} is behind - "
+                    "requesting dependabot rebase"
+                )
+                if self._dependabot_is_rebasing(
+                    pr_info.body
+                ) or await self._request_dependabot_rebase(pr_info, owner, repo):
+                    await self._enable_auto_merge_with_approval(pr_info, owner, repo)
+                return False
             try:
                 self.log.info(
                     f"PR {owner}/{repo}#{pr_info.number} is behind - updating branch"

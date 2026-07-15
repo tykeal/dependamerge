@@ -323,6 +323,8 @@ class TestStep5DispatchLocalRebase:
         client.analyze_block_reason = AsyncMock(return_value=None)
         client.get_required_status_checks = AsyncMock(return_value=[])
         client.requires_commit_signatures = AsyncMock(return_value=True)
+        # Strict up-to-date policy → Step 5 rebases proactively.
+        client.requires_strict_status_checks = AsyncMock(return_value=True)
 
         with (
             patch(
@@ -407,6 +409,8 @@ class TestStep5DispatchLocalRebase:
         client.analyze_block_reason = AsyncMock(return_value=None)
         client.get_required_status_checks = AsyncMock(return_value=[])
         client.requires_commit_signatures = AsyncMock(return_value=True)
+        # Strict up-to-date policy → Step 5 rebases proactively.
+        client.requires_strict_status_checks = AsyncMock(return_value=True)
 
         with (
             patch(
@@ -493,6 +497,8 @@ class TestStep5DispatchLocalRebase:
         client.get_required_status_checks = AsyncMock(return_value=[])
         # Unsigned base → gate returns False → REST path.
         client.requires_commit_signatures = AsyncMock(return_value=False)
+        # Strict up-to-date policy → Step 5 rebases proactively.
+        client.requires_strict_status_checks = AsyncMock(return_value=True)
 
         with (
             patch(
@@ -570,6 +576,8 @@ class TestStep5DispatchLocalRebase:
         client.analyze_block_reason = AsyncMock(return_value=None)
         client.get_required_status_checks = AsyncMock(return_value=[])
         client.requires_commit_signatures = AsyncMock(return_value=True)
+        # Strict up-to-date policy → Step 5 rebases proactively.
+        client.requires_strict_status_checks = AsyncMock(return_value=True)
 
         with (
             patch(
@@ -621,7 +629,181 @@ class TestStep5DispatchLocalRebase:
 
 
 # ---------------------------------------------------------------------------
-# 3. _authed_clone_url helper
+# 3. Step 5 dispatch: dependabot PRs use the rebase macro, not local git
+# ---------------------------------------------------------------------------
+
+
+class TestStep5DispatchDependabotMacro:
+    """Dependabot + signature-requiring base → ``@dependabot rebase``.
+
+    The local clone+rebase+sign workflow exists to preserve verified
+    signatures, but dependabot can do that itself: the macro makes it
+    force-push a freshly *signed* rebase.  Using the macro avoids
+    touching the operator's signing key (a local rebase can trigger
+    interactive prompts, e.g. a YubiKey PIN) — so when the gate says
+    "local", dependabot PRs take the macro path instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dependabot_signature_repo_uses_macro(self) -> None:
+        """Macro posted; neither local rebase nor REST update-branch."""
+        mgr, client = _make_mgr(merge_timeout=0.1, fix_out_of_date=True)
+        pr = _make_pr(author="dependabot[bot]", mergeable_state="behind")
+
+        client.update_branch = AsyncMock()
+        client.enable_auto_merge = AsyncMock(return_value=True)
+        client.post_issue_comment = AsyncMock()
+        client.get = AsyncMock(
+            return_value={
+                "mergeable": True,
+                "mergeable_state": "behind",
+                "state": "open",
+            }
+        )
+        client.analyze_block_reason = AsyncMock(return_value=None)
+        client.get_required_status_checks = AsyncMock(return_value=[])
+        # Signed base + verified head → gate selects the local path…
+        client.requires_commit_signatures = AsyncMock(return_value=True)
+        client.check_pr_commit_signatures = AsyncMock(return_value=(True, []))
+        # …and the strict policy forces the Step 5 rebase.
+        client.requires_strict_status_checks = AsyncMock(return_value=True)
+
+        with (
+            patch(
+                "dependamerge.rebase.local_rebase_pr",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_local_rebase,
+            patch.object(
+                mgr,
+                "_detect_github2gerrit",
+                new_callable=AsyncMock,
+                return_value=GitHub2GerritDetectionResult(),
+            ),
+            patch.object(
+                mgr,
+                "_get_merge_method_for_repo",
+                new_callable=AsyncMock,
+                return_value="merge",
+            ),
+            patch.object(
+                mgr,
+                "_trigger_stale_precommit_ci",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                mgr,
+                "_check_merge_requirements",
+                new_callable=AsyncMock,
+                return_value=(True, ""),
+            ),
+            patch.object(
+                mgr,
+                "_approve_pr",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                mgr,
+                "_merge_pr_with_retry",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_merge_retry,
+        ):
+            result = await mgr._merge_single_pr(pr)
+
+        # The macro was posted; the signing-sensitive paths were not.
+        # (Auto-merge enablement posts its own audit comment, so check
+        # for the macro among the calls rather than exactly one call.)
+        assert ("owner", "repo", 42, "@dependabot rebase") in [
+            c.args for c in client.post_issue_comment.await_args_list
+        ]
+        mock_local_rebase.assert_not_awaited()
+        client.update_branch.assert_not_awaited()
+        # Auto-merge armed → PR marked rebased and routed to
+        # AUTO_MERGE_PENDING; no manual merge attempt races the
+        # asynchronous dependabot rebase.
+        assert "owner/repo#42" in mgr._rebased_prs
+        assert "owner/repo#42" in mgr._auto_merge_enabled
+        assert result.status == MergeStatus.AUTO_MERGE_PENDING
+        mock_merge_retry.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_macro_post_failure_falls_back_to_local(self) -> None:
+        """Macro cannot be posted → the local path still protects signatures."""
+        mgr, client = _make_mgr(merge_timeout=0.1, fix_out_of_date=True)
+        pr = _make_pr(author="dependabot[bot]", mergeable_state="behind")
+
+        client.update_branch = AsyncMock()
+        client.enable_auto_merge = AsyncMock(return_value=True)
+        client.post_issue_comment = AsyncMock(side_effect=RuntimeError("403"))
+        client.get = AsyncMock(
+            return_value={
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "state": "open",
+            }
+        )
+        client.analyze_block_reason = AsyncMock(return_value=None)
+        client.get_required_status_checks = AsyncMock(return_value=[])
+        client.requires_commit_signatures = AsyncMock(return_value=True)
+        client.check_pr_commit_signatures = AsyncMock(return_value=(True, []))
+        client.requires_strict_status_checks = AsyncMock(return_value=True)
+
+        with (
+            patch(
+                "dependamerge.rebase.local_rebase_pr",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_local_rebase,
+            patch.object(
+                mgr,
+                "_detect_github2gerrit",
+                new_callable=AsyncMock,
+                return_value=GitHub2GerritDetectionResult(),
+            ),
+            patch.object(
+                mgr,
+                "_get_merge_method_for_repo",
+                new_callable=AsyncMock,
+                return_value="merge",
+            ),
+            patch.object(
+                mgr,
+                "_trigger_stale_precommit_ci",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                mgr,
+                "_check_merge_requirements",
+                new_callable=AsyncMock,
+                return_value=(True, ""),
+            ),
+            patch.object(
+                mgr,
+                "_approve_pr",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                mgr,
+                "_merge_pr_with_retry",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            await mgr._merge_single_pr(pr)
+
+        # Fallback: local rebase ran; REST update-branch still never
+        # fired (signature preservation invariant).
+        mock_local_rebase.assert_awaited_once()
+        client.update_branch.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# 4. _authed_clone_url helper
 # ---------------------------------------------------------------------------
 
 
@@ -684,6 +866,8 @@ class TestLocalRebaseAutoMergeUnavailable:
         client.analyze_block_reason = AsyncMock(return_value=None)
         client.get_required_status_checks = AsyncMock(return_value=[])
         client.requires_commit_signatures = AsyncMock(return_value=True)
+        # Strict up-to-date policy → Step 5 rebases proactively.
+        client.requires_strict_status_checks = AsyncMock(return_value=True)
         client.post_issue_comment = AsyncMock()
 
         with (
