@@ -418,9 +418,11 @@ class FixOrchestrator:
         workspace = base_dir / workspace_name
         workspace.mkdir(parents=True, exist_ok=True)
 
-        # Construct authenticated clone URLs
-        origin_url = self._authed_url(ctx.head_repo_clone_url, self._token)
-        upstream_url = self._authed_url(ctx.base_repo_clone_url, self._token)
+        # Clone/fetch with clean (credential-free) URLs; the token is
+        # supplied per-operation via GIT_ASKPASS so it never lands in
+        # argv or the workspace's .git/config.
+        origin_url = ctx.head_repo_clone_url
+        upstream_url = ctx.base_repo_clone_url
 
         # Clone head repo
         self._log(f"Cloning {ctx.head_repo_full_name}@{ctx.head_branch} -> {workspace}")
@@ -433,6 +435,7 @@ class FixOrchestrator:
             no_tags=True,
             filter_blobs=True,
             logger=self._log,
+            token=self._token,
         )
 
         # Ensure we have base branch available for rebase
@@ -448,7 +451,12 @@ class FixOrchestrator:
             # :meth:`InteractiveResolver.resolve` would fail with
             # ``fatal: invalid upstream 'upstream/<base>'``.
             fetch_branch(
-                "upstream", ctx.base_branch, cwd=workspace, depth=50, logger=self._log
+                "upstream",
+                ctx.base_branch,
+                cwd=workspace,
+                depth=50,
+                logger=self._log,
+                token=self._token,
             )
         else:
             # Same repo; fetch the base branch from origin into the
@@ -456,24 +464,18 @@ class FixOrchestrator:
             # above for why ``fetch_branch`` is required rather than
             # a bare ``fetch``).
             fetch_branch(
-                "origin", ctx.base_branch, cwd=workspace, depth=50, logger=self._log
+                "origin",
+                ctx.base_branch,
+                cwd=workspace,
+                depth=50,
+                logger=self._log,
+                token=self._token,
             )
 
         # Ensure we are on the head branch explicitly (detached HEAD safety)
         checkout(ctx.head_branch, cwd=workspace, create=False, logger=self._log)
 
         return workspace
-
-    @staticmethod
-    def _authed_url(clone_url: str, token: str) -> str:
-        """
-        Insert token into an HTTPS clone URL for non-interactive auth:
-          https://x-access-token:<token>@github.com/owner/repo.git
-        """
-        # Only modify HTTPS URLs; otherwise return as-is
-        if clone_url.startswith("https://"):
-            return clone_url.replace("https://", f"https://x-access-token:{token}@")
-        return clone_url
 
     def _log(self, msg: str) -> None:
         try:
@@ -606,6 +608,7 @@ class InteractiveResolver:
                 f"refs/heads/{ctx.head_branch}",
                 cwd=workspace,
                 logger=self._log,
+                token=self._token,
             )
         except GitError as e:
             return False, f"Push failed: {e}"
