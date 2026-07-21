@@ -19,8 +19,9 @@ a PR up to date with its base branch before merging:
   ``update-branch`` call and the post-rebase polling loop
   (``_poll_post_rebase``) that waits for GitHub to recompute
   mergeability.
-- :func:`authed_clone_url` injects a token into an HTTPS clone URL
-  for non-interactive ``git clone`` auth.
+- Git network operations authenticate via the ``token`` argument of
+  the :mod:`dependamerge.git_ops` helpers (GIT_ASKPASS-based), so the
+  token never appears in remote URLs, argv, or ``.git/config``.
 
 The dispatcher takes a :class:`RebaseContext` rather than a full
 ``AsyncMergeManager`` reference, which keeps the rebase logic
@@ -141,23 +142,20 @@ class Step5Outcome:
 
 
 def authed_clone_url(clone_url: str, token: str) -> str:
-    """Return an HTTPS clone URL with the token injected for auth.
+    """Deprecated: return ``clone_url`` unchanged.
 
-    The token *is* passed to ``git`` as part of the URL command-
-    line argument, which means it can be visible to process-
-    listing tools (``ps``, ``/proc/<pid>/cmdline``) on the local
-    machine for the duration of the git invocation. Log output is
-    separately redacted by :func:`git_ops._redact`, but no
-    equivalent protection exists for ``ps``-style introspection.
-    Callers needing stronger guarantees should use a different
-    auth mechanism (e.g. SSH keys or a credential helper) and
-    pass an unmodified ``ssh://`` / ``git@`` URL through
-    unchanged.
+    Tokens are no longer embedded in clone URLs. Doing so leaked the
+    secret into process listings (``ps`` / ``/proc/<pid>/cmdline``)
+    during the git invocation and persisted it on disk in the
+    workspace's ``.git/config`` (``remote.origin.url``). Authentication
+    is now performed via the ``token`` argument of the
+    :mod:`dependamerge.git_ops` helpers, which supply the secret through
+    a GIT_ASKPASS helper reading from the process environment.
 
-    Non-HTTPS URLs (SSH, ``git://``) are returned unchanged.
+    This shim is retained so third-party callers fail safe (no secret
+    injection) rather than break; it will be removed in a future
+    release.
     """
-    if clone_url.startswith("https://"):
-        return clone_url.replace("https://", f"https://x-access-token:{token}@")
     return clone_url
 
 
@@ -340,11 +338,7 @@ async def local_rebase_pr(
         is_fork = bool(pr_info.is_fork)
     elif head_full and base_full and head_full != base_full:
         is_fork = True
-    elif (
-        head_clone_url
-        and base_clone_url
-        and head_clone_url != base_clone_url
-    ):
+    elif head_clone_url and base_clone_url and head_clone_url != base_clone_url:
         is_fork = True
     else:
         is_fork = False
@@ -365,8 +359,8 @@ async def local_rebase_pr(
         )
         return False
 
-    origin_url = authed_clone_url(head_clone_url, token)
-    upstream_url = authed_clone_url(base_clone_url, token)
+    origin_url = head_clone_url
+    upstream_url = base_clone_url
 
     # Use a per-PR workspace under a secure temp parent so
     # concurrent rebases (--concurrency=N) don't collide.
@@ -393,6 +387,7 @@ async def local_rebase_pr(
                 no_tags=True,
                 filter_blobs=True,
                 logger=log.debug,
+                token=token,
             )
         except GitError as exc:
             log.debug("Local rebase: clone failed for %s: %s", pr_info.html_url, exc)
@@ -417,6 +412,7 @@ async def local_rebase_pr(
                     cwd=workspace,
                     depth=50,
                     logger=log.debug,
+                    token=token,
                 )
                 rebase_onto = f"upstream/{base_branch}"
             else:
@@ -426,6 +422,7 @@ async def local_rebase_pr(
                     cwd=workspace,
                     depth=50,
                     logger=log.debug,
+                    token=token,
                 )
                 rebase_onto = f"origin/{base_branch}"
         except GitError as exc:
@@ -493,6 +490,7 @@ async def local_rebase_pr(
                     cwd=workspace,
                     unshallow=True,
                     logger=log.debug,
+                    token=token,
                 )
                 if is_fork:
                     fetch(
@@ -500,6 +498,7 @@ async def local_rebase_pr(
                         cwd=workspace,
                         unshallow=True,
                         logger=log.debug,
+                        token=token,
                     )
             except GitError as exc:
                 log.debug(
@@ -546,6 +545,7 @@ async def local_rebase_pr(
                 head_branch,
                 cwd=workspace,
                 logger=log.debug,
+                token=token,
             )
         except GitError as exc:
             log.debug(
@@ -752,7 +752,6 @@ async def _run_local_path(
         )
 
 
-
 async def _run_dependabot_macro_path(
     *,
     ctx: RebaseContext,
@@ -806,8 +805,7 @@ async def _run_dependabot_macro_path(
         auto_merge_ok = await ctx.enable_auto_merge(pr_info, owner, repo)
     except Exception as exc:
         ctx.log.debug(
-            "Could not enable auto-merge after dependabot rebase "
-            "request for %s: %s",
+            "Could not enable auto-merge after dependabot rebase request for %s: %s",
             pr_info.html_url,
             exc,
         )
@@ -1061,8 +1059,6 @@ def _log_post_rebase_status(
     elif state == "behind":
         ctx.log.debug("Rebased: %s [still behind after rebase]", pr_info.html_url)
     elif state == "blocked":
-        ctx.log.debug(
-            "Rebased: %s [waiting for status checks]", pr_info.html_url
-        )
+        ctx.log.debug("Rebased: %s [waiting for status checks]", pr_info.html_url)
     else:
         ctx.log.debug("Rebased: %s [state=%s]", pr_info.html_url, state)

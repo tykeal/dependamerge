@@ -803,18 +803,19 @@ class TestStep5DispatchDependabotMacro:
 
 
 # ---------------------------------------------------------------------------
-# 4. _authed_clone_url helper
+# 4. authed_clone_url helper (deprecated shim)
 # ---------------------------------------------------------------------------
 
 
 class TestAuthedCloneUrl:
-    """Token injection mirrors ``FixOrchestrator._authed_url``."""
+    """The deprecated shim must never inject secrets into URLs."""
 
-    def test_https_url_gets_token(self) -> None:
+    def test_https_url_unchanged(self) -> None:
         url = rebase_module.authed_clone_url(
             "https://github.com/owner/repo.git", "abc123"
         )
-        assert url == "https://x-access-token:abc123@github.com/owner/repo.git"
+        assert url == "https://github.com/owner/repo.git"
+        assert "abc123" not in url
 
     def test_ssh_url_unchanged(self) -> None:
         ssh = "git@github.com:owner/repo.git"
