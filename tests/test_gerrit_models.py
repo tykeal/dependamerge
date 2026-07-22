@@ -881,8 +881,8 @@ class TestGerritChangeInfoPermissions:
         assert len(warnings) == 1
         assert "+2 Code-Review" in warnings[0]
 
-    def test_get_permission_warnings_no_submit(self):
-        """Test get_permission_warnings when user lacks submit permission."""
+    def test_get_permission_warnings_not_submittable_no_submit(self):
+        """Test no submit warning when submit permission is indeterminate."""
         change = GerritChangeInfo(
             number=1,
             change_id="I123",
@@ -891,6 +891,26 @@ class TestGerritChangeInfoPermissions:
             owner="user",
             branch="main",
             status="NEW",
+            permitted_labels={
+                "Code-Review": ["-2", "-1", "0", "+1", "+2"],
+            },
+            actions={},
+        )
+
+        warnings = change.get_permission_warnings()
+        assert warnings == []
+
+    def test_get_permission_warnings_submittable_no_submit(self):
+        """Test submit warning when a submittable change lacks submit action."""
+        change = GerritChangeInfo(
+            number=1,
+            change_id="I123",
+            project="proj",
+            subject="Test",
+            owner="user",
+            branch="main",
+            status="NEW",
+            submittable=True,
             permitted_labels={
                 "Code-Review": ["-2", "-1", "0", "+1", "+2"],
             },
@@ -916,7 +936,8 @@ class TestGerritChangeInfoPermissions:
         )
 
         warnings = change.get_permission_warnings()
-        assert len(warnings) == 2
+        assert len(warnings) == 1
+        assert "+2 Code-Review" in warnings[0]
 
     def test_has_required_permissions_true(self):
         """Test has_required_permissions when user has all permissions."""
@@ -958,8 +979,8 @@ class TestGerritChangeInfoPermissions:
 
         assert change.has_required_permissions() is False
 
-    def test_has_required_permissions_false_no_submit(self):
-        """Test has_required_permissions when user lacks submit."""
+    def test_has_required_permissions_true_not_submittable_no_submit(self):
+        """Test submit action is not required before Gerrit exposes it."""
         change = GerritChangeInfo(
             number=1,
             change_id="I123",
@@ -968,6 +989,25 @@ class TestGerritChangeInfoPermissions:
             owner="user",
             branch="main",
             status="NEW",
+            permitted_labels={
+                "Code-Review": ["-2", "-1", "0", "+1", "+2"],
+            },
+            actions={},
+        )
+
+        assert change.has_required_permissions() is True
+
+    def test_has_required_permissions_false_submittable_no_submit(self):
+        """Test submit action is required once a change is submittable."""
+        change = GerritChangeInfo(
+            number=1,
+            change_id="I123",
+            project="proj",
+            subject="Test",
+            owner="user",
+            branch="main",
+            status="NEW",
+            submittable=True,
             permitted_labels={
                 "Code-Review": ["-2", "-1", "0", "+1", "+2"],
             },

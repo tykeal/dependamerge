@@ -345,9 +345,7 @@ class GerritChangeInfo(BaseModel):
     @property
     def total_lines_changed(self) -> int:
         """Get the total number of lines changed (inserted + deleted)."""
-        return sum(
-            f.lines_inserted + f.lines_deleted for f in self.files_changed
-        )
+        return sum(f.lines_inserted + f.lines_deleted for f in self.files_changed)
 
     def get_label_value(self, label_name: str) -> int | None:
         """
@@ -411,7 +409,8 @@ class GerritChangeInfo(BaseModel):
         Check if the current user has the submit action available.
 
         This checks the actions field returned by Gerrit when
-        CURRENT_ACTIONS is requested.
+        CURRENT_ACTIONS is requested. Gerrit only exposes the submit
+        action once a change is submittable.
 
         Returns:
             True if the submit action is available.
@@ -432,10 +431,8 @@ class GerritChangeInfo(BaseModel):
                 "You may not have permission to give +2 Code-Review on this change"
             )
 
-        if not self.can_submit_action():
-            warnings.append(
-                "You may not have permission to submit this change"
-            )
+        if self.submittable and not self.can_submit_action():
+            warnings.append("You may not have permission to submit this change")
 
         return warnings
 
@@ -443,12 +440,17 @@ class GerritChangeInfo(BaseModel):
         """
         Check if the user has all required permissions for merge operations.
 
-        This checks both +2 Code-Review and submit permissions.
+        This checks +2 Code-Review permissions. Gerrit only exposes the
+        submit action once a change is already submittable, so submit
+        permission is required only for submittable changes.
 
         Returns:
             True if the user has all required permissions.
         """
-        return self.can_code_review_plus_two() and self.can_submit_action()
+        if not self.can_code_review_plus_two():
+            return False
+
+        return not self.submittable or self.can_submit_action()
 
 
 class GerritComparisonResult(BaseModel):
