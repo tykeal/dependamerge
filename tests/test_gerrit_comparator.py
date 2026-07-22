@@ -124,6 +124,7 @@ class TestAutomationDetection:
             status="NEW",
         )
         assert comparator._is_automation_change(change) is True
+        assert comparator.is_automation_change(change) is True
 
     def test_detects_renovate(self, comparator):
         """Test detection of Renovate changes."""
@@ -167,6 +168,7 @@ class TestAutomationDetection:
     def test_non_automation_change(self, comparator, human_change):
         """Test that human changes are not detected as automation."""
         assert comparator._is_automation_change(human_change) is False
+        assert comparator.is_automation_change(human_change) is False
 
 
 class TestOwnerComparison:
@@ -557,6 +559,37 @@ class TestCompareGerritChanges:
 
         # Should evaluate similarity without automation check
         assert result.confidence_score > 0.0
+
+    def test_non_automation_requires_same_owner_when_disabled(self):
+        """Test human overrides never match changes from a different owner."""
+        comparator = GerritChangeComparator(similarity_threshold=0.6)
+        source = GerritChangeInfo(
+            number=1,
+            change_id="I1",
+            project="proj",
+            subject="CI: Bump github2gerrit workflow to v1.4.3",
+            message="CI: Bump github2gerrit workflow to v1.4.3",
+            owner="human-user",
+            branch="main",
+            status="NEW",
+            files_changed=[
+                GerritFileChange(filename=".github/workflows/github2gerrit.yaml")
+            ],
+        )
+        target = source.model_copy(
+            update={
+                "number": 2,
+                "change_id": "I2",
+                "owner": "other-human",
+            }
+        )
+
+        result = comparator.compare_gerrit_changes(
+            source, target, only_automation=False
+        )
+
+        assert result.is_similar is False
+        assert "owner does not match" in result.reasons[0]
 
     def test_different_package_updates_not_similar(self, comparator):
         """Test that different package updates are not similar."""

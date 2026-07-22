@@ -170,7 +170,9 @@ class GerritService:
             # Change doesn't exist or has no current revision
             return {"mergeable": None}
         except GerritRestError as exc:
-            log.warning("Failed to fetch mergeable status for %d: %s", change_number, exc)
+            log.warning(
+                "Failed to fetch mergeable status for %d: %s", change_number, exc
+            )
             return {"mergeable": None}
 
     def get_change_info(
@@ -518,6 +520,15 @@ class GerritService:
             if change.number == source_change.number:
                 continue
 
+            if not only_automation and self._owners_differ(source_change, change):
+                log.debug(
+                    "Skipping change %d because owner %r does not match source owner %r",
+                    change.number,
+                    change.owner,
+                    source_change.owner,
+                )
+                continue
+
             # Compare using the provided comparator
             try:
                 if hasattr(comparator, "compare_gerrit_changes"):
@@ -526,13 +537,9 @@ class GerritService:
                     )
                 else:
                     # Fall back to generic comparison if available
-                    result = self._basic_compare(
-                        source_change, change, only_automation
-                    )
+                    result = self._basic_compare(source_change, change, only_automation)
             except Exception as exc:
-                log.debug(
-                    "Error comparing change %d: %s", change.number, exc
-                )
+                log.debug("Error comparing change %d: %s", change.number, exc)
                 continue
 
             if result.is_similar:
@@ -631,15 +638,19 @@ class GerritService:
 
         # Check automation if required
         if only_automation:
-            if not self._is_automation_change(
-                source
-            ) or not self._is_automation_change(target):
+            if not self._is_automation_change(source) or not self._is_automation_change(
+                target
+            ):
                 return GerritComparisonResult.not_similar(
                     "One or both changes are not from automation"
                 )
+        elif self._owners_differ(source, target):
+            return GerritComparisonResult.not_similar(
+                "Change owner does not match source owner"
+            )
 
         # Compare owners
-        if source.owner.lower() == target.owner.lower():
+        if self._normalize_owner(source.owner) == self._normalize_owner(target.owner):
             scores.append(1.0)
             reasons.append("Same author")
         else:
@@ -679,6 +690,33 @@ class GerritService:
 
         text = f"{change.subject} {change.message or ''} {change.owner}".lower()
         return any(indicator in text for indicator in automation_indicators)
+
+    def _owners_differ(
+        self,
+        source: GerritChangeInfo,
+        target: GerritChangeInfo,
+    ) -> bool:
+        """Return True when normalized Gerrit change owners differ."""
+        return self._normalize_owner(source.owner) != self._normalize_owner(
+            target.owner
+        )
+
+    def _normalize_owner(self, owner: str) -> str:
+        """Normalize owner name using the Gerrit comparator rules."""
+        if not owner:
+            return ""
+
+        normalized = owner.lower().strip()
+
+        if normalized.endswith("[bot]"):
+            normalized = normalized[:-5]
+
+        for suffix in ("-bot", "_bot", ".bot"):
+            if normalized.endswith(suffix):
+                normalized = normalized[: -len(suffix)]
+                break
+
+        return normalized
 
     def _compare_subjects(self, subject1: str, subject2: str) -> float:
         """Compare two change subjects for similarity."""

@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from dependamerge.gerrit.comparator import GerritChangeComparator
 from dependamerge.gerrit.models import (
     GerritChangeInfo,
     GerritComparisonResult,
@@ -633,6 +634,61 @@ class TestGerritServiceFindSimilarChanges:
         assert similar[1][0].number == 3  # 0.85
         assert similar[2][0].number == 1  # 0.70
 
+    @patch("dependamerge.gerrit.service.build_client")
+    @patch("dependamerge.gerrit.service.create_url_builder")
+    def test_find_similar_changes_filters_other_owners_when_not_automation_only(
+        self,
+        mock_url_builder,
+        mock_build_client,
+        mock_client,
+    ):
+        """Test human override scans hard-filter changes to the same owner."""
+        mock_build_client.return_value = mock_client
+
+        source = GerritChangeInfo(
+            number=1,
+            change_id="I1",
+            project="proj",
+            subject="CI: Bump github2gerrit workflow to v1.4.3",
+            message="CI: Bump github2gerrit workflow to v1.4.3",
+            owner="human-user",
+            branch="main",
+            status="NEW",
+            files_changed=[
+                GerritFileChange(filename=".github/workflows/github2gerrit.yaml")
+            ],
+        )
+        mock_client.get.return_value = [
+            {
+                "_number": 2,
+                "change_id": "I2",
+                "project": "other-project",
+                "subject": "CI: Bump github2gerrit workflow to v1.4.3",
+                "branch": "main",
+                "status": "NEW",
+                "owner": {"username": "other-human"},
+                "current_revision": "rev2",
+                "revisions": {
+                    "rev2": {
+                        "commit": {
+                            "message": "CI: Bump github2gerrit workflow to v1.4.3"
+                        },
+                        "files": {
+                            ".github/workflows/github2gerrit.yaml": {"status": "M"}
+                        },
+                    }
+                },
+            }
+        ]
+
+        service = GerritService(host="gerrit.example.org")
+        comparator = GerritChangeComparator(similarity_threshold=0.6)
+        similar = service.find_similar_changes(
+            source, comparator, only_automation=False
+        )
+
+        assert similar == []
+
 
 class TestGerritServiceBasicCompare:
     """Tests for internal basic comparison logic."""
@@ -710,6 +766,42 @@ class TestGerritServiceBasicCompare:
         result = service._basic_compare(source, target, only_automation=False)
 
         assert "Same author" in result.reasons
+
+    @patch("dependamerge.gerrit.service.build_client")
+    @patch("dependamerge.gerrit.service.create_url_builder")
+    def test_basic_compare_requires_same_author_when_not_automation_only(
+        self, mock_url_builder, mock_build_client, mock_client
+    ):
+        """Test fallback comparison rejects cross-owner human override matches."""
+        mock_build_client.return_value = mock_client
+
+        service = GerritService(
+            host="gerrit.example.org",
+            similarity_threshold=0.6,
+        )
+        source = GerritChangeInfo(
+            number=1,
+            change_id="I1",
+            project="proj",
+            subject="Bump package from 1.0 to 2.0",
+            message="Bump package from 1.0 to 2.0",
+            owner="human-user",
+            branch="main",
+            status="NEW",
+            files_changed=[GerritFileChange(filename="package.json", lines_inserted=1)],
+        )
+        target = source.model_copy(
+            update={
+                "number": 2,
+                "change_id": "I2",
+                "owner": "other-human",
+            }
+        )
+
+        result = service._basic_compare(source, target, only_automation=False)
+
+        assert result.is_similar is False
+        assert "owner does not match" in result.reasons[0]
 
 
 class TestCreateGerritService:

@@ -155,6 +155,21 @@ def _generate_override_sha(
     return sha_hash[:16]
 
 
+def _generate_gerrit_override_sha(change: GerritChangeInfo) -> str:
+    """
+    Generate a SHA hash based on Gerrit change owner and subject.
+
+    Args:
+        change: Gerrit change information containing owner and subject
+
+    Returns:
+        SHA256 hash string
+    """
+    combined_data = f"{change.owner}:{change.subject.strip()}"
+    sha_hash = hashlib.sha256(combined_data.encode("utf-8")).hexdigest()
+    return sha_hash[:16]
+
+
 def _validate_override_sha(
     provided_sha: str, pr_info: PullRequestInfo, commit_message_first_line: str
 ) -> bool:
@@ -643,7 +658,7 @@ def _maybe_check_merge_permissions(ctx: _MergeContext) -> None:
     """
     if ctx.dry_run:
         console.print(
-            "🧪 Dry run: skipping token permission check " "(no changes will be made)"
+            "🧪 Dry run: skipping token permission check (no changes will be made)"
         )
         return
     _check_merge_permissions(ctx)
@@ -1834,6 +1849,7 @@ def _handle_gerrit_merge(
     netrc_file: Path | None = None,
     netrc_optional: bool = True,
     dry_run: bool = False,
+    override: str | None = None,
 ) -> None:
     """
     Handle merge operation for a Gerrit change URL.
@@ -1849,6 +1865,7 @@ def _handle_gerrit_merge(
         netrc_optional: If True, don't fail if netrc not found.
         dry_run: If True, preview only and never review or submit any
             change, even when ``no_confirm`` is also set.
+        override: SHA hash to override non-automation change restriction.
     """
     # Resolve Gerrit credentials from all sources using centralized function
     try:
@@ -1911,6 +1928,42 @@ def _handle_gerrit_merge(
             console.print("\n❌ Change has been abandoned.")
             raise typer.Exit(1)
 
+        comparator = create_gerrit_comparator(similarity_threshold=similarity_threshold)
+
+        source_is_automation = comparator.is_automation_change(source_change)
+        if source_is_automation:
+            only_automation = True
+        else:
+            expected_sha = _generate_gerrit_override_sha(source_change)
+            if not override:
+                console.print("Source change is not from a recognized automation tool.")
+                console.print(
+                    "To submit this and similar changes, run again with: "
+                    f"--override {expected_sha}"
+                )
+                console.print(
+                    f"This SHA is based on the owner "
+                    f"'{source_change.owner}' and subject "
+                    f"'{source_change.subject[:50]}...'",
+                    style="dim",
+                )
+                raise typer.Exit(0)
+
+            if override != expected_sha:
+                exit_with_error(
+                    ExitCode.VALIDATION_ERROR,
+                    message="❌ Invalid override SHA provided",
+                    details=(
+                        "Expected SHA for this change and owner: "
+                        f"--override {expected_sha}"
+                    ),
+                )
+
+            console.print(
+                "Override SHA validated. Proceeding with non-automation change merge."
+            )
+            only_automation = False
+
         # Check for merge conflicts and attempt rebase if needed
         if source_change.mergeable is False:
             console.print("\n⚠️ Change has merge conflicts. Attempting to rebase...")
@@ -1943,12 +1996,11 @@ def _handle_gerrit_merge(
                 console.print(f"\n❌ Rebase failed: {rebase_result['error']}")
                 raise typer.Exit(1)
 
-        comparator = create_gerrit_comparator(similarity_threshold=similarity_threshold)
-
         console.print(f"\n🔍 Searching for similar changes on {parsed_url.host}...")
         similar_changes = service.find_similar_changes(
             source_change,
             comparator,
+            only_automation=only_automation,
         )
 
         console.print(f"Found {len(similar_changes)} similar changes:")
@@ -2075,7 +2127,9 @@ def merge(
         None, "--token", help="GitHub token (or set GITHUB_TOKEN env var)"
     ),
     override: str | None = typer.Option(
-        None, "--override", help="SHA hash to override non-automation PR restriction"
+        None,
+        "--override",
+        help="SHA hash to override non-automation PR/change restriction",
     ),
     no_fix: bool = typer.Option(
         False,
@@ -2362,6 +2416,7 @@ def merge(
             netrc_file=netrc_file,
             netrc_optional=netrc_optional,
             dry_run=dry_run,
+            override=override,
         )
         return
 
@@ -2751,15 +2806,13 @@ def _print_close_debug_matching(
         f"{ctx.github_client.is_automation_author(source_pr.author)}"
     )
     console.print(
-        "   Extracted package: "
-        f"'{comparator._extract_package_name(source_pr.title)}'"
+        f"   Extracted package: '{comparator._extract_package_name(source_pr.title)}'"
     )
     console.print(f"   Similarity threshold: {similarity_threshold}")
     if source_pr.body:
         console.print(f"   Body preview: {source_pr.body[:100]}...")
         console.print(
-            "   Is dependabot body: "
-            f"{comparator._is_dependabot_body(source_pr.body)}"
+            f"   Is dependabot body: {comparator._is_dependabot_body(source_pr.body)}"
         )
     else:
         console.print("   ⚠️ Source PR has no body")
@@ -2896,7 +2949,7 @@ def _run_close_dry_run(
         console.print()
     else:
         console.print(
-            f"\n🧪 Dry run: evaluating {len(all_prs_to_close)} " "pull requests..."
+            f"\n🧪 Dry run: evaluating {len(all_prs_to_close)} pull requests..."
         )
 
     close_results = _run_close_parallel(ctx, all_prs_to_close, True)

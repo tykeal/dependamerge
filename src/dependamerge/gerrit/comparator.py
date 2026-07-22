@@ -84,13 +84,19 @@ class GerritChangeComparator:
 
         # Check automation requirements
         if only_automation:
-            source_is_auto = self._is_automation_change(source_change)
-            target_is_auto = self._is_automation_change(target_change)
+            source_is_auto = self.is_automation_change(source_change)
+            target_is_auto = self.is_automation_change(target_change)
 
             if not source_is_auto or not target_is_auto:
                 return GerritComparisonResult.not_similar(
                     "One or both changes are not from automation tools"
                 )
+        elif self._normalize_owner(source_change.owner) != self._normalize_owner(
+            target_change.owner
+        ):
+            return GerritComparisonResult.not_similar(
+                "Change owner does not match source owner"
+            )
 
         # Compare owners (authors)
         owner_score = self._compare_owners(source_change, target_change)
@@ -133,7 +139,7 @@ class GerritChangeComparator:
 
         return GerritComparisonResult.not_similar()
 
-    def _is_automation_change(self, change: GerritChangeInfo) -> bool:
+    def is_automation_change(self, change: GerritChangeInfo) -> bool:
         """
         Check if a change is from an automation tool.
 
@@ -166,6 +172,10 @@ class GerritChangeComparator:
                 return True
 
         return False
+
+    def _is_automation_change(self, change: GerritChangeInfo) -> bool:
+        """Backward-compatible alias for automation detection."""
+        return self.is_automation_change(change)
 
     def _compare_owners(
         self,
@@ -234,9 +244,7 @@ class GerritChangeComparator:
         Normalize subject by removing version-specific information.
         """
         # Remove version numbers
-        subject = re.sub(
-            r"v?\d+\.\d+\.\d+(?:\.\d+)?(?:-[a-zA-Z0-9.-]+)?", "", subject
-        )
+        subject = re.sub(r"v?\d+\.\d+\.\d+(?:\.\d+)?(?:-[a-zA-Z0-9.-]+)?", "", subject)
         # Remove commit hashes
         subject = re.sub(r"\b[a-f0-9]{7,40}\b", "", subject)
         # Remove dates
@@ -275,9 +283,7 @@ class GerritChangeComparator:
 
         return ""
 
-    def _compare_messages(
-        self, message1: str | None, message2: str | None
-    ) -> float:
+    def _compare_messages(self, message1: str | None, message2: str | None) -> float:
         """
         Compare commit messages for similarity.
         """
@@ -326,9 +332,7 @@ class GerritChangeComparator:
 
         return message
 
-    def _compare_automation_patterns(
-        self, message1: str, message2: str
-    ) -> float:
+    def _compare_automation_patterns(self, message1: str, message2: str) -> float:
         """
         Compare messages for specific automation tool patterns.
         """
@@ -370,9 +374,7 @@ class GerritChangeComparator:
     def _extract_dependabot_package(self, message: str) -> str:
         """Extract package name from Dependabot commit message."""
         # Look for "dependency-name: package" pattern
-        yaml_match = re.search(
-            r"dependency-name:\s*([^\s\n]+)", message, re.IGNORECASE
-        )
+        yaml_match = re.search(r"dependency-name:\s*([^\s\n]+)", message, re.IGNORECASE)
         if yaml_match:
             return yaml_match.group(1).strip()
 
@@ -424,12 +426,8 @@ class GerritChangeComparator:
         base_score = intersection / union
 
         # Boost score for workflow files
-        source_workflows = {
-            f for f in source_files if ".github/workflows/" in f
-        }
-        target_workflows = {
-            f for f in target_files if ".github/workflows/" in f
-        }
+        source_workflows = {f for f in source_files if ".github/workflows/" in f}
+        target_workflows = {f for f in target_files if ".github/workflows/" in f}
 
         if source_workflows and target_workflows:
             # Both modify workflow files - consider partial match

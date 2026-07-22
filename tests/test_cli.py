@@ -5,17 +5,23 @@ import hashlib
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+import typer
+from rich.console import Console
 from typer.testing import CliRunner
 
 from dependamerge.cli import (
     _format_failure_reason,
+    _generate_gerrit_override_sha,
     _generate_override_sha,
+    _handle_gerrit_merge,
     _MergeContext,
     _restart_merge_progress_tracker,
     _validate_override_sha,
     app,
 )
+from dependamerge.gerrit.models import GerritChangeInfo
 from dependamerge.models import PullRequestInfo
+from dependamerge.url_parser import ChangeSource, ParsedUrl
 
 
 class TestCLI:
@@ -583,6 +589,167 @@ class TestCLI:
         # Invalid SHA should fail validation
         assert _validate_override_sha("invalid_sha", mock_pr, commit_message) is False
         assert _validate_override_sha("", mock_pr, commit_message) is False
+
+    def test_generate_gerrit_override_sha(self):
+        """Test Gerrit override SHA generation."""
+        change = GerritChangeInfo(
+            number=123,
+            change_id="I123",
+            project="proj",
+            subject=" CI: Bump github2gerrit workflow to v1.4.3 ",
+            owner="human-user",
+            branch="main",
+            status="NEW",
+        )
+
+        expected = hashlib.sha256(
+            b"human-user:CI: Bump github2gerrit workflow to v1.4.3"
+        ).hexdigest()[:16]
+        assert _generate_gerrit_override_sha(change) == expected
+
+    @staticmethod
+    def _gerrit_parsed_url() -> ParsedUrl:
+        return ParsedUrl(
+            source=ChangeSource.GERRIT,
+            host="gerrit.example.org",
+            base_path=None,
+            project="proj",
+            change_number=123,
+            original_url="https://gerrit.example.org/c/proj/+/123",
+        )
+
+    @staticmethod
+    def _human_gerrit_change() -> GerritChangeInfo:
+        return GerritChangeInfo(
+            number=123,
+            change_id="I123",
+            project="proj",
+            subject="CI: Bump github2gerrit workflow to v1.4.3",
+            owner="human-user",
+            branch="main",
+            status="NEW",
+            permitted_labels={"Code-Review": ["-2", "-1", "0", "+1", "+2"]},
+        )
+
+    @patch("dependamerge.cli.create_gerrit_comparator")
+    @patch("dependamerge.cli.create_gerrit_service")
+    @patch("dependamerge.cli.resolve_gerrit_credentials")
+    def test_gerrit_merge_non_automation_change_no_override(
+        self,
+        mock_resolve_credentials,
+        mock_create_service,
+        mock_create_comparator,
+    ):
+        """Test Gerrit human-authored changes require an override."""
+        change = self._human_gerrit_change()
+        credentials = Mock(is_valid=True, username="user", password="pass")
+        credentials.auth_method_display.return_value = ".netrc file"
+        mock_resolve_credentials.return_value = credentials
+
+        service = Mock(is_authenticated=True)
+        service.get_change_info.return_value = change
+        mock_create_service.return_value = service
+
+        comparator = Mock()
+        comparator.is_automation_change.return_value = False
+        mock_create_comparator.return_value = comparator
+
+        console = Console(record=True, width=120)
+        with pytest.raises(typer.Exit) as exc_info:
+            _handle_gerrit_merge(
+                parsed_url=self._gerrit_parsed_url(),
+                no_confirm=True,
+                similarity_threshold=0.8,
+                verbose=False,
+                console=console,
+            )
+
+        assert exc_info.value.exit_code == 0
+        output = console.export_text()
+        assert "Source change is not from a recognized automation tool" in output
+        assert "--override" in output
+        assert "human-user" in output
+        service.find_similar_changes.assert_not_called()
+
+    @patch("dependamerge.cli.create_gerrit_comparator")
+    @patch("dependamerge.cli.create_gerrit_service")
+    @patch("dependamerge.cli.resolve_gerrit_credentials")
+    def test_gerrit_merge_non_automation_change_valid_override(
+        self,
+        mock_resolve_credentials,
+        mock_create_service,
+        mock_create_comparator,
+    ):
+        """Test valid Gerrit override disables the automation-only scan."""
+        change = self._human_gerrit_change()
+        credentials = Mock(is_valid=True, username="user", password="pass")
+        credentials.auth_method_display.return_value = ".netrc file"
+        mock_resolve_credentials.return_value = credentials
+
+        service = Mock(is_authenticated=True)
+        service.get_change_info.return_value = change
+        service.find_similar_changes.return_value = []
+        mock_create_service.return_value = service
+
+        comparator = Mock()
+        comparator.is_automation_change.return_value = False
+        mock_create_comparator.return_value = comparator
+
+        console = Console(record=True, width=120)
+        _handle_gerrit_merge(
+            parsed_url=self._gerrit_parsed_url(),
+            no_confirm=True,
+            similarity_threshold=0.8,
+            verbose=False,
+            console=console,
+            dry_run=True,
+            override=_generate_gerrit_override_sha(change),
+        )
+
+        output = console.export_text()
+        assert "Override SHA validated" in output
+        service.find_similar_changes.assert_called_once_with(
+            change,
+            comparator,
+            only_automation=False,
+        )
+
+    @patch("dependamerge.cli.create_gerrit_comparator")
+    @patch("dependamerge.cli.create_gerrit_service")
+    @patch("dependamerge.cli.resolve_gerrit_credentials")
+    def test_gerrit_merge_non_automation_change_invalid_override(
+        self,
+        mock_resolve_credentials,
+        mock_create_service,
+        mock_create_comparator,
+    ):
+        """Test invalid Gerrit override exits with validation error."""
+        change = self._human_gerrit_change()
+        credentials = Mock(is_valid=True, username="user", password="pass")
+        credentials.auth_method_display.return_value = ".netrc file"
+        mock_resolve_credentials.return_value = credentials
+
+        service = Mock(is_authenticated=True)
+        service.get_change_info.return_value = change
+        mock_create_service.return_value = service
+
+        comparator = Mock()
+        comparator.is_automation_change.return_value = False
+        mock_create_comparator.return_value = comparator
+
+        console = Console(record=True, width=120)
+        with pytest.raises(SystemExit) as exc_info:
+            _handle_gerrit_merge(
+                parsed_url=self._gerrit_parsed_url(),
+                no_confirm=True,
+                similarity_threshold=0.8,
+                verbose=False,
+                console=console,
+                override="wrongsha",
+            )
+
+        assert exc_info.value.code == 8
+        service.find_similar_changes.assert_not_called()
 
     @patch("dependamerge.cli.GitHubClient")
     @patch("dependamerge.cli.PRComparator")
